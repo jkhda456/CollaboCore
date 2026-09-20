@@ -83,9 +83,3 @@ bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
   --initramfs app/images/initramfs.cpio --initramfs app/images/python.cpio \
   --mount "$OLDPWD:/work"                     # a root shell in this terminal; Ctrl-C ends it
 ```
-
-## More
-
-[readme.detail.md](readme.detail.md) — what is implemented and verified, Flutter integration and
-bundling, the full configuration, the guest's tools, the security model and the control protocol.
-[docs/note.md](docs/note.md) — the running work log (Korean).
