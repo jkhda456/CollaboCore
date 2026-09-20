@@ -1,0 +1,9 @@
+# This machine has clang-19 but no unversioned `cc`/`gcc`, so name the linker explicitly.
+# (Rust needs a C linker driver; nothing here is compiled from C.)
+[target.x86_64-unknown-linux-gnu]
+linker = "clang-19"
+rustflags = ["-C", "link-arg=-fuse-ld=lld-19"]
+
+# wasmtime's build script compiles one small C helper; name the compiler for it too.
+[env]
+CC = "clang-19"

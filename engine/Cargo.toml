@@ -1,0 +1,21 @@
+[package]
+name = "collabo-core-engine"
+version = "0.1.0"
+edition = "2021"
+description = "collaboCore sandbox engine: runs the WebAssembly Linux kernel with wasmtime"
+license = "MIT"
+
+[dependencies]
+wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "threads", "parallel-compilation", "std", "gc", "gc-null"] }
+wasmparser = "0.239"
+anyhow = "1"
+rand = "0.9"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+serde_json = "1.0.151"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

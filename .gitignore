@@ -1,0 +1,32 @@
+# Machine-local tools and all build outputs; ./build.sh recreates them.
+.tools/
+dist/
+tests/node_modules/
+tests/package-lock.json
+userspace/src/
+userspace/build/
+userspace/out/
+userspace/sysroot/
+userspace/kheaders/
+python/src/
+python/host/
+python/build-host/
+python/build-wasm/
+python/build-zlib/
+python/zlib/
+python/stage/
+python/out/
+python/*.log
+dart/collabo_core/.dart_tool/
+dart/collabo_core/pubspec.lock
+engine/target/
+engine/build.log
+# Made by userspace/build.sh from whichever LLVM 19 this machine has.
+userspace/tools/llvm-*
+# Third-party clones keep their own git history.
+kernel/linux/
+third_party/
+flutter/collabo_core_demo/build/
+flutter/collabo_core_demo/.dart_tool/
+flutter/collabo_core_demo/pubspec.lock
+flutter/collabo_core_demo/**/ephemeral/

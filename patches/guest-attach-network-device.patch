@@ -1,0 +1,63 @@
+diff --git a/packages/linux-guest/src/index.ts b/packages/linux-guest/src/index.ts
+index 5499163..8a1daf2 100644
+--- a/packages/linux-guest/src/index.ts
++++ b/packages/linux-guest/src/index.ts
+@@ -21,6 +21,7 @@ export {
+ export { guestFetchHandler } from "./guest-fetch-handler.ts";
+ export { hostFetchNetwork } from "./host-fetch-network.ts";
+ export {
++  attachNetworkDevice,
+   createNetwork,
+   type Network,
+   type NetworkAddress,
+diff --git a/packages/linux-guest/src/network.ts b/packages/linux-guest/src/network.ts
+index 0a08737..8eec6d4 100644
+--- a/packages/linux-guest/src/network.ts
++++ b/packages/linux-guest/src/network.ts
+@@ -1497,6 +1497,46 @@ export function createNetwork({ connectTcp, resolveDns }: NetworkOptions): Netwo
+   return network;
+ }
+ 
++/**
++ * Attaches a NIC without a guest agent.
++ *
++ * `Network.attach()` needs a `guestAgent()` to wait for and to configure the guest's
++ * interface. A guest that boots from its own initramfs has no agent, so this only
++ * contributes the device: the guest's init must bring up `eth0` itself, with
++ * `attachment.address`, netmask 255.255.255.0 and default gateway `network.gateway`.
++ */
++export function attachNetworkDevice(network: Network): NetworkAttachment {
++  const attachment = (network as InternalNetwork)[do_attach_guest]();
++  let configured = false;
++  const plugin: MachinePlugin = {
++    configure(setup) {
++      if (configured) throw new Error("guest network is already attached to a machine");
++      configured = true;
++      setup.devices.add(attachment.device);
++    },
++  };
++  void attachment.device.closed.finally(() => attachment.close()).catch(() => {});
++
++  function connect(options: Omit<TcpConnectOptions, "hostname">): Promise<TcpConnection>;
++  function connect(options: Omit<UdpConnectOptions, "hostname">): Promise<UdpConnection>;
++  function connect(
++    options: Omit<TcpConnectOptions, "hostname"> | Omit<UdpConnectOptions, "hostname">,
++  ) {
++    if (options.transport === "udp") {
++      return network.connect({ ...options, hostname: attachment.address });
++    }
++    return network.connect({ ...options, hostname: attachment.address });
++  }
++
++  return {
++    address: attachment.address,
++    connect,
++    [getMachinePlugin]() {
++      return plugin;
++    },
++  };
++}
++
+ function attach_guest(network: Network, agent: GuestAgent): NetworkAttachment {
+   if (networked_agents.has(agent)) throw new Error("guest agent already has a network attachment");
+   const attachment = (network as InternalNetwork)[do_attach_guest]();

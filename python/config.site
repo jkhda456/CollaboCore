@@ -1,0 +1,11 @@
+# Autoconf answers for probes that lie or cannot run when cross-compiling to wasm32-linux.
+# Same platform facts as distro/distro/stdenv.nix's wasm-config.site.
+ac_cv_func_fork=no
+ac_cv_func_vfork=no
+ac_cv_func_fork_works=no
+ac_cv_func_vfork_works=no
+ac_cv_func_mmap_fixed_mapped=no
+ac_cv_func_dlopen=no
+ac_cv_search_dlopen=no
+ac_cv_lib_dl_dlopen=no
+ac_cv_func_sigaltstack=no

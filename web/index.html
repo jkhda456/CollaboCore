@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>collaboCore</title>
+    <style>
+      @import url(vendor/xterm/xterm.css);
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        --border: color-mix(in srgb, currentColor 20%, transparent);
+        --muted: color-mix(in srgb, currentColor 60%, transparent);
+        --ok: #1a7f37;
+        --bad: #cf222e;
+        --pending: #9a6700;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ok: #3fb950;
+          --bad: #ff7b72;
+          --pending: #d29922;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 0.4rem 1rem;
+        font-size: 0.9rem;
+        display: flex;
+        gap: 1rem;
+        align-items: baseline;
+        border-bottom: 1px solid var(--border);
+      }
+      header button {
+        font: inherit;
+      }
+      #status {
+        margin-left: auto;
+        opacity: 0.7;
+      }
+      main {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+      }
+      #term {
+        flex: 1;
+        min-width: 0;
+        min-height: 0;
+        background: #000;
+      }
+      #side {
+        width: 24rem;
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        border-left: 1px solid var(--border);
+        min-height: 0;
+      }
+      #side[hidden] {
+        display: none;
+      }
+      #workspace {
+        flex: none;
+        max-height: 50%;
+        display: flex;
+        flex-direction: column;
+        border-bottom: 1px solid var(--border);
+        min-height: 0;
+      }
+      #requests {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      @media (max-width: 800px) {
+        main {
+          flex-direction: column;
+        }
+        #side {
+          width: auto;
+          height: 45%;
+          border-left: 0;
+          border-top: 1px solid var(--border);
+        }
+      }
+      /* workspace panel (app/workspace-panel.js) */
+      .ws-head {
+        display: flex;
+        gap: 0.6rem;
+        align-items: baseline;
+        padding: 0.4rem 0.7rem;
+        font-size: 0.9rem;
+      }
+      .ws-path {
+        color: var(--muted);
+      }
+      .ws-download {
+        margin-left: auto;
+        font: inherit;
+        font-size: 0.8rem;
+      }
+      .ws-summary {
+        padding: 0 0.7rem 0.4rem;
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+      .ws-summary.bad,
+      .ws-notice {
+        color: var(--bad);
+      }
+      .ws-notice {
+        padding: 0 0.7rem 0.4rem;
+        font-size: 0.8rem;
+      }
+      .ws-empty {
+        padding: 0.4rem 0.7rem 0.8rem;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      .ws-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        overflow-y: auto;
+        font-size: 0.8rem;
+        font-family: ui-monospace, monospace;
+        border-top: 1px solid var(--border);
+      }
+      .ws-list:empty {
+        display: none;
+      }
+      .ws-row,
+      .ws-more {
+        display: flex;
+        gap: 0.5rem;
+        padding: 0.15rem 0.7rem;
+      }
+      .ws-name {
+        flex: 1;
+        min-width: 0;
+        word-break: break-all;
+      }
+      .ws-row.dir .ws-name {
+        color: var(--muted);
+      }
+      .ws-size {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .ws-more {
+        color: var(--muted);
+      }
+      /* request log panel (app/http-log.js) */
+      .reqlog-head {
+        display: flex;
+        gap: 0.6rem;
+        align-items: baseline;
+        padding: 0.4rem 0.7rem;
+        border-bottom: 1px solid var(--border);
+        font-size: 0.9rem;
+      }
+      .reqlog-count {
+        color: var(--muted);
+      }
+      .reqlog-clear {
+        margin-left: auto;
+        font: inherit;
+        font-size: 0.8rem;
+      }
+      .reqlog-empty {
+        padding: 0.8rem 0.7rem;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      .reqlog-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        overflow-y: auto;
+        flex: 1;
+      }
+      .reqlog-row {
+        padding: 0.4rem 0.7rem;
+        border-bottom: 1px solid var(--border);
+        border-left: 3px solid transparent;
+        font-size: 0.8rem;
+      }
+      .reqlog-row.ok {
+        border-left-color: var(--ok);
+      }
+      .reqlog-row.bad {
+        border-left-color: var(--bad);
+      }
+      .reqlog-row.pending {
+        border-left-color: var(--pending);
+      }
+      .reqlog-line {
+        display: flex;
+        gap: 0.5rem;
+        align-items: baseline;
+      }
+      .reqlog-time {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .reqlog-method {
+        font-weight: 600;
+        font-family: ui-monospace, monospace;
+      }
+      .reqlog-source {
+        color: var(--muted);
+        font-size: 0.7rem;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0 0.25rem;
+      }
+      .reqlog-status {
+        margin-left: auto;
+        font-variant-numeric: tabular-nums;
+      }
+      .ok .reqlog-status {
+        color: var(--ok);
+      }
+      .bad .reqlog-status {
+        color: var(--bad);
+      }
+      .pending .reqlog-status {
+        color: var(--pending);
+      }
+      .reqlog-url {
+        margin-top: 0.15rem;
+        font-family: ui-monospace, monospace;
+        word-break: break-all;
+      }
+      .reqlog-meta {
+        margin-top: 0.15rem;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>collaboCore</strong>
+      <span>WebAssembly Linux agent sandbox (root shell, no login)</span>
+      <button id="toggle-side" type="button" aria-controls="side">Panels</button>
+      <span id="status">loading…</span>
+    </header>
+    <main>
+      <div id="term"></div>
+      <aside id="side">
+        <section id="workspace" aria-label="Workspace files"></section>
+        <section id="requests" aria-label="HTTP requests from the guest"></section>
+      </aside>
+    </main>
+    <script type="importmap">
+      {
+        "imports": {
+          "@lowland/bytes": "./static/kernel/bytes/index.js",
+          "@lowland/kernel": "./static/kernel/dist/index.js",
+          "@lowland/kernel/plugin": "./static/kernel/dist/plugin.js",
+          "@lowland/guest": "./static/guest/index.js"
+        }
+      }
+    </script>
+    <script type="module">
+      import { FitAddon, Terminal, WebglAddon } from "./vendor/xterm/dist.js";
+      import {
+        bootMachine,
+        consoleDevice,
+        entropyDevice,
+        fileSystemDevice,
+        MachinePanicError,
+      } from "@lowland/kernel";
+      import { attachNetworkDevice, createNetwork, hostFetchNetwork } from "@lowland/guest";
+      import { createHostFetch } from "./app/host-fetch.js";
+      import { createHttpBridge } from "./app/http-bridge.js";
+      import { DEFAULT_ALLOWED_REQUEST_HEADERS } from "./app/http-protocol.js";
+      import { createRequestLog } from "./app/http-log.js";
+      import { createWorkspacePanel } from "./app/workspace-panel.js";
+      import { indexedDbBacking, ZipStore } from "./app/zip-store.js";
+
+      const status = document.getElementById("status");
+      const params = new URLSearchParams(location.search);
+
+      const side = document.getElementById("side");
+      const requestLog = createRequestLog(document.getElementById("requests"));
+      document.getElementById("toggle-side").addEventListener("click", () => {
+        side.hidden = !side.hidden;
+      });
+
+      const termRoot = document.getElementById("term");
+      const term = new Terminal({ convertEol: true, fontFamily: "monospace" });
+      const fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(termRoot);
+      fit.fit();
+      // The panel can be toggled or resized, so follow the container, not the window.
+      new ResizeObserver(() => fit.fit()).observe(termRoot);
+      if (params.get("webgl") !== "0") {
+        try {
+          term.loadAddon(new WebglAddon());
+        } catch (err) {
+          console.warn(err);
+        }
+      }
+
+      if (!window.crossOriginIsolated) {
+        status.textContent = "error";
+        term.write(
+          "Error: page is not cross-origin isolated (SharedArrayBuffer unavailable).\r\n" +
+            "The server must send COOP: same-origin and COEP: require-corp; see _headers.\r\n",
+        );
+        throw new Error("not cross origin isolated");
+      }
+
+      // xterm writes asynchronously; resolving on its callback turns the stream
+      // into real backpressure so a chatty guest stalls instead of buffering.
+      const toTerminal = (data) => new Promise((resolve) => term.write(data, resolve));
+
+      const stdin = new ReadableStream({
+        start(controller) {
+          term.onData((data) => controller.enqueue(data));
+        },
+      }).pipeThrough(new TextEncoderStream());
+      const stdout = new WritableStream({ write: toTerminal });
+      const tty = consoleDevice(stdin, stdout);
+
+      // Seed the size before boot (the machine reads it at boot), then follow the terminal.
+      const resize = () => tty.resize(term.cols, term.rows);
+      term.onResize(resize);
+      resize();
+
+      // Kernel output from before the virtio console comes up.
+      const bootOut = new WritableStream({ write: toTerminal });
+
+      // ---- workspace: /work in the guest, a ZIP archive in the browser ------------------
+      // The guest mounts it as virtiofs; every change lands in memory at once and is saved to
+      // IndexedDB as one uncompressed .zip shortly after. The panel lists it and downloads it.
+      let workStore = new ZipStore({ backing: indexedDbBacking() });
+      let workNotice;
+      try {
+        await workStore.load();
+      } catch (error) {
+        // Never save over something that could not be read: work in memory only instead.
+        workStore = new ZipStore();
+        workNotice =
+          error?.name === "ZipError"
+            ? `The saved workspace could not be restored (${error.message}). Starting empty; nothing will be saved this session.`
+            : `Browser storage is unavailable (${error?.message ?? error}). The workspace is kept in memory only.`;
+        console.warn(error);
+      }
+      const workspacePanel = createWorkspacePanel(document.getElementById("workspace"), workStore, {
+        notice: workNotice,
+      });
+      // Best effort: flush before the tab goes away (IndexedDB may not finish on unload).
+      addEventListener("pagehide", () => void workStore.saveNow().catch(() => {}));
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") void workStore.saveNow().catch(() => {});
+      });
+
+      // ---- guest HTTP -> host fetch() -------------------------------------------------
+      // Two paths, both ending in a browser fetch() and both shown in the panel:
+      //
+      //  1. api: the guest runs `hfetch URL` (or speaks the protocol in app/http-protocol.js)
+      //     over vsock. It is one request per call at fetch() level: method, URL, a few
+      //     allow-listed headers, body. This is the intended path for the agent.
+      //  2. net: a virtual NIC with a JS TCP/IP stack, so unmodified plain-HTTP tools
+      //     (wget) work. Looser: it does not restrict headers. Disable with ?net=0.
+      //
+      // Request headers the guest may set on the api path. Extend here, e.g. for an API
+      // that needs a version header: ["anthropic-version"].
+      const EXTRA_ALLOWED_REQUEST_HEADERS = [];
+      const bridge = createHttpBridge({
+        log: requestLog,
+        allowHeaders: [...DEFAULT_ALLOWED_REQUEST_HEADERS, ...EXTRA_ALLOWED_REQUEST_HEADERS],
+      });
+
+      const args = ["collabo.mount=work:/work"];
+      const devices = [bridge.device, fileSystemDevice(workStore, { tag: "work" })];
+      if (params.get("net") !== "0") {
+        const hostFetch = createHostFetch({ log: requestLog });
+        const network = createNetwork(hostFetchNetwork({ fetch: hostFetch }));
+        const nic = attachNetworkDevice(network);
+        // /etc/rc in the guest reads these from /proc/cmdline to configure eth0.
+        args.push(`collabo.ip=${nic.address}`, `collabo.gw=${network.gateway}`);
+        devices.push(nic);
+      }
+      args.push(...(params.get("cmdline") ?? "").replace(/\+/g, " ").split(" ").filter(Boolean));
+
+      const cpus = Number(params.get("cpus")) || navigator.hardwareConcurrency;
+
+      // Root filesystem: cpio initramfs archives (busybox + /init that starts a root shell with no
+      // login). The kernel unpacks archives placed back to back, so optional pieces are just
+      // appended: python.cpio brings CPython 3.13 (?python=0 leaves it out). Without any
+      // initramfs the kernel panics at "Unable to mount root fs".
+      const fetchBytes = async (url) => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+        return new Uint8Array(await response.arrayBuffer());
+      };
+      let initcpio;
+      try {
+        const wanted = [fetchBytes("./static/initramfs.cpio")];
+        if (params.get("python") !== "0") wanted.push(fetchBytes("./static/python.cpio").catch(() => undefined));
+        const archives = (await Promise.all(wanted)).filter(Boolean);
+        initcpio = new Uint8Array(archives.reduce((total, a) => total + a.length, 0));
+        archives.reduce((at, a) => (initcpio.set(a, at), at + a.length), 0);
+      } catch (error) {
+        term.write(`[host] no initramfs (${error}); booting kernel only\r\n`);
+      }
+
+      try {
+        const machine = await bootMachine({
+          cpus,
+          args,
+          plugins: [tty, entropyDevice(), ...devices],
+          initcpio,
+        });
+        status.textContent = `running (${cpus} cpu)`;
+        void machine.bootConsole.pipeTo(bootOut).catch(() => {});
+        await machine.closed;
+        status.textContent = "stopped";
+      } catch (error) {
+        status.textContent = error instanceof MachinePanicError ? "kernel panic" : "error";
+        term.write(`\r\n[host] ${error?.stack ?? error}\r\n`);
+        console.error(error);
+      }
+    </script>
+  </body>
+</html>

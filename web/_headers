@@ -1,0 +1,12 @@
+# The kernel is multi-threaded WebAssembly on SharedArrayBuffer, which browsers
+# only enable in a cross-origin isolated page. Every response needs these three.
+# (Cloudflare Pages / Netlify syntax; on another server set the same headers
+# and serve *.wasm as application/wasm - compileStreaming rejects other types.)
+/*
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: cross-origin
+
+# Same name is reused across rebuilds, so revalidate instead of caching forever.
+/static/*
+  Cache-Control: no-cache

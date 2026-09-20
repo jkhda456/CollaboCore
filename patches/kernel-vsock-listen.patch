@@ -1,0 +1,145 @@
+diff --git a/packages/kernel/src/virtio/vsock.ts b/packages/kernel/src/virtio/vsock.ts
+index 5747b32..60e74a0 100644
+--- a/packages/kernel/src/virtio/vsock.ts
++++ b/packages/kernel/src/virtio/vsock.ts
+@@ -209,6 +209,8 @@ function create_vsock_connection(
+ }
+ 
+ interface VsockConnectionState {
++  /** Host-initiated connections are keyed by local port; guest-initiated ones by "local:peer". */
++  key: number | string;
+   controller: VsockConnectionController;
+   connected: boolean;
+   resolve(connection: VsockConnection): void;
+@@ -228,6 +230,12 @@ export interface VsockDevice extends VirtioDevice {
+       timeoutMs?: number;
+     },
+   ): Promise<VsockConnection>;
++  /**
++   * Accepts connections that the guest opens to host `port` (guest CID -> host CID 2).
++   * `onConnection` is called once per accepted connection. Returns a function that stops
++   * listening; connections already accepted stay open.
++   */
++  listen(port: number, onConnection: (connection: VsockConnection) => void): () => void;
+   /** Closes the device and every connection on it. */
+   close(): void;
+ }
+@@ -242,7 +250,8 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
+ 
+   const rx_buffers: VirtqueueChain[] = [];
+   const pending_packets: Uint8Array[] = [];
+-  const connections = new Map<number, VsockConnectionState>();
++  const connections = new Map<number | string, VsockConnectionState>();
++  const listeners = new Map<number, (connection: VsockConnection) => void>();
+   let next_port = 49152;
+   let closed = false;
+ 
+@@ -307,13 +316,66 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
+     return { header, payload };
+   }
+ 
++  const no_payload = new Uint8Array();
++
++  /** The guest opened a connection to one of our ports: accept it, or reset it. */
++  function accept_guest_connection(controller: VirtioController, header: VsockHeader) {
++    const key = `${header.dst_port}:${header.src_port}`;
++    const listener = listeners.get(header.dst_port);
++    if (!listener || closed || connections.has(key)) {
++      // Nothing listens there: refuse at once instead of leaving the guest waiting.
++      const refused = create_vsock_connection(
++        { send() {}, close() {} },
++        header.dst_port,
++        header.src_port,
++      );
++      send_packet(controller, refused, VsockOp.RST, 0, no_payload);
++      return;
++    }
++
++    const accepted: VsockConnectionController = create_vsock_connection(
++      {
++        send(op, flags, payload, fwd_cnt) {
++          if (closed || !connections.has(key)) return;
++          send_packet(controller, accepted, op, flags, payload, fwd_cnt);
++        },
++        close() {
++          if (!connections.has(key)) return;
++          send_packet(
++            controller,
++            accepted,
++            VsockOp.SHUTDOWN,
++            VsockShutdown.RCV | VsockShutdown.SEND,
++            no_payload,
++          );
++        },
++      },
++      header.dst_port,
++      header.src_port,
++    );
++    connections.set(key, {
++      key,
++      controller: accepted,
++      connected: true,
++      resolve() {},
++      reject() {},
++    });
++    accepted.update_credit(header.buf_alloc, header.fwd_cnt);
++    send_packet(controller, accepted, VsockOp.RESPONSE, 0, no_payload);
++    listener(accepted.connection);
++  }
++
+   function handle_tx_packet(
+     controller: VirtioController,
+     header: VsockHeader,
+     payload: Uint8Array,
+   ) {
+-    const local_port = header.dst_port;
+-    const state = connections.get(local_port);
++    if (header.op === VsockOp.REQUEST) {
++      accept_guest_connection(controller, header);
++      return;
++    }
++    const state =
++      connections.get(`${header.dst_port}:${header.src_port}`) ?? connections.get(header.dst_port);
+     if (!state) return;
+ 
+     const connection = state.controller;
+@@ -338,14 +400,14 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
+           state.reject(new Error("guest shut down vsock connection"));
+         }
+         connection.close_from_peer();
+-        connections.delete(local_port);
++        connections.delete(state.key);
+         break;
+       case VsockOp.RST:
+         if (!state.connected) {
+           state.reject(new Error("guest reset vsock connection"));
+         }
+         connection.close_from_peer();
+-        connections.delete(local_port);
++        connections.delete(state.key);
+         break;
+       default:
+         console.warn("unknown vsock op", header.op);
+@@ -447,6 +509,7 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
+       }, timeoutMs);
+ 
+       connections.set(local_port, {
++        key: local_port,
+         controller: connection,
+         connected: false,
+         resolve(value) {
+@@ -464,5 +527,13 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
+     return promise;
+   }
+ 
+-  return controller.expose({ connect, close: controller.close });
++  function listen(port: number, onConnection: (connection: VsockConnection) => void) {
++    if (listeners.has(port)) throw new Error(`vsock port ${port} already has a listener`);
++    listeners.set(port, onConnection);
++    return () => {
++      if (listeners.get(port) === onConnection) listeners.delete(port);
++    };
++  }
++
++  return controller.expose({ connect, listen, close: controller.close });
+ }

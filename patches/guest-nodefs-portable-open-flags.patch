@@ -1,0 +1,67 @@
+diff --git a/packages/linux-guest/src/node.ts b/packages/linux-guest/src/node.ts
+index 79ed5d4..d3d5005 100644
+--- a/packages/linux-guest/src/node.ts
++++ b/packages/linux-guest/src/node.ts
+@@ -161,21 +161,31 @@ function translate_open_flags(flags: number) {
+     result |= host;
+   };
+ 
++  // Flags that only advise the host. Windows' Node has no constant for them: a regular file
++  // behaves the same without them, so they are dropped instead of failing the open.
++  const advisory = (linux: number, host: number | undefined) => {
++    if (!(remaining & linux)) return;
++    remaining &= ~linux;
++    if (host !== undefined) result |= host;
++  };
++
+   map(linux_open.create, constants.O_CREAT, "O_CREAT");
+   map(linux_open.exclusive, constants.O_EXCL, "O_EXCL");
+-  map(linux_open.noTerminal, constants.O_NOCTTY, "O_NOCTTY");
++  advisory(linux_open.noTerminal, host_constants.O_NOCTTY);
+   map(linux_open.truncate, constants.O_TRUNC, "O_TRUNC");
+   map(linux_open.append, constants.O_APPEND, "O_APPEND");
+-  map(linux_open.nonblocking, constants.O_NONBLOCK, "O_NONBLOCK");
++  advisory(linux_open.nonblocking, host_constants.O_NONBLOCK);
+   if (remaining & linux_open.sync) {
+     remaining &= ~(linux_open.sync | linux_open.dataSync);
+-    result |= constants.O_SYNC;
++    result |= host_constants.O_SYNC ?? 0;
+   } else {
+     map(linux_open.dataSync, host_constants.O_DSYNC, "O_DSYNC");
+   }
+   map(linux_open.direct, host_constants.O_DIRECT, "O_DIRECT");
+   map(linux_open.directory, constants.O_DIRECTORY, "O_DIRECTORY");
+-  map(linux_open.noFollow, constants.O_NOFOLLOW, "O_NOFOLLOW");
++  // Without O_NOFOLLOW (Windows) a final symlink would be followed; NodeFS still keeps every
++  // resolved path inside the shared folder, and Windows rarely has symlinks there.
++  advisory(linux_open.noFollow, host_constants.O_NOFOLLOW);
+   map(linux_open.noAtime, host_constants.O_NOATIME, "O_NOATIME");
+ 
+   // File descriptors never cross the JavaScript boundary, and Node already
+@@ -390,7 +400,7 @@ export class NodeFS implements FS<Node, Handle> {
+         const size = checked_offset(changes.size);
+         if (file) await file.truncate(size);
+         else {
+-          const temporary = await open(target!, constants.O_WRONLY | constants.O_NOFOLLOW);
++          const temporary = await open(target!, constants.O_WRONLY | (host_constants.O_NOFOLLOW ?? 0));
+           try {
+             await temporary.truncate(size);
+           } finally {
+@@ -427,7 +437,7 @@ export class NodeFS implements FS<Node, Handle> {
+ 
+   async open(node: Node, flags: number) {
+     if (this.readOnly && may_write(flags)) this.#writable();
+-    const host_flags = translate_open_flags(flags) | constants.O_NOFOLLOW;
++    const host_flags = translate_open_flags(flags) | (host_constants.O_NOFOLLOW ?? 0);
+     return await this.#path_operation(async () => {
+       const target = await this.#validated_path(this.#parts(node));
+       return new Handle(await node_call(open(target, host_flags)));
+@@ -437,7 +447,7 @@ export class NodeFS implements FS<Node, Handle> {
+   async create(parent: Node, name: string, flags: number, context: FSCreateContext) {
+     this.#writable();
+     const host_flags =
+-      translate_open_flags(flags | linux_open.create) | constants.O_CREAT | constants.O_NOFOLLOW;
++      translate_open_flags(flags | linux_open.create) | constants.O_CREAT | (host_constants.O_NOFOLLOW ?? 0);
+     return await this.#path_operation(async () => {
+       const parts = [...this.#parts(parent), valid_name(name)];
+       const target = await this.#validated_path(parts);

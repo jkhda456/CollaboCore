@@ -1,0 +1,12 @@
+name: collabo_core
+description: >-
+  collaboCore for Flutter desktop apps: an isolated Linux sandbox (WebAssembly kernel) for AI
+  agents, with local folder mounts, a managed network and controlled access to the host.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dev_dependencies:
+  test: ^1.25.0

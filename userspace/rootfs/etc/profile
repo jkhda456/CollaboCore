@@ -1,0 +1,4 @@
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/root
+PS1='\u@\h:\w\$ '
+if [ -d /work ]; then cd /work; else cd "$HOME"; fi

@@ -1,0 +1,61 @@
+#!/bin/sh
+# Boot-time setup, run by /init before the interactive shell. The host describes the machine on
+# the kernel command line:
+#
+#   collabo.ip=A collabo.gw=G      a virtio NIC is attached: give eth0 address A, gateway G.
+#                                  Everything outside 192.0.2.0/24 is answered by the host.
+#   collabo.mount=TAG:/path[:ro]   mount the host's virtiofs share TAG at /path (repeatable):
+#                                  a local disk folder (desktop) or the zip workspace (browser)
+#   collabo.work=TAG               old spelling of collabo.mount=TAG:/work
+#   collabo.agent=1                start collabo-agentd, through which the host runs commands
+#   collabo.quiet=1                no banner
+MOUNTS=
+for a in $(cat /proc/cmdline); do
+	case $a in
+	collabo.ip=*) IP=${a#*=} ;;
+	collabo.gw=*) GW=${a#*=} ;;
+	collabo.mount=*) MOUNTS="$MOUNTS ${a#*=}" ;;
+	collabo.work=*) MOUNTS="$MOUNTS ${a#*=}:/work" ;;
+	collabo.agent=1) AGENT=1 ;;
+	collabo.quiet=1) QUIET=1 ;;
+	esac
+done
+say() { [ -n "$QUIET" ] || echo "$@"; }
+
+ifconfig lo 127.0.0.1 up
+
+if [ -n "$IP" ] && [ -n "$GW" ]; then
+	# eth0 is registered asynchronously by the virtio-net probe.
+	n=0
+	while [ ! -d /sys/class/net/eth0 ] && [ $n -lt 100 ]; do
+		sleep 0.1
+		n=$((n + 1))
+	done
+	if ifconfig eth0 "$IP" netmask 255.255.255.0 up && route add default gw "$GW" eth0; then
+		say "net: eth0 $IP, gateway $GW"
+	else
+		echo "net: configuring eth0 failed"
+	fi
+fi
+
+for m in $MOUNTS; do
+	tag=${m%%:*}
+	rest=${m#*:}
+	path=${rest%%:*}
+	opts=rw
+	[ "${rest##*:}" = ro ] && [ "$rest" != "$path" ] && opts=ro
+	mkdir -p "$path"
+	if mount -t virtiofs -o "$opts" "$tag" "$path"; then
+		say "mount: $path ($opts) is a folder shared by the host"
+	else
+		echo "mount: mounting $tag on $path failed"
+	fi
+done
+
+if [ -n "$AGENT" ]; then
+	collabo-agentd 2>/tmp/collabo-agentd.log &
+fi
+
+say "hfetch URL: HTTP(S) through the host (hfetch -h); hostcall --list: host functions"
+[ -x /usr/bin/python3 ] && say "python3: CPython 3.13 (import collabo_core for host HTTP and host functions)"
+true

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# clang-19 acting as tombl's `wasm32-unknown-linux-musl` clang (LLVM 22 fork), which we
+# cannot build here. Reproduces what that driver does for the linux target:
+#   compile: __linux__/__unix__ macros, sysroot include, atomics/bulk-memory/sjlj flags
+#   link   : crt1.o first, --table-base=3 (fn ptr 1,2 = SIG_IGN/SIG_HOLD), -lc, compiler-rt
+U="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SYS="$U/sysroot"
+RT="$U/out/rt/lib/wasm32-unknown-unknown/libclang_rt.builtins.a"
+CC_BIN="${WASM_CC_BIN:-clang-19}"
+
+COMMON=(--target=wasm32 -matomics -mbulk-memory -mllvm -wasm-enable-sjlj
+        -D__linux__=1 -D__linux=1 -D__unix__=1 -D__unix=1 -D__gnu_linux__=1
+        -Wno-unused-command-line-argument -Wno-override-module)
+
+link=1
+for a in "$@"; do case "$a" in -c|-S|-E|-M|-MM|-###) link=0;; esac; done
+
+if [[ $link == 0 ]]; then
+  exec "$CC_BIN" "${COMMON[@]}" -isystem "$SYS/include" "$@"
+fi
+# Probing the compiler (e.g. `-print-*`, `--version`) is not a link either.
+for a in "$@"; do case "$a" in -print-*|--version|-v|-dumpmachine) exec "$CC_BIN" "${COMMON[@]}" "$@";; esac; done
+
+# Partial links (`-r`) must not get executable-shaping flags, crt1 or libc.
+for a in "$@"; do case "$a" in -r|-Wl,-r|-Wl,--relocatable) exec "$CC_BIN" "${COMMON[@]}" -nostdlib --ld-path=/usr/bin/wasm-ld-19 "$@";; esac; done
+
+"$CC_BIN" "${COMMON[@]}" -isystem "$SYS/include" -nostdlib -fuse-ld=lld --ld-path=/usr/bin/wasm-ld-19 \
+  -Wl,--table-base=3 -L"$SYS/lib" "$SYS/lib/crt1.o" "$@" -lc "$RT" || exit
+
+# setjmp/longjmp becomes exception instructions (-wasm-enable-sjlj), and clang-19 still writes
+# them in the withdrawn "phase 3" encoding (`try`/`catch`). Browsers and V8 accept both, but
+# the native engine's compiler (wasmtime/cranelift) only implements the standard one, so
+# rewrite the linked program to `try_table`/`exnref`. Programs without setjmp pass unchanged.
+out=a.out
+for ((i = 1; i <= $#; i++)); do [[ "${!i}" == -o ]] && { j=$((i + 1)); out="${!j}"; }; done
+[[ -f "$out" ]] || exit 0
+"$U/../.tools/binaryen/bin/wasm-opt" -all --translate-to-exnref "$out" -o "$out.exnref" && mv "$out.exnref" "$out"

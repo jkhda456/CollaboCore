@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+# Minimal stand-in for `bzip2` (stdin -> stdout only), backed by Python's real bz2 module.
+# The machine has no bzip2 and no root to install one; busybox's scripts/mkconfigs only
+# needs `bzip2 -1 < file > out`. Not for general use.
+import bz2, sys
+level, decompress = 9, False
+for a in sys.argv[1:]:
+    if a in ("-d", "-dc", "-cd", "--decompress"): decompress = True
+    elif len(a) == 2 and a[0] == "-" and a[1].isdigit(): level = int(a[1])
+    elif a in ("-c", "--stdout", "-z", "--compress", "-"): pass
+    else: sys.exit(f"bzip2 shim: unsupported argument {a}")
+data = sys.stdin.buffer.read()
+sys.stdout.buffer.write(bz2.decompress(data) if decompress else bz2.compress(data, level))
