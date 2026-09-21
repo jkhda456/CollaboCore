@@ -30,3 +30,4 @@ flutter/collabo_core_demo/build/
 flutter/collabo_core_demo/.dart_tool/
 flutter/collabo_core_demo/pubspec.lock
 flutter/collabo_core_demo/**/ephemeral/
+.DS_Store
