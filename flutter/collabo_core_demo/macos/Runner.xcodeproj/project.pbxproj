@@ -357,7 +357,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "\"$SRCROOT/collabo_core_embed.sh\"\n";
+			shellScript = "/bin/sh \"$SRCROOT/collabo_core_embed.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

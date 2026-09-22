@@ -8,7 +8,15 @@
 #                                  a local disk folder (desktop) or the zip workspace (browser)
 #   collabo.work=TAG               old spelling of collabo.mount=TAG:/work
 #   collabo.agent=1                start collabo-agentd, through which the host runs commands
+#   collabo.sshagent=1             the host lends its ssh-agent: SSH_AUTH_SOCK (collabo-sshagent)
 #   collabo.quiet=1                no banner
+# The engine's session CA, when it came with the boot images: the sandbox's own HTTPS clients
+# (curl, git, python) then get the app's API keys for the hosts that have them, added on the host
+# (engine/src/intercept.rs). Everything else keeps Mozilla's roots alone.
+if [ -f /etc/ssl/collabo-ca.pem ]; then
+	cat /etc/ssl/collabo-ca.pem >> /etc/ssl/cert.pem
+fi
+
 MOUNTS=
 for a in $(cat /proc/cmdline); do
 	case $a in
@@ -17,6 +25,7 @@ for a in $(cat /proc/cmdline); do
 	collabo.mount=*) MOUNTS="$MOUNTS ${a#*=}" ;;
 	collabo.work=*) MOUNTS="$MOUNTS ${a#*=}:/work" ;;
 	collabo.agent=1) AGENT=1 ;;
+	collabo.sshagent=1) SSHAGENT=1 ;;
 	collabo.quiet=1) QUIET=1 ;;
 	esac
 done
@@ -51,6 +60,12 @@ for m in $MOUNTS; do
 		echo "mount: mounting $tag on $path failed"
 	fi
 done
+
+# Before the agent: commands the host runs inherit SSH_AUTH_SOCK (/etc/profile sets it for shells).
+if [ -n "$SSHAGENT" ]; then
+	export SSH_AUTH_SOCK=/run/collabo/ssh-agent.sock
+	collabo-sshagent "$SSH_AUTH_SOCK" 2>/tmp/collabo-sshagent.log &
+fi
 
 if [ -n "$AGENT" ]; then
 	collabo-agentd 2>/tmp/collabo-agentd.log &

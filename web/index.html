@@ -401,7 +401,8 @@
 
       // Root filesystem: cpio initramfs archives (busybox + /init that starts a root shell with no
       // login). The kernel unpacks archives placed back to back, so optional pieces are just
-      // appended: python.cpio brings CPython 3.13 (?python=0 leaves it out). Without any
+      // appended: python.cpio brings CPython 3.13 (?python=0 leaves it out), tools.cpio curl, ssh
+      // and git (only with ?tools=1: a browser has no sockets, so they reach little here). Without any
       // initramfs the kernel panics at "Unable to mount root fs".
       const fetchBytes = async (url) => {
         const response = await fetch(url);
@@ -412,6 +413,7 @@
       try {
         const wanted = [fetchBytes("./static/initramfs.cpio")];
         if (params.get("python") !== "0") wanted.push(fetchBytes("./static/python.cpio").catch(() => undefined));
+        if (params.get("tools") === "1") wanted.push(fetchBytes("./static/tools.cpio").catch(() => undefined));
         const archives = (await Promise.all(wanted)).filter(Boolean);
         initcpio = new Uint8Array(archives.reduce((total, a) => total + a.length, 0));
         archives.reduce((at, a) => (initcpio.set(a, at), at + a.length), 0);

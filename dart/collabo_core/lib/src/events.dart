@@ -61,7 +61,13 @@ class NetworkEvent {
   String toString() => 'NetworkEvent($via $kind ${phase ?? ''} ${url ?? host ?? '$ip:$port'}${blocked ? ' BLOCKED' : ''})';
 }
 
-/// The sandbox asks to run a host program ([kind] "exec") or open a file/URL ([kind] "open").
+/// The sandbox asks for something the app decides:
+///  * [kind] "exec": run a host program ([argv], [cwd], [gui]); "open": open a file or URL ([target])
+///    (both under `hostExec: ask`);
+///  * [kind] "network": reach [target] ("host:port"), which the network policy does not name
+///    (`NetworkPolicy.ask`);
+///  * [kind] "ssh-agent": use the host's ssh-agent ([target] says for what, e.g. "sign with
+///    ED25519 SHA256:… (me@laptop)"), under `sshAgent: ask`.
 class PermissionRequest {
   PermissionRequest(this.raw);
   final Map<String, Object?> raw;
@@ -73,8 +79,17 @@ class PermissionRequest {
   bool get gui => raw['gui'] == true;
   String? get target => raw['target'] as String?;
 
+  /// For "network" and "ssh-agent": whether the answer also covers the next requests for the same
+  /// [target] in this session. The handler may set it to false to be asked every time.
+  bool remember = true;
+
   @override
-  String toString() => kind == 'open' ? 'open $target' : '${gui ? 'start' : 'run'} ${argv.join(' ')}${cwd != null ? ' in $cwd' : ''}';
+  String toString() => switch (kind) {
+        'open' => 'open $target',
+        'network' => 'connect to $target',
+        'ssh-agent' => 'ssh-agent: $target',
+        _ => '${gui ? 'start' : 'run'} ${argv.join(' ')}${cwd != null ? ' in $cwd' : ''}',
+      };
 }
 
 /// Why the sandbox stopped.

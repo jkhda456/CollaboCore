@@ -6,9 +6,9 @@
 # only visible inside this guest, never on the host.
 #
 # Usage:
-#   ./sync-release.sh            # copy dist/web/ into the share (mirror: deletes extras there)
-#   ./sync-release.sh --dry-run  # show what would change
-#   ./sync-release.sh --check    # verify the share matches dist/web/ (exit 1 if not)
+#   scripts/sync-web.sh            # copy dist/web/ into the share (mirror: deletes extras there)
+#   scripts/sync-web.sh --dry-run  # show what would change
+#   scripts/sync-web.sh --check    # verify the share matches dist/web/ (exit 1 if not)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -28,6 +28,7 @@ if [[ "$LEVEL" == build || "$LEVEL" == all ]]; then
   remove "$ROOT/userspace/build" "$ROOT/userspace/out" "$ROOT/userspace/sysroot" \
          "$ROOT/python/build-host" "$ROOT/python/build-wasm" "$ROOT/python/build-zlib" \
          "$ROOT/python/host" "$ROOT/python/stage" "$ROOT/python/out" "$ROOT/python/zlib" \
+         "$ROOT/python/deps" "$ROOT/python/build-deps" "$ROOT/python/build-native" "$ROOT/python/build-etc" \
          "$ROOT/engine/target" "$ROOT/tests/node_modules" \
          "$ROOT/dart/collabo_core/.dart_tool" "$ROOT/flutter/collabo_core_demo/build" \
          "$ROOT/flutter/collabo_core_demo/.dart_tool"

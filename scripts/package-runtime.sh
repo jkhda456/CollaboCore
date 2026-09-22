@@ -6,6 +6,7 @@
 #     app/images/vmlinux.wasm         the kernel
 #     app/images/initramfs.cpio       guest root (busybox, /init, the agent)
 #     app/images/python.cpio          CPython 3.13 overlay
+#     app/images/tools.cpio           network tools overlay (curl, ssh, git)
 #     app/licenses/*
 #     manifest.json                   { platform, engine, protocol, entry, files }
 #
@@ -41,8 +42,8 @@ case "$(uname -s)-$(uname -m)" in
 esac
 PLATFORMS="${PLATFORMS:-$HERE}"
 [[ -n "$PLATFORMS" ]] || { echo "unknown platform $(uname -sm); set PLATFORMS" >&2; exit 2; }
-[[ -f "$ENGINE/kernel/vmlinux.wasm" ]] || { echo "missing dist/engine; run scripts/build-engine.sh" >&2; exit 1; }
-command -v cargo >/dev/null || { echo "no cargo; run scripts/bootstrap-tools.sh" >&2; exit 1; }
+[[ -f "$ENGINE/kernel/vmlinux.wasm" ]] || { echo "missing dist/engine; run: python3 build.py engine" >&2; exit 1; }
+command -v cargo >/dev/null || { echo "no cargo; run: python3 build.py tools" >&2; exit 1; }
 mkdir -p "$OUT"
 
 triple() {
@@ -93,6 +94,8 @@ entry = ["bin/" + exe,
          "--kernel", "app/images/vmlinux.wasm",
          "--initramfs", "app/images/initramfs.cpio",
          "--python-image", "app/images/python.cpio"]
+if os.path.exists(os.path.join(d, "app/images/tools.cpio")):
+    entry += ["--tools-image", "app/images/tools.cpio"]
 json.dump({"name": "collabo-core-runtime", "platform": platform, "engine": "wasmtime", "protocol": 1,
            "entry": entry, "files": dict(sorted(files.items()))},
           open(os.path.join(d, "manifest.json"), "w"), indent=1)

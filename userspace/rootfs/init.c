@@ -40,6 +40,9 @@ int main(void)
 	mnt("proc", "/proc", "proc", 0);	// busybox (NOMMU) re-execs /proc/self/exe
 	mnt("sysfs", "/sys", "sysfs", 0);
 	mnt("devtmpfs", "/dev", "devtmpfs", 0);
+	// Without it os.openpty() is ENOENT and Python's pty falls back to the BSD /dev/ttyp*
+	// pairs, whose slave it opens without O_NOCTTY.
+	mnt("devpts", "/dev/pts", "devpts", 0);
 	mnt("tmpfs", "/tmp", "tmpfs", 0);
 	mkdir("/root", 0700);
 	sethostname("collabo", 7);
@@ -61,12 +64,20 @@ int main(void)
 	}
 	puts("init: starting /bin/sh");
 
+	// The shell needs the console as its controlling terminal, or ^C has no foreground group
+	// to signal. posix_spawn can start a session but not take a terminal (TIOCSCTTY), so
+	// busybox `setsid -c` does both and then execs the shell in the same process.
+	char *session[] = { "setsid", "-c", "sh", "-l", NULL };
+	char *plain[] = { "sh", "-l", NULL };
+	int ctty = access("/usr/bin/setsid", X_OK) == 0;
+	const char *path = ctty ? "/usr/bin/setsid" : "/bin/sh";
+	char **argv = ctty ? session : plain;
+
 	for (;;) {
-		char *argv[] = { "sh", "-l", NULL };
 		pid_t pid;
-		int err = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
+		int err = posix_spawn(&pid, path, NULL, NULL, argv, environ);
 		if (err) {
-			fprintf(stderr, "init: cannot spawn /bin/sh: %s\n", strerror(err));
+			fprintf(stderr, "init: cannot spawn %s: %s\n", path, strerror(err));
 			sleep(1);
 			continue;
 		}

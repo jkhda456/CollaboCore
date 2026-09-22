@@ -81,7 +81,9 @@ impl Default for HostPolicy {
 pub enum Ask {
     /// A function the app registered.
     Call { call_id: u64, function: String, args: Value },
-    /// Permission to touch the host: kind is "exec" or "open".
+    /// Permission to touch the host (kind "exec" or "open"), to reach a host the network policy
+    /// does not name (kind "network", target "host:port"), or to use the host's ssh-agent
+    /// (kind "ssh-agent").
     Permission { request_id: u64, kind: &'static str, argv: Vec<String>, cwd: Option<String>, gui: bool, target: Option<String> },
 }
 
@@ -89,7 +91,8 @@ pub enum Ask {
 pub enum Reply {
     Result(Value),
     Error { kind: String, message: String },
-    Allow(bool),
+    /// Whether it may, and whether the answer holds for the rest of the session.
+    Allow { allow: bool, remember: bool },
 }
 
 struct CallError {
@@ -231,7 +234,7 @@ impl HostFunctions {
                 match self.ask_app(call_id, Ask::Call { call_id, function: other.to_string(), args: args.clone() }, timeout) {
                     Some(Reply::Result(result)) => Ok(result),
                     Some(Reply::Error { kind, message }) => Err(CallError { kind, message }),
-                    Some(Reply::Allow(_)) => refuse("failed", "the app answered a call with a permission"),
+                    Some(Reply::Allow { .. }) => refuse("failed", "the app answered a call with a permission"),
                     None => refuse("timeout", "the app did not answer"),
                 }
             }
@@ -251,11 +254,23 @@ impl HostFunctions {
                 let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 let asked = Ask::Permission { request_id, kind, argv, cwd, gui, target };
                 match self.ask_app(request_id, asked, timeout) {
-                    Some(Reply::Allow(true)) => Ok(()),
+                    Some(Reply::Allow { allow: true, .. }) => Ok(()),
                     Some(_) => refuse("denied", "the user did not allow it"),
                     None => refuse("denied", "nobody answered the permission request"),
                 }
             }
+        }
+    }
+
+    /// Asks the app about something other than a host program (kind "network", "ssh-agent"),
+    /// as a `permission` event. None when nobody answered in time.
+    pub fn ask_permission(&self, kind: &'static str, target: &str) -> Option<(bool, bool)> {
+        let timeout = self.policy.read().unwrap().permission_timeout;
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let asked = Ask::Permission { request_id, kind, argv: Vec::new(), cwd: None, gui: false, target: Some(target.to_string()) };
+        match self.ask_app(request_id, asked, timeout)? {
+            Reply::Allow { allow, remember } => Some((allow, remember)),
+            _ => Some((false, false)),
         }
     }
 

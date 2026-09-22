@@ -12,6 +12,15 @@ anyhow = "1"
 rand = "0.9"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 serde_json = "1.0.151"
+# SHA-256 for ssh key fingerprints (already in the tree through rustls).
+ring = "0.17"
+# The secret-injecting TLS proxy for the packet network (intercept.rs): the same rustls and roots
+# ureq uses, and rcgen for the session CA and its per-host certificates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+time = "0.3"
 
 [profile.release]
 opt-level = 3

@@ -70,11 +70,15 @@ def main():
                          "base directories, only what --file/--link/--etc name")
     ap.add_argument("--etc", help="directory copied to /etc")
     ap.add_argument("--file", action="append", default=[], metavar="DEST=SRC",
-                    help="add an executable file, e.g. usr/bin/hfetch=out/hfetch.wasm (repeatable)")
+                    help="add a file, e.g. usr/bin/hfetch=out/hfetch.wasm; 755 when it is a wasm program or "
+                         "starts with #! (repeatable)")
     ap.add_argument("--dir", action="append", default=[], metavar="PATH",
                     help="add an (empty) directory, e.g. usr/lib/python3.13/lib-dynload (repeatable)")
     ap.add_argument("--link", action="append", default=[], metavar="DEST=TARGET",
                     help="add a symlink, e.g. usr/bin/python=python3.13 (repeatable)")
+    ap.add_argument("--tree", action="append", default=[], metavar="DEST=SRC",
+                    help="add a directory tree, e.g. usr/share/terminfo=deps/share/terminfo; a file "
+                         "is 755 when it is a wasm program, starts with #! or is executable on the host (repeatable)")
     ap.add_argument("-o", "--output", required=True)
     args = ap.parse_args()
     if not args.overlay and not (args.init and args.busybox):
@@ -120,7 +124,8 @@ def main():
         if not dest or not src:
             ap.error(f"--file expects DEST=SRC, got {spec!r}")
         ensure_parents(dest)
-        c.file(dest, open(src, "rb").read(), 0o755 if not dest.endswith(".zip") else 0o644)
+        data = open(src, "rb").read()
+        c.file(dest, data, 0o755 if data.startswith((b"\0asm", b"#!")) else 0o644)
 
     for d in args.dir:
         ensure_parents(d + "/x")
@@ -134,6 +139,28 @@ def main():
         ensure_parents(dest)
         c.symlink(dest, target)
 
+    for spec in args.tree:
+        dest, _, src = spec.partition("=")
+        if not dest or not src:
+            ap.error(f"--tree expects DEST=SRC, got {spec!r}")
+        ensure_parents(dest + "/x")
+        if dest not in c.seen:
+            c.dir(dest)
+        for root, dirs, files in os.walk(src):
+            dirs.sort()
+            rel = os.path.relpath(root, src)
+            base = dest if rel == "." else f"{dest}/{rel}"
+            if base not in c.seen:
+                c.dir(base)
+            for f in sorted(files):
+                p = os.path.join(root, f)
+                if os.path.islink(p):
+                    c.symlink(f"{base}/{f}", os.readlink(p))
+                    continue
+                data = open(p, "rb").read()
+                executable = data.startswith((b"\0asm", b"#!")) or os.stat(p).st_mode & stat.S_IXUSR
+                c.file(f"{base}/{f}", data, 0o755 if executable else 0o644)
+
     if args.etc:
         for root, dirs, files in os.walk(args.etc):
             dirs.sort()
@@ -141,7 +168,12 @@ def main():
                 p = os.path.join(root, f)
                 r = os.path.join("etc", os.path.relpath(p, args.etc))
                 ensure_parents(r)
-                c.file(r, open(p, "rb").read(), 0o755 if os.stat(p).st_mode & stat.S_IXUSR else 0o644)
+                # These come from the source tree, where a checkout on Windows or through a shared
+                # folder loses the executable bit and may turn LF into CRLF. A script is known by
+                # its #! line, not by the host's mode, and the guest's shell wants LF.
+                data = open(p, "rb").read().replace(b"\r\n", b"\n")
+                executable = data.startswith(b"#!") or os.stat(p).st_mode & stat.S_IXUSR
+                c.file(r, data, 0o755 if executable else 0o644)
 
     data = c.finish()
     with open(args.output, "wb") as fh:

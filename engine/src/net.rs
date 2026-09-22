@@ -22,7 +22,8 @@ use std::time::Duration;
 use anyhow::Result;
 use wasmtime::SharedMemory;
 
-use crate::http::Policy;
+use crate::http::{Asker, Policy};
+use crate::intercept::Interceptor;
 use crate::machine::Waker;
 use crate::virtio::{write_bytes, Device, Queue};
 
@@ -184,10 +185,27 @@ pub struct Stack {
     /// is allowed when the name it came from is.
     resolved: Mutex<HashMap<Ipv4Addr, Vec<String>>>,
     next_id: Mutex<u64>,
+    /// Asks the app about hosts neither list names, when the policy says `ask`.
+    asker: Option<Asker>,
+    /// Takes the TLS connections to hosts that have secrets, to add them (intercept.rs).
+    interceptor: Option<Arc<Interceptor>>,
+}
+
+/// What to do with a connection the guest opens.
+enum Decision {
+    Allow,
+    Refuse(String),
+    /// Ask the app about this "host:port" first.
+    Ask(String),
 }
 
 impl Stack {
-    pub fn new(policy: Arc<RwLock<Policy>>, observer: Option<Observer>) -> Arc<Stack> {
+    pub fn new(
+        policy: Arc<RwLock<Policy>>,
+        observer: Option<Observer>,
+        asker: Option<Asker>,
+        interceptor: Option<Arc<Interceptor>>,
+    ) -> Arc<Stack> {
         Arc::new(Stack {
             policy,
             observer,
@@ -196,6 +214,8 @@ impl Stack {
             connections: Mutex::new(HashMap::new()),
             resolved: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
+            asker,
+            interceptor,
         })
     }
 
@@ -220,27 +240,36 @@ impl Stack {
         self.waker.lock().unwrap().wake();
     }
 
-    /// Why the guest may not reach this address, if it may not.
-    fn refuses(&self, address: Ipv4Addr, target: Ipv4Addr) -> Option<String> {
+    /// May the guest reach this address (as `address`, really `target`) on `port`?
+    fn decide(&self, address: Ipv4Addr, target: Ipv4Addr, port: u16) -> Decision {
         let policy = self.policy.read().unwrap();
         // The gateway is this computer: `allowHostLoopback` alone governs it.
         if target.is_loopback() {
             return match policy.allow_loopback {
-                true => None,
-                false => Some("the host's own services (192.0.2.1 = its localhost) are not allowed".into()),
+                true => Decision::Allow,
+                false => Decision::Refuse("the host's own services (192.0.2.1 = its localhost) are not allowed".into()),
             };
         }
         let names = self.resolved.lock().unwrap().get(&address).cloned().unwrap_or_default();
         if names.iter().any(|name| policy.refuses_host(name).is_none()) {
-            return None;
+            return Decision::Allow;
         }
-        match policy.refuses_host(&address.to_string()) {
-            None => None,
-            Some(reason) => Some(match names.first() {
-                Some(name) => policy.refuses_host(name).unwrap_or(reason),
-                None => format!("{address} was not resolved from an allowed name"),
-            }),
+        let ip = address.to_string();
+        let Some(reason) = policy.refuses_host(&ip) else { return Decision::Allow };
+        // A name (or, without one, the address) that no list mentions: the app decides.
+        if policy.ask && self.asker.is_some() {
+            let unlisted = match names.is_empty() {
+                true => policy.unlisted(&ip).then_some(ip.as_str()),
+                false => names.iter().find(|name| policy.unlisted(name)).map(String::as_str),
+            };
+            if let Some(host) = unlisted {
+                return Decision::Ask(format!("{host}:{port}"));
+            }
         }
+        Decision::Refuse(match names.first() {
+            Some(name) => policy.refuses_host(name).unwrap_or(reason),
+            None => format!("{address} was not resolved from an allowed name"),
+        })
     }
 
     // ---- what arrives from the guest ----------------------------------------------------
@@ -356,7 +385,13 @@ impl Stack {
         let mut code = 3u8;
         let mut addresses: Vec<Ipv4Addr> = Vec::new();
         let name = name.trim_end_matches('.').to_lowercase();
-        match self.policy.read().unwrap().refuses_host(&name) {
+        let refused = {
+            let policy = self.policy.read().unwrap();
+            // With `ask`, an unlisted name resolves: the question comes when the guest connects,
+            // with the port, and the address alone lets nothing through.
+            policy.refuses_host(&name).filter(|_| !(policy.ask && self.asker.is_some() && policy.unlisted(&name)))
+        };
+        match refused {
             Some(reason) => {
                 self.report(Event::Dns { host: name.clone(), addresses: Vec::new(), blocked: true, reason: Some(reason) });
             }
@@ -506,18 +541,11 @@ impl Stack {
         };
         // The gateway is this computer, so that is where the connection really goes.
         let target = if destination == GATEWAY { Ipv4Addr::LOCALHOST } else { destination };
-        if let Some(reason) = self.refuses(destination, target) {
-            self.report(Event::Connect {
-                id,
-                ip: destination.to_string(),
-                port,
-                phase: "failed",
-                blocked: true,
-                reason: Some(reason),
-            });
-            self.send(tcp_segment(destination, guest_port, port, 0, sequence.wrapping_add(1), RST | ACK, 0, &[]));
-            return;
-        }
+        let asking = match self.decide(destination, target, port) {
+            Decision::Allow => None,
+            Decision::Refuse(reason) => return self.refuse(id, destination, port, guest_port, sequence, reason),
+            Decision::Ask(what) => Some(what),
+        };
 
         let initial = rand_sequence();
         {
@@ -547,15 +575,60 @@ impl Stack {
                 },
             );
         }
-        self.report(Event::Connect { id, ip: destination.to_string(), port, phase: "open", blocked: false, reason: None });
-        self.connect(key, SocketAddr::new(IpAddr::V4(target), port));
+        let address = SocketAddr::new(IpAddr::V4(target), port);
+        let Some(what) = asking else {
+            self.report(Event::Connect { id, ip: destination.to_string(), port, phase: "open", blocked: false, reason: None });
+            return self.connect(key, address);
+        };
+        // The user may take a while; the guest keeps resending its SYN, which the connection
+        // entry above absorbs, until the answer.
+        let (stack, asker) = (self.clone(), self.asker.clone().expect("Decision::Ask needs an asker"));
+        std::thread::spawn(move || match asker("net", &what) {
+            true => {
+                stack.report(Event::Connect { id, ip: destination.to_string(), port, phase: "open", blocked: false, reason: None });
+                stack.connect(key, address);
+            }
+            false => {
+                stack.connections.lock().unwrap().remove(&key);
+                let reason = format!("blocked by the network policy: the app did not allow \"{what}\"");
+                stack.refuse(id, destination, port, guest_port, sequence, reason);
+            }
+        });
+    }
+
+    /// Turns a connection away: the guest sees it reset, the app sees why.
+    fn refuse(&self, id: u64, destination: Ipv4Addr, port: u16, guest_port: u16, sequence: u32, reason: String) {
+        self.report(Event::Connect {
+            id,
+            ip: destination.to_string(),
+            port,
+            phase: "failed",
+            blocked: true,
+            reason: Some(reason),
+        });
+        self.send(tcp_segment(destination, guest_port, port, 0, sequence.wrapping_add(1), RST | ACK, 0, &[]));
+    }
+
+    /// The interceptor, when this connection goes to a host the app has secrets for.
+    fn interceptor_for(&self, address: SocketAddr, guest_target: Ipv4Addr) -> Option<Arc<Interceptor>> {
+        let interceptor = self.interceptor.as_ref()?;
+        let names = match address.ip().is_loopback() {
+            true => vec!["localhost".to_string()],
+            false => self.resolved.lock().unwrap().get(&guest_target).cloned().unwrap_or_default(),
+        };
+        let policy = self.policy.read().unwrap();
+        names.iter().any(|name| policy.has_secret_for(name)).then(|| interceptor.clone())
     }
 
     /// Connects on the host; the guest waits for the SYN-ACK this produces.
     fn connect(self: &Arc<Stack>, key: (u16, Ipv4Addr, u16), address: SocketAddr) {
         let owner = self.clone();
+        let guest_target = key.1;
         std::thread::spawn(move || {
-            let socket = TcpStream::connect_timeout(&address, Duration::from_secs(10));
+            let socket = match owner.interceptor_for(address, guest_target) {
+                Some(interceptor) => interceptor.attach(address),
+                None => TcpStream::connect_timeout(&address, Duration::from_secs(10)),
+            };
             let mut connections = owner.connections.lock().unwrap();
             let Some(connection) = connections.get_mut(&key) else { return };
             let (id, ip, port) = (connection.id, connection.guest_target.to_string(), connection.port);

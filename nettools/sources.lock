@@ -1,0 +1,6 @@
+# Sources of the network tools image (tools.cpio): name, URL, sha256 of the download.
+# Versions follow third_party/distro/distro/*/package.nix; each tarball unpacks to exactly the tree
+# whose Nix NAR hash distro pins there (checked with python/nar-hash.py when a line changes).
+curl      https://curl.se/download/curl-8.21.0.tar.xz                                   aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6
+dropbear  https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.92.tar.bz2            91dcb5234de8dea68dd82c55411c9fc986b457ab58372a780ee8a870419c2f7e
+git       https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz                 457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357

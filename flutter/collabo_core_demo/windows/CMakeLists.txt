@@ -116,7 +116,7 @@ else()
   set(COLLABO_CORE_PLATFORM "win-x64")
 endif()
 if(NOT EXISTS "${COLLABO_CORE_RUNTIME_DIR}/collabo-core-${COLLABO_CORE_PLATFORM}/manifest.json")
-  message(FATAL_ERROR "collaboCore runtime not found: ${COLLABO_CORE_RUNTIME_DIR}/collabo-core-${COLLABO_CORE_PLATFORM} (run scripts/package-runtime.sh)")
+  message(FATAL_ERROR "collaboCore runtime not found: ${COLLABO_CORE_RUNTIME_DIR}/collabo-core-${COLLABO_CORE_PLATFORM} (run: python3 build.py runtime)")
 endif()
 install(DIRECTORY "${COLLABO_CORE_RUNTIME_DIR}/collabo-core-${COLLABO_CORE_PLATFORM}"
   DESTINATION "${CMAKE_INSTALL_PREFIX}/collabo_core_runtime"

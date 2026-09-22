@@ -128,11 +128,13 @@ def _():
         finally:
             sys.path.remove(d)
 
-@check("no fork/mmap-based modules, as configured")
+@check("no fork, no C mmap: only what the platform cannot have is missing")
 def _():
     assert not hasattr(os, "fork") and not hasattr(os, "vfork")
-    notes = [must_not_import(m) for m in ("mmap", "_ctypes", "_posixsubprocess", "sqlite3", "ssl", "_bz2", "_lzma")]
-    return f"{len(notes)} optional modules absent"
+    notes = [must_not_import(m) for m in ("_ctypes", "_posixsubprocess", "_posixshmem", "_tkinter")]
+    import mmap  # the copy-based stand-in (python/lib/mmap.py), not the C module
+    assert "mmap" not in sys.builtin_module_names and mmap.__file__.endswith((".py", ".pyc"))
+    return f"{len(notes)} platform-impossible modules absent"
 
 # ---- files ------------------------------------------------------------------------------------
 

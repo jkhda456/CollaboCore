@@ -19,10 +19,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/dist/release"
 
 if [[ "${1:-}" == "--build" ]]; then
-  "$ROOT/build.sh" engine web runtime
+  python3 "$ROOT/build.py" engine web runtime
 fi
 
-[[ -d "$ROOT/dist/runtime" ]] || { echo "no dist/runtime; run scripts/package-runtime.sh" >&2; exit 1; }
+[[ -d "$ROOT/dist/runtime" ]] || { echo "no dist/runtime; run: python3 build.py runtime" >&2; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT"
 
 found=0

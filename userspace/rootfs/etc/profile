@@ -1,4 +1,6 @@
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export HOME=/root
+# The host's ssh-agent, when the app lends it (see /etc/rc).
+grep -q 'collabo.sshagent=1' /proc/cmdline 2>/dev/null && export SSH_AUTH_SOCK=/run/collabo/ssh-agent.sock
 PS1='\u@\h:\w\$ '
 if [ -d /work ]; then cd /work; else cd "$HOME"; fi

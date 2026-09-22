@@ -4,6 +4,7 @@ class CollaboConfig {
   const CollaboConfig({
     this.cpus,
     this.python = true,
+    this.tools = true,
     this.mounts = const [],
     this.network = const NetworkPolicy(),
     this.networkEnabled = true,
@@ -18,8 +19,12 @@ class CollaboConfig {
   /// Virtual CPUs; one host thread each. Default: min(4, host CPUs).
   final int? cpus;
 
-  /// Boot with CPython 3.13 (adds ~17 MB to what is loaded at start).
+  /// Boot with CPython 3.13 and pip (adds ~62 MB to what is loaded at start).
   final bool python;
+
+  /// Boot with the network tools: curl, ssh (dropbear) and git (adds ~14 MB). busybox's wget,
+  /// nc and telnet are always there.
+  final bool tools;
 
   /// Local folders to share with the sandbox.
   final List<Mount> mounts;
@@ -48,6 +53,7 @@ class CollaboConfig {
   Map<String, Object?> toJson() => {
         if (cpus != null) 'cpus': cpus,
         'python': python,
+        'tools': tools,
         'mounts': [for (final m in mounts) m.toJson()],
         'network': networkEnabled ? network.toJson() : false,
         'hostExec': hostExec.name,
@@ -82,6 +88,7 @@ class NetworkPolicy {
     this.allowHostLoopback = false,
     this.secrets = const [],
     this.extraAllowedHeaders = const [],
+    this.ask = false,
   });
 
   final List<String> allow;
@@ -98,12 +105,20 @@ class NetworkPolicy {
   /// and x-api-key (for example `anthropic-version`).
   final List<String> extraAllowedHeaders;
 
+  /// A host that neither [allow] nor [deny] names is not refused but asked about:
+  /// [CollaboCore.onPermission] gets a request of kind "network" with target "host:port"
+  /// (curl, git, ssh, python sockets and hfetch alike). The answer holds for that host:port
+  /// until the policy changes, unless the handler clears [PermissionRequest.remember].
+  /// Useful with a narrow [allow] list, e.g. `allow: ['api.openai.com'], ask: true`.
+  final bool ask;
+
   Map<String, Object?> toJson() => {
         'allow': allow,
         'deny': deny,
         'allowHostLoopback': allowHostLoopback,
         'secrets': [for (final s in secrets) s.toJson()],
         'extraAllowedHeaders': extraAllowedHeaders,
+        'ask': ask,
       };
 }
 

@@ -22,6 +22,11 @@ header. Cookies are never sent and redirects are followed. For code that already
 
     collabo_core.install_urllib()               # urllib.request.urlopen() now goes through the host
 
+httpx2 (and so the openai SDK) can use the host the same way:
+
+    client = collabo_core.openai_client()       # openai.OpenAI; the host adds the API key
+    httpx2.Client(transport=collabo_core.HostTransport())
+
 The wire format is documented in release/app/http-protocol.js.
 """
 import io
@@ -30,7 +35,8 @@ import os
 import socket
 
 __all__ = ["request", "get", "post", "put", "delete", "head", "patch", "Response", "Headers",
-           "HostError", "IncompleteResponse", "StatusError", "install_urllib"]
+           "HostError", "IncompleteResponse", "StatusError", "install_urllib",
+           "HostTransport", "AsyncHostTransport", "openai_client"]
 
 VMADDR_CID_HOST = 2
 DEFAULT_PORT = 1080
@@ -350,6 +356,133 @@ def install_urllib():
         http_open = https_open = _open
 
     urllib.request.install_opener(urllib.request.build_opener(HostHandler))
+
+
+# ---- httpx (the openai SDK) --------------------------------------------------------------------
+
+# Headers httpx and SDKs built on it add by themselves: the host sets its own transport headers,
+# and SDK telemetry (x-stainless-*) is not the program's to send. Any other header is passed on,
+# so the host's allow-list still refuses what it does not accept, with a message.
+_HTTPX_DEFAULTS = _URLLIB_DEFAULTS | {"transfer-encoding"}
+# The host hands over bodies already decoded, so these no longer describe what arrives.
+_DECODED = {"content-encoding", "content-length", "transfer-encoding"}
+
+
+def _host_transports():
+    """HostTransport and AsyncHostTransport, built on first use (httpx2 is imported only then)."""
+    import asyncio
+    import httpx2
+
+    send = request  # the module's request(); inside the transports `request` is httpx's
+
+    def forward(request):
+        return {name: value for name, value in request.headers.items()
+                if name.lower() not in _HTTPX_DEFAULTS and not name.lower().startswith("x-stainless-")}
+
+    def timeout_of(request):
+        timeouts = request.extensions.get("timeout") or {}
+        values = [t for t in (timeouts.get("connect"), timeouts.get("read")) if t is not None]
+        return max(values) if values else None
+
+    def raise_as_httpx(error, request):
+        if isinstance(error, IncompleteResponse):
+            raise httpx2.RemoteProtocolError(str(error), request=request) from error
+        if error.kind == "timeout":
+            raise httpx2.ReadTimeout(str(error), request=request) from error
+        if error.kind in ("network", "no-response", "busy"):
+            raise httpx2.ConnectError(str(error), request=request) from error
+        raise httpx2.RequestError(str(error), request=request) from error
+
+    def to_response(response, stream):
+        headers = [(k, v) for k, v in response.headers.items() if k not in _DECODED]
+        return httpx2.Response(response.status, headers=headers, stream=stream,
+                               extensions={"reason_phrase": (response.reason or "").encode()})
+
+    class _Body(httpx2.SyncByteStream):
+        def __init__(self, response, request):
+            self.response, self.request = response, request
+
+        def __iter__(self):
+            try:
+                yield from self.response.iter_bytes()
+            except HostError as error:
+                raise_as_httpx(error, self.request)
+
+        def close(self):
+            self.response.close()
+
+    class HostTransport(httpx2.BaseTransport):
+        """An httpx2 transport that sends every request through the host (see the module doc).
+        The host applies its network policy and adds the secrets it holds for the destination."""
+
+        def handle_request(self, request):
+            try:
+                response = send(request.method, str(request.url), headers=forward(request),
+                                data=request.read(), timeout=timeout_of(request))
+            except HostError as error:
+                raise_as_httpx(error, request)
+            return to_response(response, _Body(response, request))
+
+    class _AsyncBody(httpx2.AsyncByteStream):
+        def __init__(self, response, request):
+            self.response, self.request = response, request
+
+        async def __aiter__(self):
+            chunks = self.response.iter_bytes()
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(next, chunks, None)
+                except HostError as error:
+                    raise_as_httpx(error, self.request)
+                if chunk is None:
+                    return
+                yield chunk
+
+        async def aclose(self):
+            self.response.close()
+
+    class AsyncHostTransport(httpx2.AsyncBaseTransport):
+        """HostTransport for httpx2.AsyncClient: the blocking vsock exchange runs in a thread."""
+
+        async def handle_async_request(self, request):
+            body = await request.aread()
+            try:
+                response = await asyncio.to_thread(send, request.method, str(request.url),
+                                                   headers=forward(request), data=body,
+                                                   timeout=timeout_of(request))
+            except HostError as error:
+                raise_as_httpx(error, request)
+            return to_response(response, _AsyncBody(response, request))
+
+    return HostTransport, AsyncHostTransport
+
+
+def __getattr__(name):
+    if name in ("HostTransport", "AsyncHostTransport"):
+        sync, async_ = _host_transports()
+        globals().update(HostTransport=sync, AsyncHostTransport=async_)
+        return globals()[name]
+    raise AttributeError(f"module 'collabo_core' has no attribute {name!r}")
+
+
+def openai_client(*, api_key=None, async_=False, **kwargs):
+    """An openai.OpenAI (or AsyncOpenAI) client whose requests go through the host.
+
+    The key usually stays with the host: it adds the secret it holds for the API's host (the
+    app's `secrets` setting), replacing whatever the guest sent, so the key given here — or
+    OPENAI_API_KEY, or a placeholder — never needs to be the real one. Other arguments go to
+    the client as usual (base_url, timeout, max_retries, ...)."""
+    import httpx2
+    import openai
+
+    if api_key is None:
+        api_key = os.environ.get("OPENAI_API_KEY") or "host-managed"
+    if async_:
+        return openai.AsyncOpenAI(api_key=api_key,
+                                  http_client=httpx2.AsyncClient(transport=__getattr__("AsyncHostTransport")()),
+                                  **kwargs)
+    return openai.OpenAI(api_key=api_key, http_client=httpx2.Client(transport=__getattr__("HostTransport")()),
+                         **kwargs)
 
 
 # ---- host functions ----------------------------------------------------------------------------

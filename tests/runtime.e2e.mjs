@@ -4,11 +4,11 @@
 // Portable: needs nothing on the host but Node (no openssl, python, sh), so it runs unchanged on
 // Linux, macOS and Windows. COLLABO_CORE_RUNTIME may point at the runtime folder (or its parent).
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createTcpServer } from "node:net";
-import { tmpdir, platform, arch } from "node:os";
+import { tmpdir, platform, arch, userInfo } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,7 @@ const MANIFEST = JSON.parse(readFileSync(join(RUNTIME, "manifest.json"), "utf8")
 const PROGRAM = join(RUNTIME, MANIFEST.entry[0]);
 const ENTRY_ARGS = MANIFEST.entry.slice(1);
 const SECRET = "sk-test-0123456789abcdef";
+const OPENAI_KEY = "sk-openai-fedcba9876543210";
 const b64 = (s) => Buffer.from(s).toString("base64");
 const unb64 = (s) => Buffer.from(s, "base64").toString();
 
@@ -107,13 +108,90 @@ mkdirSync(docs);
 writeFileSync(join(work, "hello.txt"), "from the host\n");
 writeFileSync(join(docs, "readme.md"), "read only\n");
 const seen = [];
+// A stand-in for the OpenAI API: says whether the host's key arrived, plainly or streamed (SSE).
+function chatCompletion(req, res, body) {
+  const authorized = req.headers.authorization === `Bearer ${OPENAI_KEY}`;
+  const content = `authorized=${authorized} model=${body.model} said=${body.messages?.at(-1)?.content}`;
+  const base = { id: "c1", created: 0, model: body.model };
+  if (!body.stream) {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ...base, object: "chat.completion",
+      choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content } }] }));
+    return;
+  }
+  res.setHeader("content-type", "text/event-stream");
+  for (const piece of content.split(" ")) {
+    res.write(`data: ${JSON.stringify({ ...base, object: "chat.completion.chunk",
+      choices: [{ index: 0, finish_reason: null, delta: { content: piece + " " } }] })}\n\n`);
+  }
+  res.end("data: [DONE]\n\n");
+}
 const https = createHttpsServer({ key: readFileSync(join(FIXTURES, "localhost-key.pem")), cert: readFileSync(join(FIXTURES, "localhost-cert.pem")) }, (req, res) => {
   seen.push({ url: req.url, headers: req.headers });
+  if (req.url === "/v1/chat/completions") {
+    const chunks = [];
+    req.on("data", (d) => chunks.push(d));
+    req.on("end", () => chatCompletion(req, res, JSON.parse(Buffer.concat(chunks).toString())));
+    return;
+  }
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify({ path: req.url, hasKey: req.headers["x-api-key"] === SECRET, sawKeyHeader: "x-api-key" in req.headers }));
 });
 const tcp = createTcpServer((s) => s.on("data", (d) => s.end("echo:" + d)));
 let HTTPS_PORT, TCP_PORT;
+
+// ssh: a throwaway sshd on this computer's loopback (the guest's 192.0.2.1) that accepts one key,
+// and an ssh-agent holding that key. The sandbox borrows the agent; the key never enters it.
+// Needs OpenSSH's sshd and ssh-agent (not on Windows runners: those tests are skipped).
+const SSH = (() => {
+  const which = (name) => ["/usr/sbin", "/usr/bin", "/usr/local/sbin", "/opt/homebrew/sbin", "/opt/homebrew/bin"]
+    .map((d) => join(d, name)).find((p) => existsSync(p));
+  const sshd = which("sshd"), agent = which("ssh-agent"), keygen = which("ssh-keygen"), add = which("ssh-add");
+  return platform() !== "win32" && sshd && agent && keygen && add ? { sshd, agent, keygen, add } : null;
+})();
+const sshDir = join(tmp, "ssh");
+let SSHD_PORT, sshdProc, agentProc;
+const AGENT_SOCK = join(sshDir, "agent.sock");
+const REPO = join(tmp, "repo.git");
+// How the tests answer the network and ssh-agent questions (kind -> (target) => allow).
+const answers = { network: () => false, "ssh-agent": () => false };
+const freePort = () => new Promise((resolve) => {
+  const probe = createTcpServer().listen(0, "127.0.0.1", () => {
+    const { port } = probe.address();
+    probe.close(() => resolve(port));
+  });
+});
+async function startSsh() {
+  mkdirSync(sshDir, { recursive: true });
+  const run = (cmd, args, env) => {
+    const r = spawnSync(cmd, args, { env: { ...process.env, ...env }, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout;
+  };
+  run(SSH.keygen, ["-q", "-t", "ed25519", "-N", "", "-f", join(sshDir, "host_key")]);
+  run(SSH.keygen, ["-q", "-t", "ed25519", "-N", "", "-C", "sandbox-test@host", "-f", join(sshDir, "user_key")]);
+  writeFileSync(join(sshDir, "authorized_keys"), readFileSync(join(sshDir, "user_key.pub")));
+  SSHD_PORT = await freePort();
+  writeFileSync(join(sshDir, "sshd_config"), [
+    `Port ${SSHD_PORT}`, "ListenAddress 127.0.0.1", `HostKey ${join(sshDir, "host_key")}`,
+    `PidFile ${join(sshDir, "sshd.pid")}`, `AuthorizedKeysFile ${join(sshDir, "authorized_keys")}`,
+    "StrictModes no", "UsePAM no", "PasswordAuthentication no", "KbdInteractiveAuthentication no",
+    "PubkeyAuthentication yes", "LogLevel ERROR", "",
+  ].join("\n"));
+  sshdProc = spawn(SSH.sshd, ["-D", "-e", "-f", join(sshDir, "sshd_config")], { stdio: "ignore" });
+  agentProc = spawn(SSH.agent, ["-D", "-a", AGENT_SOCK], { stdio: "ignore" });
+  for (let i = 0; i < 50 && !existsSync(AGENT_SOCK); i++) await new Promise((r) => setTimeout(r, 100));
+  run(SSH.add, ["-q", join(sshDir, "user_key")], { SSH_AUTH_SOCK: AGENT_SOCK });
+  // A repository to clone over ssh.
+  const git = (...args) => run("git", args, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" });
+  const src = join(tmp, "repo-src");
+  mkdirSync(src);
+  writeFileSync(join(src, "README"), "cloned into the sandbox\n");
+  git("-C", src, "init", "-q", "-b", "main");
+  git("-C", src, "add", "README");
+  git("-C", src, "commit", "-q", "-m", "first commit from the host");
+  git("clone", "-q", "--bare", src, REPO);
+}
 
 let c;
 before(async () => {
@@ -121,12 +199,17 @@ before(async () => {
   await new Promise((r) => tcp.listen(0, "127.0.0.1", r));
   HTTPS_PORT = https.address().port;
   TCP_PORT = tcp.address().port;
-  assert.ok(existsSync(PROGRAM), `no runtime package at ${RUNTIME}; run PLATFORMS=${PLATFORM} scripts/package-runtime.sh`);
+  if (SSH) await startSsh();
+  assert.ok(existsSync(PROGRAM), `no runtime package at ${RUNTIME}; run: python3 build.py runtime`);
   // The engine must trust the test certificate, as it would a real CA-signed one.
   c = new Client({ COLLABO_CORE_CA_FILE: join(FIXTURES, "localhost-ca.pem") });
   c.onEvent = (m) => {
     if (m.event === "hostCall" && m.fn === "app.greet") void c.call("reply", { id: m.callId, result: { greeting: `hello ${m.args.name}` } });
     if (m.event === "hostCall" && m.fn === "app.fail") void c.call("reply", { id: m.callId, error: { kind: "failed", message: "the app said no" } });
+    if (m.event === "permission" && m.kind in answers) {
+      const answer = answers[m.kind](m.target);
+      void c.call("reply", { id: m.requestId, allow: answer === true || answer?.allow === true, remember: answer?.remember ?? true });
+    }
   };
   const started = await c.call("start", {
     config: {
@@ -137,14 +220,17 @@ before(async () => {
         allow: ["localhost", "*.allowed.test", "example.com"],
         deny: ["blocked.allowed.test"],
         allowHostLoopback: true,
-        secrets: [{ host: "localhost", header: "x-api-key", value: SECRET }],
+        secrets: [{ host: "localhost", header: "x-api-key", value: SECRET },
+                  { host: "localhost", header: "authorization", value: `Bearer ${OPENAI_KEY}` }],
       },
       hostExec: "ask",
       hostFunctions: ["app.greet", "app.fail"],
+      ...(SSH ? { sshAgent: "ask", sshAgentSocket: AGENT_SOCK } : {}),
     },
   });
   assert.equal(started.version, 1);
-  assert.deepEqual(started.config.network.secrets, [{ host: "localhost", header: "x-api-key" }], "secret values are not echoed back");
+  assert.deepEqual(started.config.network.secrets, [{ host: "localhost", header: "x-api-key" }, { host: "localhost", header: "authorization" }],
+    "secret values are not echoed back");
 });
 after(async () => {
   if (c && c.proc.exitCode === null) {
@@ -153,6 +239,8 @@ after(async () => {
   }
   https.close();
   tcp.close();
+  sshdProc?.kill();
+  agentProc?.kill();
 });
 
 describe("exec", () => {
@@ -250,6 +338,12 @@ describe("files and local disk", () => {
     assert.match(r.stdout, /'py\.txt'/);
     assert.equal(readFileSync(join(work, "py.txt"), "utf8"), "héllo");
   });
+  test("a file opened only to read closes cleanly (Windows cannot flush a read handle)", async () => {
+    const r = await c.sh("python3 -W error -c \"import os; f = open('/work/hello.txt'); print(f.read(), end=''); f.close(); fd = os.open('/docs/readme.md', os.O_RDONLY); os.read(fd, 9); os.close(fd)\"");
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(r.stdout, "from the host\n");
+    assert.equal(r.stderr, "");
+  });
   test("exportZip writes the mounted folder as a stored zip", async () => {
     const out = join(tmp, "work.zip");
     const r = await c.call("exportZip", { guestPath: "/work", outFile: out });
@@ -280,6 +374,19 @@ describe("managed network", () => {
   test("python collabo_core goes through the same policy", async () => {
     const r = await c.sh(`python3 -c "import collabo_core as c; print(c.get('https://localhost:${HTTPS_PORT}/py').json()['hasKey'])"`);
     assert.equal(r.stdout.trim(), "True");
+  });
+  test("the openai SDK through the host: the key is the host's, plain and streamed", async () => {
+    const r = await c.sh(`python3 - <<'PY'
+import collabo_core
+client = collabo_core.openai_client(base_url="https://localhost:${HTTPS_PORT}/v1")
+reply = client.chat.completions.create(model="m1", messages=[{"role": "user", "content": "hi"}])
+print(reply.choices[0].message.content)
+stream = client.chat.completions.create(model="m2", messages=[{"role": "user", "content": "yo"}], stream=True)
+print("".join(chunk.choices[0].delta.content or "" for chunk in stream).strip())
+PY`);
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.deepEqual(r.stdout.trim().split("\n"), ["authorized=true model=m1 said=hi", "authorized=true model=m2 said=yo"]);
+    assert.ok(!JSON.stringify(c.events).includes(OPENAI_KEY), "the key never appears in events");
   });
   test("hosts outside the allow list and on the deny list are refused, with a reason", async () => {
     const a = await c.sh("hfetch https://not-listed.test/; echo rc=$?");
@@ -313,6 +420,99 @@ describe("managed network", () => {
     const h = await c.sh(`hfetch https://localhost:${HTTPS_PORT}/`);
     assert.match(h.stderr, /is this computer \(allowHostLoopback is off\)/);
     await c.call("policy.update", { network: { allowHostLoopback: true } });
+  });
+});
+
+describe("network tools (tools.cpio)", () => {
+  test("curl, nc and telnet reach an allowed host through the managed network", async () => {
+    const nc = await c.sh(`(printf ping; sleep 1) | nc 192.0.2.1 ${TCP_PORT}`);
+    assert.equal(nc.stdout, "echo:ping", nc.stderr);
+    const telnet = await c.sh(`(sleep 0.5; printf 'hi\\r\\n'; sleep 1) | telnet 192.0.2.1 ${TCP_PORT}`);
+    assert.match(telnet.stdout, /echo:hi/, telnet.stderr);
+    assert.match((await c.sh("git --version; ssh -V 2>&1; curl --version | head -1")).stdout, /git version 2\.55\.0\nDropbear v2026\.92\ncurl 8\.21\.0/);
+  });
+  test("the guest's own HTTPS clients get the app's secret for its host, and never see it", async () => {
+    // localhost has secrets in this sandbox's policy: its TLS ends in the engine, which adds
+    // them and goes on to the real server (verified against COLLABO_CORE_CA_FILE here).
+    const curl = await c.sh(`curl -sS -H 'x-api-key: guest-guess' --resolve localhost:${HTTPS_PORT}:192.0.2.1 https://localhost:${HTTPS_PORT}/from-curl`);
+    assert.equal(curl.exitCode, 0, curl.stderr);
+    assert.deepEqual(JSON.parse(curl.stdout), { path: "/from-curl", hasKey: true, sawKeyHeader: true });
+    const seenByServer = seen.find((r) => r.url === "/from-curl");
+    assert.equal(seenByServer.headers["x-api-key"], SECRET, "the guest's own value was replaced");
+    const py = await c.sh(`python3 -c "
+import socket, ssl
+s = ssl.create_default_context().wrap_socket(socket.create_connection(('192.0.2.1', ${HTTPS_PORT})), server_hostname='localhost')
+s.sendall(b'GET /from-python HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')
+data = b''
+while chunk := s.recv(65536): data += chunk
+print(data.split(b'\\r\\n\\r\\n', 1)[1].decode())"`);
+    assert.equal(py.exitCode, 0, py.stderr);
+    assert.equal(JSON.parse(py.stdout).hasKey, true, py.stderr);
+    // Nothing of the key in the sandbox: not in what it received, not in its environment.
+    assert.doesNotMatch(curl.stdout + py.stdout, new RegExp(SECRET));
+    assert.equal((await c.sh(`grep -rs '${SECRET}' /etc /tmp /root; env | grep -c '${SECRET}'`)).stdout.trim(), "0");
+    assert.ok(c.events.some((e) => e.event === "network" && e.via === "net" && e.kind === "request" && e.url === `https://localhost:${HTTPS_PORT}/from-curl` && e.status === 200 && e.secrets === 2));
+    // A certificate the guest trusts only through the session CA: a client that brings its own
+    // trust store refuses it, as it should.
+    await c.call("writeFile", { path: "/tmp/test-ca.pem", dataBase64: readFileSync(join(FIXTURES, "localhost-ca.pem")).toString("base64") });
+    const pinned = await c.sh(`curl -sS --cacert /tmp/test-ca.pem --resolve localhost:${HTTPS_PORT}:192.0.2.1 https://localhost:${HTTPS_PORT}/`);
+    assert.notEqual(pinned.exitCode, 0);
+  });
+  test("ssh signs with a key that stays in the host's ssh-agent, once the app says yes", { skip: !SSH && "no sshd/ssh-agent on this computer" }, async () => {
+    const asked = [];
+    answers["ssh-agent"] = (target) => (asked.push(target), true);
+    const r = await c.sh(`ssh -y -p ${SSHD_PORT} ${userInfo().username}@192.0.2.1 'echo via-agent-$((6*7))'`);
+    assert.equal(r.stdout.trim(), "via-agent-42", r.stderr);
+    assert.equal(asked.length, 1, "asked once for the key");
+    assert.match(asked[0], /^sign with ssh-ed25519 SHA256:\S+ \(sandbox-test@host\)$/);
+    assert.ok(c.events.some((e) => e.event === "sshAgent" && e.op === "sign" && e.allowed));
+    // Remembered for the session: no second question.
+    assert.equal((await c.sh(`ssh -y -p ${SSHD_PORT} ${userInfo().username}@192.0.2.1 true`)).exitCode, 0);
+    assert.equal(asked.length, 1);
+    // No key material in the sandbox, only the socket.
+    const inside = await c.sh("echo $SSH_AUTH_SOCK; ls -A ~/.ssh 2>/dev/null | grep -vx known_hosts");
+    assert.equal(inside.stdout, "/run/collabo/ssh-agent.sock\n");
+  });
+  test("git clones over ssh through the borrowed agent", { skip: !SSH && "no sshd/ssh-agent on this computer" }, async () => {
+    const r = await c.sh(`cd /tmp && git clone -q ssh://${userInfo().username}@192.0.2.1:${SSHD_PORT}${REPO} cloned && git -C cloned log --format=%s && cat cloned/README`);
+    assert.equal(r.stdout, "first commit from the host\ncloned into the sandbox\n", r.stderr);
+  });
+  test("a signature the app refuses fails ssh, and the agent refuses more than list and sign", { skip: !SSH && "no sshd/ssh-agent on this computer" }, async () => {
+    await c.call("policy.update", { sshAgent: "ask" }); // forgets the earlier yes
+    answers["ssh-agent"] = () => false;
+    const r = await c.sh(`ssh -y -p ${SSHD_PORT} ${userInfo().username}@192.0.2.1 true`);
+    assert.notEqual(r.exitCode, 0);
+    assert.ok(c.events.some((e) => e.event === "sshAgent" && e.op === "sign" && !e.allowed && /did not allow/.test(e.reason)));
+    // SSH_AGENTC_REMOVE_ALL_IDENTITIES (19) through the socket: refused, keys intact on the host.
+    const removed = await c.sh(`python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect('/run/collabo/ssh-agent.sock'); s.sendall(bytes([0, 0, 0, 1, 19])); print(s.recv(16).hex())"`);
+    assert.equal(removed.stdout.trim(), "0000000105", removed.stderr);
+    const listed = spawnSync(SSH.add, ["-l"], { env: { ...process.env, SSH_AUTH_SOCK: AGENT_SOCK }, encoding: "utf8" });
+    assert.match(listed.stdout, /sandbox-test@host/);
+    answers["ssh-agent"] = () => true;
+  });
+  test("network ask: a host neither list names is the app's call, per host:port", async () => {
+    await c.call("policy.update", { network: { allow: ["localhost"], ask: true } });
+    try {
+      const asked = [];
+      answers.network = (target) => (asked.push(target), false);
+      const api = await c.sh("hfetch https://unlisted.test/; echo rc=$?");
+      assert.match(api.stderr, /the app did not allow "unlisted\.test:443"/);
+      const net = await c.sh(`python3 -c "import socket; socket.create_connection(('203.0.113.10', 9), timeout=20)" 2>&1 | tail -1`);
+      assert.match(net.stdout, /Connection (refused|reset)/);
+      assert.deepEqual(asked, ["unlisted.test:443", "203.0.113.10:9"]);
+      assert.ok(c.events.some((e) => e.event === "network" && e.via === "net" && e.blocked && /did not allow "203\.0\.113\.10:9"/.test(e.reason)));
+      // A remembered no is not asked again; an allowed-once host is asked every time.
+      await c.sh("hfetch https://unlisted.test/");
+      assert.equal(asked.length, 2);
+      answers.network = (target) => (asked.push(target), { allow: true, remember: false });
+      await c.sh(`python3 -c "import socket; socket.create_connection(('203.0.113.11', 9), timeout=2)" 2>&1`);
+      await c.sh(`python3 -c "import socket; socket.create_connection(('203.0.113.11', 9), timeout=2)" 2>&1`);
+      assert.deepEqual(asked.slice(2), ["203.0.113.11:9", "203.0.113.11:9"]);
+      assert.ok(c.events.some((e) => e.event === "network" && e.via === "net" && e.phase === "open" && e.ip === "203.0.113.11"));
+    } finally {
+      answers.network = () => false;
+      await c.call("policy.update", { network: { allow: ["localhost", "*.allowed.test", "example.com"], ask: false } });
+    }
   });
 });
 
@@ -387,6 +587,24 @@ describe("console and lifecycle", () => {
     await c.call("console.write", { data: "echo console-$((6*7))\n" });
     await c.waitEvent(() => c.console.includes("console-42"));
     await c.call("console.resize", { cols: 100, rows: 30 });
+  });
+  test("the console shell owns the terminal, so ^C interrupts the foreground command", async () => {
+    await c.call("console.write", { data: "echo tty=$(cut -d' ' -f7 /proc/$$/stat)\n" });
+    await c.waitEvent(() => /tty=\d+/.test(c.console));
+    assert.notEqual(c.console.match(/tty=(\d+)/)[1], "0", "the shell has no controlling terminal");
+    await c.call("console.write", { data: "sleep 30\n" });
+    await new Promise((r) => setTimeout(r, 500));
+    const t0 = Date.now();
+    await c.call("console.write", { data: "\x03" });
+    await c.call("console.write", { data: "echo after-$((6*8))\n" });
+    // Without a controlling terminal ^C is only echoed and the shell stays blocked in sleep.
+    await c.waitEvent(() => c.console.includes("after-48"), 10_000);
+    assert.ok(Date.now() - t0 < 10_000, "sleep was not interrupted");
+  });
+  test("devpts is mounted: os.openpty gives a /dev/pts pair", async () => {
+    const r = await c.sh("python3 -c \"import os; m, s = os.openpty(); print(os.ttyname(s))\"");
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.stdout, /^\/dev\/pts\/\d+$/m);
   });
   test("protocol errors are answered, not fatal", async () => {
     await assert.rejects(c.call("nope"), /no method "nope"/);

@@ -16,7 +16,7 @@ PLATFORMS="${PLATFORMS:-win-x64 win-arm64 darwin-arm64 darwin-x64 linux-x64 linu
 
 rm -rf "$OUT"; mkdir -p "$OUT/runtime" "$OUT/tests/fixtures" "$OUT/host"
 for p in $PLATFORMS; do
-  [[ -d "$ROOT/dist/runtime/collabo-core-$p" ]] || { echo "missing dist/runtime/collabo-core-$p (scripts/package-runtime.sh)" >&2; exit 1; }
+  [[ -d "$ROOT/dist/runtime/collabo-core-$p" ]] || { echo "missing dist/runtime/collabo-core-$p (python3 build.py runtime)" >&2; exit 1; }
   cp -r "$ROOT/dist/runtime/collabo-core-$p" "$OUT/runtime/"
 done
 cp "$ROOT/tests/runtime.e2e.mjs" "$OUT/tests/"

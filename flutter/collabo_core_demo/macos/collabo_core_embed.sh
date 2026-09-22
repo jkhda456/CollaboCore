@@ -17,6 +17,6 @@ for a in darwin-arm64 darwin-x64; do
   fi
 done
 if [ "$found" != 1 ]; then
-  echo "error: collaboCore runtime not found in $src (run scripts/package-runtime.sh)"
+  echo "error: collaboCore runtime not found in $src (run: python3 build.py runtime)"
   exit 1
 fi

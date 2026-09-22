@@ -35,6 +35,7 @@ pub struct Secret {
 }
 
 /// Which hosts the guest may reach, and what the host adds to those requests.
+#[derive(Clone)]
 pub struct Policy {
     /// Host patterns: "example.com", "*.example.com" (subdomains only) or "*".
     pub allow: Vec<String>,
@@ -45,7 +46,14 @@ pub struct Policy {
     pub secrets: Vec<Secret>,
     /// Request headers the guest may set beyond the defaults.
     pub extra_headers: Vec<String>,
+    /// A host neither list names is asked about (the app's `permission` event, kind "network")
+    /// instead of refused.
+    pub ask: bool,
 }
+
+/// Asks the app whether the guest may reach a host the lists do not name: (via "api" or "net",
+/// target "host:port") → allowed. Blocks for as long as the user takes to answer.
+pub type Asker = Arc<dyn Fn(&'static str, &str) -> bool + Send + Sync>;
 
 impl Default for Policy {
     fn default() -> Policy {
@@ -55,6 +63,7 @@ impl Default for Policy {
             allow_loopback: false,
             secrets: Vec::new(),
             extra_headers: Vec::new(),
+            ask: false,
         }
     }
 }
@@ -96,6 +105,13 @@ impl Policy {
         }
     }
 
+    /// Neither list names this host (and it is not this computer): what `ask` asks about.
+    pub fn unlisted(&self, host: &str) -> bool {
+        !is_loopback(host)
+            && !self.deny.iter().any(|rule| host_matches(rule, host))
+            && !self.allow.iter().any(|rule| host_matches(rule, host))
+    }
+
     /// Why this host is refused, if it is. The wording is the app's and the guest's, so it
     /// matches what the JavaScript runtime said.
     fn refuses(&self, host: &str) -> Option<String> {
@@ -117,6 +133,21 @@ impl Policy {
             false => Vec::new(),
             true => self.secrets.iter().filter(|secret| host_matches(&secret.host, host)).collect(),
         }
+    }
+
+    /// The secrets for a host the guest reaches over its own TLS (intercept.rs).
+    pub fn secrets_for_host(&self, host: &str) -> Vec<Secret> {
+        self.secrets_for(true, host).into_iter().cloned().collect()
+    }
+
+    /// Is there a secret for this host? Its TLS connections are then taken over (intercept.rs).
+    pub fn has_secret_for(&self, host: &str) -> bool {
+        self.secrets.iter().any(|secret| host_matches(&secret.host, host))
+    }
+
+    /// `redact`, for other modules.
+    pub fn redact_text(&self, text: &str) -> String {
+        self.redact(text)
     }
 
     fn allows_header(&self, name: &str) -> bool {
@@ -338,7 +369,7 @@ fn root_certificates() -> Result<ureq::tls::RootCerts> {
 }
 
 /// Serves the guest's HTTP API on `port`, one thread per request.
-pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Option<Observer>) -> Result<()> {
+pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Option<Observer>, asker: Option<Asker>) -> Result<()> {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certificates()?).build())
@@ -349,10 +380,12 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
             .build(),
     );
     vsock.listen(port, move |stream| {
-        let (policy, agent, observer) = (policy.clone(), agent.clone(), observer.clone());
+        let (policy, agent, observer, asker) = (policy.clone(), agent.clone(), observer.clone(), asker.clone());
         std::thread::spawn(move || {
-            let policy = policy.read().unwrap();
-            if let Err(error) = handle(&stream, &policy, &agent, observer.as_ref()) {
+            // A copy: the request keeps the policy it started with, and a question to the user
+            // must not hold the lock policy.update needs.
+            let policy = policy.read().unwrap().clone();
+            if let Err(error) = handle(&stream, &policy, &agent, observer.as_ref(), asker.as_ref()) {
                 eprintln!("collabo-core: http bridge: {error:#}");
             }
         });
@@ -360,7 +393,7 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
 }
 
 /// Serves one connection. Every failure is reported to the guest in the protocol's own words.
-fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: Option<&Observer>) -> Result<()> {
+fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: Option<&Observer>, asker: Option<&Asker>) -> Result<()> {
     let mut head_sent = false;
     let mut blocked = false;
     let mut seen: Option<(String, String)> = None;
@@ -370,7 +403,17 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
         seen = Some((request.method.clone(), request.url.clone()));
         let body = read_body(stream, rest, request.content_length)?;
 
-        if let Some(reason) = policy.refuses(&request.host) {
+        let refused = match (policy.refuses(&request.host), asker) {
+            (Some(_), Some(ask)) if policy.ask && policy.unlisted(&request.host) => {
+                let target = format!("{}:{}", request.host, if request.https { 443 } else { 80 });
+                match ask("api", &target) {
+                    true => None,
+                    false => Some(format!("blocked by the network policy: the app did not allow \"{target}\"")),
+                }
+            }
+            (reason, _) => reason,
+        };
+        if let Some(reason) = refused {
             if let Some(observer) = observer {
                 observer(Event {
                     method: request.method.clone(),

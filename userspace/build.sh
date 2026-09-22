@@ -5,15 +5,19 @@
 # tombl's LLVM 22 fork; see bin/wasm-cc and docs/note.md for why.
 # Stages are skipped when their output already exists; FORCE=stage[,stage] redoes them.
 #
-#   ./build.sh                    # all stages
-#   FORCE=musl,sysroot,rt ./build.sh
-#   stages: src kheaders musl sysroot rt busybox init hfetch collabo-agentd hostcall cpio
+#   bash build.sh                    # all stages
+#   FORCE=musl,sysroot,rt bash build.sh
+#   stages: src kheaders musl sysroot rt busybox init hfetch collabo-agentd hostcall collabo-sshagent cpio
 set -euo pipefail
 
 U="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$U")"
 export PATH="$ROOT/.tools/cmake/bin:$U/tools:$PATH"
 LINUX="$ROOT/kernel/linux"
+
+# wasm-cc is make's CC and tools/bzip2 is found on PATH, so both are run by other programs and
+# need their executable bit, which a checkout made on Windows or through a shared folder loses.
+chmod +x "$U/bin/wasm-cc" "$U/tools/bzip2"
 
 # musl's and busybox's build systems call the LLVM tools by their unversioned names, which
 # Ubuntu does not install. Point them at the versioned ones here rather than checking in
@@ -109,7 +113,7 @@ if stage rt "$RT_LIB"; then
 fi
 
 if stage busybox "$U/out/busybox/bin/busybox"; then
-  "$U/build-busybox.sh"
+  bash "$U/build-busybox.sh"
 fi
 
 # The kernel rejects modules that V8 refuses to compile, and the host swallows the reason
@@ -132,14 +136,16 @@ if stage hfetch "$U/out/hfetch.wasm" "$U/rootfs/hfetch.c" "$U/bin/wasm-cc"; then
   "$U/bin/wasm-cc" -Os -Wall -Wextra -o "$U/out/hfetch.wasm" "$U/rootfs/hfetch.c" "${LINK_FLAGS[@]}"
 fi
 
-# collabo-agentd runs commands for the host; hostcall reaches host functions (see those files).
-for tool in collabo-agentd hostcall; do
+# collabo-agentd runs commands for the host; hostcall reaches host functions; collabo-sshagent
+# carries SSH_AUTH_SOCK to the host's ssh-agent (see those files).
+for tool in collabo-agentd hostcall collabo-sshagent; do
   if stage "$tool" "$U/out/$tool.wasm" "$U/rootfs/$tool.c" "$U/bin/wasm-cc"; then
     "$U/bin/wasm-cc" -Os -Wall -Wextra -o "$U/out/$tool.wasm" "$U/rootfs/$tool.c" "${LINK_FLAGS[@]}"
   fi
 done
 
-validate "$U/out/init.wasm" "$U/out/hfetch.wasm" "$U/out/collabo-agentd.wasm" "$U/out/hostcall.wasm" "$U/out/busybox/bin/busybox"
+validate "$U/out/init.wasm" "$U/out/hfetch.wasm" "$U/out/collabo-agentd.wasm" "$U/out/hostcall.wasm" \
+  "$U/out/collabo-sshagent.wasm" "$U/out/busybox/bin/busybox"
 
 # Always repacked: cheap, and picks up rootfs/etc edits.
 echo "== cpio"
@@ -147,4 +153,5 @@ python3 "$U/mkinitramfs.py" --init "$U/out/init.wasm" --busybox "$U/out/busybox"
   --file usr/bin/hfetch="$U/out/hfetch.wasm" \
   --file usr/bin/hostcall="$U/out/hostcall.wasm" \
   --file usr/sbin/collabo-agentd="$U/out/collabo-agentd.wasm" \
+  --file usr/sbin/collabo-sshagent="$U/out/collabo-sshagent.wasm" \
   --etc "$U/rootfs/etc" -o "$U/out/initramfs.cpio"

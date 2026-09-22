@@ -27,8 +27,10 @@ class SandboxTools {
         {
           'name': 'run_command',
           'description': 'Run a shell command (/bin/sh) in an isolated Linux sandbox and return its exit code, stdout and '
-              'stderr. Python 3.13 (python3) and BusyBox tools are available. The sandbox has no direct internet access: '
-              'use `hfetch URL` or python `import collabo_core; collabo_core.get(url)` for HTTP(S). '
+              'stderr. Python 3.13 (python3, pip), BusyBox tools, curl, git and ssh are available. Network access goes '
+              'through the app\'s policy: hosts it does not allow fail (or wait for the user\'s answer). API keys the app '
+              'holds are added by the host, so do not look for them: use `hfetch URL`, python `collabo_core`, or plain '
+              'curl/git/requests to those hosts. '
               'The working directory $workdir is a folder shared with the user.',
           'input_schema': {
             'type': 'object',

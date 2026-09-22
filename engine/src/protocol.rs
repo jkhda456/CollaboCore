@@ -7,7 +7,18 @@
 //!   engine -> app   {"event": "console", ...}
 //!
 //! Methods: start, exec, readFile, writeFile, console.write, console.resize, policy.update,
-//! exportZip, stop. Events: ready, console, network, execOutput, exit.
+//! reply, exportZip, stop. Events: ready, console, network, execOutput, hostCall, permission,
+//! sshAgent, exit.
+//!
+//! start.config: cpus, python, tools, mounts, network {allow, deny, allowHostLoopback, secrets,
+//! extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
+//! "ask", "allow"), sshAgentSocket, quiet, consoleSize. policy.update takes network, hostExec,
+//! hostFunctions, sshAgent and sshAgentSocket.
+//!
+//! permission events (answered with reply {id, allow, remember?}): kind "exec" / "open" (hostExec:
+//! ask), "network" (target "host:port" that network.ask leaves to the app), "ssh-agent" (target
+//! "sign with <key>"). remember (default true) keeps a network or ssh-agent answer for the session.
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -16,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{agent, console, fs, hostfn, http, machine, net, virtio, vsock, zip};
+use crate::{agent, console, fs, hostfn, http, intercept, machine, net, sshagent, virtio, vsock, zip};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -64,6 +75,8 @@ pub struct Images {
     pub initramfs: Vec<PathBuf>,
     /// The CPython overlay, added unless the app asks for `python: false`.
     pub python: Option<PathBuf>,
+    /// The network tools overlay (curl, ssh, git), added unless the app asks for `tools: false`.
+    pub tools: Option<PathBuf>,
 }
 
 struct Mount {
@@ -116,6 +129,10 @@ struct Running {
     mounts: Vec<Mount>,
     /// Both policies can be replaced while the guest runs (`policy.update`).
     network: Arc<RwLock<http::Policy>>,
+    /// The app's answers to network questions, forgotten when the policy changes.
+    network_answers: Arc<Mutex<HashMap<String, bool>>>,
+    ssh_agent: Arc<RwLock<sshagent::Policy>>,
+    ssh_answers: sshagent::Answers,
     host_policy: Arc<RwLock<hostfn::HostPolicy>>,
     host_functions: hostfn::HostFunctions,
 }
@@ -214,6 +231,7 @@ impl Server {
         let config = params.get("config").cloned().unwrap_or_else(|| json!({}));
         let cpus = config.get("cpus").and_then(Value::as_u64).unwrap_or(2).clamp(1, 32) as u32;
         let python = config.get("python").and_then(Value::as_bool).unwrap_or(true);
+        let tools = config.get("tools").and_then(Value::as_bool).unwrap_or(true);
         let quiet = config.get("quiet").and_then(Value::as_bool).unwrap_or(false);
 
         if let Some(mode) = config.get("hostExec").and_then(Value::as_str) {
@@ -221,6 +239,10 @@ impl Server {
                 return failed("bad-request", "hostExec must be one of deny, ask, allow");
             }
         }
+        let ssh_agent = match ssh_agent_policy(&config, sshagent::Policy { mode: sshagent::Mode::Off, socket: None }) {
+            Ok(policy) => policy,
+            Err(message) => return failed("bad-request", message),
+        };
 
         // Mounts: a host folder each, mounted by the guest's /etc/rc from the command line.
         let mut mounts: Vec<Mount> = Vec::new();
@@ -255,37 +277,6 @@ impl Server {
 
         let network = Arc::new(RwLock::new(network_policy(config.get("network"))));
         let vsock = vsock::Vsock::new(3);
-        let out = self.out.clone();
-        http::serve(
-            &vsock,
-            http::DEFAULT_PORT,
-            network.clone(),
-            Some(Arc::new(move |event: http::Event| {
-                let mut fields = Map::new();
-                fields.insert("via".into(), json!("api"));
-                fields.insert("method".into(), json!(event.method));
-                fields.insert("url".into(), json!(event.url));
-                fields.insert("kind".into(), json!("request"));
-                if event.blocked {
-                    fields.insert("blocked".into(), json!(true));
-                    fields.insert("errorKind".into(), json!("denied"));
-                }
-                match (event.status, event.error) {
-                    (Some(status), _) => {
-                        fields.insert("phase".into(), json!("response"));
-                        fields.insert("status".into(), json!(status));
-                    }
-                    (None, Some(error)) => {
-                        fields.insert("phase".into(), json!("failed"));
-                        fields.insert("error".into(), json!(error.clone()));
-                        fields.insert("reason".into(), json!(error));
-                    }
-                    _ => {}
-                }
-                out.event("network", fields);
-            })),
-        )?;
-
         // Host functions: what the app answers itself, and whether it lets the guest run
         // programs on this computer.
         let host_policy = Arc::new(RwLock::new(hostfn::HostPolicy {
@@ -328,10 +319,118 @@ impl Server {
         );
         host_functions.serve(&vsock, hostfn::PORT)?;
 
+        // The host's ssh-agent, when the app lends it: the guest's SSH_AUTH_SOCK comes here.
+        let ssh_lent = ssh_agent.mode != sshagent::Mode::Off;
+        let ssh_agent = Arc::new(RwLock::new(ssh_agent));
+        let ssh_answers: sshagent::Answers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let (asker_functions, observer_out) = (host_functions.clone(), self.out.clone());
+            sshagent::serve(
+                &vsock,
+                ssh_agent.clone(),
+                ssh_answers.clone(),
+                Arc::new(move |target: &str| asker_functions.ask_permission("ssh-agent", target)),
+                Arc::new(move |event: sshagent::Event| {
+                    let mut fields = Map::new();
+                    fields.insert("op".into(), json!(event.op));
+                    if let Some(key) = event.key {
+                        fields.insert("key".into(), json!(key));
+                    }
+                    fields.insert("allowed".into(), json!(event.allowed));
+                    if let Some(reason) = event.reason {
+                        fields.insert("reason".into(), json!(reason));
+                    }
+                    observer_out.event("sshAgent", fields);
+                }),
+            )?;
+        }
+
+        // Hosts the network policy does not name, under `ask`: one question per host:port,
+        // remembered for the session unless the app answers with remember: false. policy.update
+        // forgets the answers.
+        let answers: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let asker: http::Asker = {
+            let (answers, host_functions) = (answers.clone(), host_functions.clone());
+            Arc::new(move |_via: &'static str, target: &str| {
+                if let Some(known) = answers.lock().unwrap().get(target) {
+                    return *known;
+                }
+                let (allow, remember) = host_functions.ask_permission("network", target).unwrap_or((false, false));
+                if remember {
+                    answers.lock().unwrap().insert(target.to_string(), allow);
+                }
+                allow
+            })
+        };
+        let out = self.out.clone();
+        http::serve(
+            &vsock,
+            http::DEFAULT_PORT,
+            network.clone(),
+            Some(Arc::new(move |event: http::Event| {
+                let mut fields = Map::new();
+                fields.insert("via".into(), json!("api"));
+                fields.insert("method".into(), json!(event.method));
+                fields.insert("url".into(), json!(event.url));
+                fields.insert("kind".into(), json!("request"));
+                if event.blocked {
+                    fields.insert("blocked".into(), json!(true));
+                    fields.insert("errorKind".into(), json!("denied"));
+                }
+                match (event.status, event.error) {
+                    (Some(status), _) => {
+                        fields.insert("phase".into(), json!("response"));
+                        fields.insert("status".into(), json!(status));
+                    }
+                    (None, Some(error)) => {
+                        fields.insert("phase".into(), json!("failed"));
+                        fields.insert("error".into(), json!(error.clone()));
+                        fields.insert("reason".into(), json!(error));
+                    }
+                    _ => {}
+                }
+                out.event("network", fields);
+            })),
+            Some(asker.clone()),
+        )?;
+
+
         // Packet level: a NIC whose gateway is this process, unless the app turned the
         // network off entirely.
         let mut args: Vec<String> = vec!["collabo.agent=1".into()];
         let networked = !matches!(config.get("network"), Some(Value::Bool(false)));
+        // The guest's own HTTPS clients get the app's secrets too: TLS to those hosts ends here
+        // (intercept.rs), with a session CA the guest trusts.
+        let interceptor = match networked {
+            false => None,
+            true => {
+                let out = self.out.clone();
+                Some(intercept::Interceptor::new(
+                    network.clone(),
+                    Some(Arc::new(move |event: intercept::Event| {
+                        let mut fields = Map::new();
+                        fields.insert("via".into(), json!("net"));
+                        fields.insert("kind".into(), json!("request"));
+                        fields.insert("method".into(), json!(event.method));
+                        fields.insert("url".into(), json!(event.url));
+                        fields.insert("secrets".into(), json!(event.secrets));
+                        match (event.status, event.error) {
+                            (_, Some(error)) => {
+                                fields.insert("phase".into(), json!("failed"));
+                                fields.insert("reason".into(), json!(error));
+                            }
+                            (Some(status), None) => {
+                                fields.insert("phase".into(), json!("response"));
+                                fields.insert("status".into(), json!(status));
+                            }
+                            _ => {}
+                        }
+                        out.event("network", fields);
+                    })),
+                )?)
+            }
+        };
+        let session_ca = interceptor.as_ref().map(|interceptor| interceptor.ca_pem().to_string());
         let stack = networked.then(|| {
             let out = self.out.clone();
             net::Stack::new(
@@ -369,10 +468,15 @@ impl Server {
                     }
                     out.event("network", fields);
                 })),
+                Some(asker.clone()),
+                interceptor.clone(),
             )
         });
         if quiet {
             args.push("collabo.quiet=1".into());
+        }
+        if ssh_lent {
+            args.push("collabo.sshagent=1".into());
         }
         let console_out = self.out.clone();
         let console = console::Console::new(
@@ -411,6 +515,15 @@ impl Server {
                 Some(path) => initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
                 None => return failed("bad-request", "this runtime has no Python image; start with python: false"),
             }
+        }
+        if tools {
+            match &self.images.tools {
+                Some(path) => initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+                None => return failed("bad-request", "this runtime has no network tools image; start with tools: false"),
+            }
+        }
+        if let Some(pem) = &session_ca {
+            initcpio.extend(cpio_overlay(&[("etc", None), ("etc/ssl", None), ("etc/ssl/collabo-ca.pem", Some(pem.as_bytes()))]));
         }
         let kernel = std::fs::read(&self.images.kernel)
             .with_context(|| format!("reading {}", self.images.kernel.display()))?;
@@ -461,6 +574,8 @@ impl Server {
             "hostExec": config.get("hostExec").cloned().unwrap_or_else(|| json!("deny")),
             "hostFunctions": config.get("hostFunctions").cloned().unwrap_or_else(|| json!([])),
             "python": python,
+            "tools": tools,
+            "sshAgent": config.get("sshAgent").cloned().unwrap_or_else(|| json!("off")),
             "quiet": quiet,
             "mounts": mounts.iter().map(|mount| json!({
                 "hostPath": mount.host_path.to_string_lossy(),
@@ -470,7 +585,18 @@ impl Server {
             "network": redacted_network(config.get("network")),
         });
         *self.running.write().unwrap() =
-            Some(Arc::new(Running { vsock, stopper, console: console_input, mounts, network, host_policy, host_functions }));
+            Some(Arc::new(Running {
+                vsock,
+                stopper,
+                console: console_input,
+                mounts,
+                network,
+                network_answers: answers,
+                ssh_agent,
+                ssh_answers,
+                host_policy,
+                host_functions,
+            }));
         self.out.event("ready", Map::new());
         Ok(json!({"version": PROTOCOL_VERSION, "config": reported}))
     }
@@ -601,6 +727,15 @@ impl Server {
         let running = self.running()?;
         if let Some(network) = params.get("network") {
             apply_network_policy(&mut running.network.write().unwrap(), Some(network));
+            running.network_answers.lock().unwrap().clear();
+        }
+        if params.get("sshAgent").is_some() || params.get("sshAgentSocket").is_some() {
+            let current = running.ssh_agent.read().unwrap().clone();
+            match ssh_agent_policy(params, current) {
+                Ok(policy) => *running.ssh_agent.write().unwrap() = policy,
+                Err(message) => return failed("bad-request", message),
+            }
+            running.ssh_answers.lock().unwrap().clear();
         }
         {
             let mut policy = running.host_policy.write().unwrap();
@@ -628,7 +763,10 @@ impl Server {
                     None => error.as_str().unwrap_or("the app refused").to_string(),
                 },
             },
-            (None, Some(allow)) => hostfn::Reply::Allow(allow.as_bool().unwrap_or(false)),
+            (None, Some(allow)) => hostfn::Reply::Allow {
+                allow: allow.as_bool().unwrap_or(false),
+                remember: params.get("remember").and_then(Value::as_bool).unwrap_or(true),
+            },
             (None, None) => hostfn::Reply::Result(params.get("result").cloned().unwrap_or(Value::Null)),
         };
         match running.host_functions.reply(id, reply) {
@@ -674,6 +812,54 @@ fn safe_guest_path(path: &str) -> bool {
     !SYSTEM.contains(&first)
 }
 
+/// A newc cpio archive of a few directories and files (root-owned, 755 / 644), to append after
+/// the images: the kernel unpacks archives placed back to back.
+fn cpio_overlay(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut add = |ino: usize, name: &str, mode: u32, data: &[u8]| {
+        let header = format!(
+            "070701{ino:08x}{mode:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            0, 0, 1, 0, data.len(), 0, 0, 0, 0, name.len() + 1, 0
+        );
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    };
+    for (index, (name, data)) in entries.iter().enumerate() {
+        match data {
+            None => add(index + 1, name, 0o040755, &[]),
+            Some(data) => add(index + 1, name, 0o100644, data),
+        }
+    }
+    add(0, "TRAILER!!!", 0, &[]);
+    out
+}
+
+/// `sshAgent` ("off", "ask", "allow") and `sshAgentSocket` from a start or policy.update request,
+/// over what was there before.
+fn ssh_agent_policy(fields: &Value, mut policy: sshagent::Policy) -> std::result::Result<sshagent::Policy, String> {
+    if let Some(mode) = fields.get("sshAgent") {
+        policy.mode = mode
+            .as_str()
+            .and_then(sshagent::Mode::parse)
+            .ok_or_else(|| "sshAgent must be one of off, ask, allow".to_string())?;
+    }
+    match fields.get("sshAgentSocket") {
+        Some(Value::String(path)) if !path.is_empty() => policy.socket = Some(PathBuf::from(path)),
+        Some(Value::Null) | Some(Value::String(_)) => policy.socket = None,
+        Some(_) => return Err("sshAgentSocket must be a path".into()),
+        None => {}
+    }
+    Ok(policy)
+}
+
 /// The app's `network` field: `false`, or the policy object.
 fn network_policy(value: Option<&Value>) -> http::Policy {
     let mut policy = http::Policy::default();
@@ -711,6 +897,9 @@ fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) {
     }
     if let Some(loopback) = fields.get("allowHostLoopback").and_then(Value::as_bool) {
         policy.allow_loopback = loopback;
+    }
+    if let Some(ask) = fields.get("ask").and_then(Value::as_bool) {
+        policy.ask = ask;
     }
     if let Some(secrets) = fields.get("secrets").and_then(Value::as_array) {
         policy.secrets = secrets

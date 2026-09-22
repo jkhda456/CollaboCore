@@ -1,0 +1,10 @@
+# System git configuration of the collaboCore guest (/etc/gitconfig, from nettools/etc).
+[ssh]
+	# `ssh` is dropbear's dbclient: OpenSSH's command line for what git passes (-p, -o), and it
+	# ignores the -o options it does not know.
+	variant = ssh
+[core]
+	# busybox less: -R shows colours; there is no -F/-X, so short output still pages (q quits).
+	pager = less -R
+[init]
+	defaultBranch = main

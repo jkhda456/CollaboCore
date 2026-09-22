@@ -728,17 +728,14 @@ impl FsDevice {
             OP_FLUSH => {
                 let fh = body.u64()?;
                 if let Some(file) = self.handles.get(&fh).and_then(|record| record.file.as_ref()) {
-                    file.sync_data()?;
+                    sync(file, true)?;
                 }
             }
             OP_FSYNC | OP_FSYNCDIR => {
                 let fh = body.u64()?;
                 let flags = body.u32()?;
                 if let Some(file) = self.handles.get(&fh).and_then(|record| record.file.as_ref()) {
-                    match flags & 1 {
-                        0 => file.sync_all()?,
-                        _ => file.sync_data()?,
-                    }
+                    sync(file, flags & 1 != 0)?;
                 }
             }
             OP_RELEASE | OP_RELEASEDIR => {
@@ -842,6 +839,21 @@ fn symlink(target: &str, path: &Path) -> std::io::Result<()> {
     match Path::new(target).is_dir() {
         true => std::os::windows::fs::symlink_dir(target, path),
         false => std::os::windows::fs::symlink_file(target, path),
+    }
+}
+
+/// Push a file's writes to disk (only its data when `data_only`, as fdatasync).
+fn sync(file: &std::fs::File, data_only: bool) -> std::io::Result<()> {
+    let result = match data_only {
+        true => file.sync_data(),
+        false => file.sync_all(),
+    };
+    match result {
+        // FlushFileBuffers only works on a handle opened for writing; a file the guest opened to
+        // read has nothing to flush, and failing its close() breaks Python (PermissionError).
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        result => result,
     }
 }
 

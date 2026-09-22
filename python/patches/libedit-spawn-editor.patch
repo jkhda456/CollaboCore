@@ -1,0 +1,44 @@
+Open $EDITOR (vi mode's 'v') with posix_spawnp instead of fork + execlp: the wasm guest has no
+fork(). Same behaviour: the editor runs on a temporary file and the line is read back.
+
+--- a/src/vi.c
++++ b/src/vi.c
+@@ -45,6 +45,7 @@
+  * vi.c: Vi mode commands.
+  */
+ #include <sys/wait.h>
++#include <spawn.h>
+ #include <ctype.h>
+ #include <limits.h>
+ #include <stdlib.h>
+@@ -1035,15 +1036,24 @@
+ 	len = strlen(cp);
+ 	write(fd, cp, len);
+ 	write(fd, "\n", (size_t)1);
+-	pid = fork();
++	{
++		/* posix_spawnp rather than fork + execlp: this platform has no fork(). */
++		extern char **environ;
++		char *argv[] = { (char *)editor, tempfile, NULL };
++		posix_spawn_file_actions_t actions;
++		int spawned;
++
++		if (posix_spawn_file_actions_init(&actions) != 0)
++			goto error;
++		posix_spawn_file_actions_addclose(&actions, fd);
++		spawned = posix_spawnp(&pid, editor, &actions, NULL, argv, environ);
++		posix_spawn_file_actions_destroy(&actions);
++		if (spawned != 0)
++			pid = -1;
++	}
+ 	switch (pid) {
+ 	case -1:
+ 		goto error;
+-	case 0:
+-		close(fd);
+-		execlp(editor, editor, tempfile, (char *)NULL);
+-		exit(0);
+-		/*NOTREACHED*/
+ 	default:
+ 		while (waitpid(pid, &status, 0) != pid)
+ 			continue;

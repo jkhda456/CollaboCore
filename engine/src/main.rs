@@ -19,6 +19,7 @@
 //!          --log-requests     print every request the guest makes
 //!          --cwd PATH         the guest directory to run the command in (exec)
 //!          --python-image FILE  the CPython overlay, added unless the app turns it off
+//!          --tools-image FILE   the network tools overlay (curl, ssh, git), likewise
 //!          --arg TEXT         an extra kernel command line argument (repeatable)
 mod agent;
 mod console;
@@ -26,8 +27,10 @@ mod devicetree;
 mod fs;
 mod hostfn;
 mod http;
+mod intercept;
 mod machine;
 mod protocol;
+mod sshagent;
 mod module_info;
 mod net;
 mod user;
@@ -87,6 +90,7 @@ fn main() -> Result<()> {
     let mut exec = false;
     let mut stdio = false;
     let mut python_image: Option<String> = None;
+    let mut tools_image: Option<String> = None;
     let mut mounts: Vec<fs::Share> = Vec::new();
     let mut policy = http::Policy::default();
     let mut allow: Vec<String> = Vec::new();
@@ -99,6 +103,7 @@ fn main() -> Result<()> {
             "exec" => exec = true,
             "--stdio" => stdio = true,
             "--python-image" => python_image = argv.next(),
+            "--tools-image" => tools_image = argv.next(),
             "--kernel" => kernel_path = argv.next(),
             "--initramfs" => initramfs_paths.extend(argv.next()),
             "--cpus" => cpus = argv.next().context("--cpus needs a number")?.parse()?,
@@ -133,6 +138,7 @@ fn main() -> Result<()> {
             kernel: kernel_path.into(),
             initramfs: initramfs_paths.iter().map(Into::into).collect(),
             python: python_image.map(Into::into),
+            tools: tools_image.map(Into::into),
         })
         .serve();
     }
@@ -171,6 +177,7 @@ fn main() -> Result<()> {
                 _ => {}
             })
         }),
+        None,
     )?;
     let console = console::Console::new(100, 30, writer(console_to_stderr));
     let mut devices: Vec<Box<dyn virtio::Device>> = vec![Box::new(console), vsock.device()];
@@ -182,6 +189,8 @@ fn main() -> Result<()> {
             log_requests.then(|| -> std::sync::Arc<dyn Fn(net::Event) + Send + Sync> {
                 std::sync::Arc::new(|event: net::Event| eprintln!("[network] {event:?}"))
             }),
+            None,
+            None,
         );
         devices.push(stack.device());
         args.extend(net::Stack::kernel_arguments());

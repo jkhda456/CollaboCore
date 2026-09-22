@@ -6,11 +6,11 @@
 # relative to the source root, so O= is not usable).
 #
 # Usage:
-#   ./build.sh deps      # print missing tools + the apt command to fix it
-#   ./build.sh           # defconfig (if no .config) + vmlinux.wasm
-#   ./build.sh config    # force re-run of defconfig
-#   ./build.sh clean     # make clean (keeps .config)
-#   ./build.sh distclean # make distclean (removes .config too)
+#   bash build.sh deps      # print missing tools + the apt command to fix it
+#   bash build.sh           # defconfig (if no .config) + vmlinux.wasm
+#   bash build.sh config    # force re-run of defconfig
+#   bash build.sh clean     # make clean (keeps .config)
+#   bash build.sh distclean # make distclean (removes .config too)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

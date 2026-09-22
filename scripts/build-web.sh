@@ -6,14 +6,14 @@
 #   dist/web/index.html, _headers, serve.py, serve.mjs     from web/
 #   dist/web/app/*.js                                     host/*.js + the page's panels
 #   dist/web/static/{kernel,guest}                        from dist/engine
-#   dist/web/static/{initramfs,python}.cpio               from dist/engine/images
+#   dist/web/static/{initramfs,python,tools}.cpio         from dist/engine/images
 #   dist/web/vendor/xterm                                 terminal widget (third_party/distro)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/dist/engine"
 OUT="$ROOT/dist/web"
-[[ -f "$ENGINE/kernel/vmlinux.wasm" ]] || { echo "missing dist/engine; run scripts/build-engine.sh" >&2; exit 1; }
+[[ -f "$ENGINE/kernel/vmlinux.wasm" ]] || { echo "missing dist/engine; run: python3 build.py engine" >&2; exit 1; }
 
 rm -rf "$OUT"
 mkdir -p "$OUT/app" "$OUT/static" "$OUT/vendor"

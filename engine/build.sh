@@ -12,7 +12,7 @@ if [[ -x "$ROOT/.tools/cargo/bin/cargo" ]]; then
   export PATH="$ROOT/.tools/rustup/toolchains/stable-$(uname -m)-unknown-linux-gnu/bin:$PATH"
 fi
 
-command -v cargo >/dev/null || { echo "no cargo; run scripts/bootstrap-tools.sh" >&2; exit 1; }
+command -v cargo >/dev/null || { echo "no cargo; run: python3 build.py tools" >&2; exit 1; }
 cd "$E"
 if [[ "${1:-}" == "--tests" ]]; then
   exec cargo test --release
