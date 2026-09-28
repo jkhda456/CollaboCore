@@ -110,6 +110,9 @@ bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
   --mount "$OLDPWD:/work"                     # a root shell in this terminal; Ctrl-] then q leaves
 ```
 
+`bin/collabo-core-engine --help` lists every option (`exec` for one command, the network policy,
+add-ons, the terminal).
+
 ## More
 
 [readme.detail.md](readme.detail.md) — what is implemented and verified, Flutter integration and

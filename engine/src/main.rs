@@ -1,34 +1,6 @@
 //! collaboCore engine: runs the sandbox's WebAssembly Linux kernel natively (no browser, no
-//! Node.js).
-//!
-//!   collabo-core-engine [options]                 the guest's root shell in this terminal
-//!   collabo-core-engine exec [options] -- CMD...  run one command in the guest, then stop
-//!   collabo-core-engine --stdio [options]         the control protocol on stdin/stdout, for
-//!                                                 the Flutter/Dart package (protocol.rs)
-//!
-//! options: --kernel FILE      the kernel image (vmlinux.wasm)
-//!          --initramfs FILE   a cpio archive to unpack at boot (repeatable)
-//!          --cpus N           virtual CPUs (default 2)
-//!          --mount HOST:GUEST[:ro]  share a host folder with the guest (repeatable)
-//!          --allow HOST       a host the guest may reach (repeatable; default: any)
-//!          --deny HOST        a host it may not (repeatable, checked first)
-//!          --no-network       no outbound requests at all
-//!          --allow-loopback   let the guest reach this computer's own services
-//!          --secret HOST:HEADER=VALUE  a key the host adds to https requests (never seen
-//!                             by the guest, and never logged)
-//!          --log-requests     print every request the guest makes
-//!          --cwd PATH         the guest directory to run the command in (exec)
-//!          --python-image FILE  the CPython overlay, added unless the app turns it off
-//!          --tools-image FILE   the network tools overlay (curl, ssh, git), likewise
-//!          --addon-dir DIR    where the add-on images are (<name>.cpio + <name>.json)
-//!          --addon NAME       boot with that add-on (repeatable; with --stdio the app chooses)
-//!          --addon-config NAME:KEY=VALUE  one of an add-on's settings (repeatable; implies
-//!                             --addon NAME), e.g. claude-code:provider=openai
-//!          --arg TEXT         an extra kernel command line argument (repeatable)
-//!          --no-raw           leave this terminal as it is (line-buffered, Ctrl-C ends the engine)
-//!
-//! In a terminal, the guest's root shell gets the terminal raw, at its size: keys reach the guest
-//! as they are typed (Ctrl-C too), so full-screen programs work. Ctrl-] then q leaves.
+//! Node.js). The command line is `USAGE` below (`collabo-core-engine --help`); `--stdio` is the
+//! control protocol the Flutter/Dart package speaks (protocol.rs).
 mod addons;
 mod agent;
 mod console;
@@ -53,6 +25,86 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+
+/// What `--help` prints. The paths in the examples are relative to a runtime folder
+/// (dist/runtime/collabo-core-<platform>, scripts/package-runtime.sh).
+const USAGE: &str = "\
+collabo-core-engine: a Linux machine, compiled to WebAssembly, in this process
+
+Usage:
+  collabo-core-engine [OPTIONS]                  the guest's root shell in this terminal
+  collabo-core-engine exec [OPTIONS] -- CMD...   run one command in the guest, then stop with
+                                                 its exit status (125: it could not be run)
+  collabo-core-engine --stdio [IMAGES]           the control protocol on stdin/stdout, for an app
+                                                 (the app describes the sandbox in `start`)
+  collabo-core-engine --help                     this text
+
+Images:
+  --kernel FILE             the kernel image, vmlinux.wasm (required)
+  --initramfs FILE          a cpio archive to unpack at boot (repeatable, in order)
+  --python-image FILE       the CPython overlay (with --stdio: added unless the app turns it off)
+  --tools-image FILE        the network tools overlay: curl, ssh, git (likewise)
+  --addon-dir DIR           where the add-ons are: <name>.cpio + <name>.json
+
+Machine:
+  --cpus N                  virtual CPUs (default 2)
+  --mount HOST:GUEST[:ro]   share a host folder at an absolute guest path (repeatable)
+  --cwd PATH                the guest directory to run the command in (exec)
+  --arg TEXT                an extra kernel command line argument (repeatable; a bare word
+                            that is not an option counts as one too)
+
+Network (the guest's sockets and its request API go through the same policy):
+  --allow HOST              a host the guest may reach (repeatable; default: any)
+  --deny HOST               a host it may not (repeatable, checked first)
+  --no-network              no outbound connections at all
+  --allow-loopback          let the guest reach this computer's own services
+  --secret HOST:HEADER=VALUE
+                            a header the host adds to https requests to HOST (repeatable);
+                            the guest never sees it, and it is never logged
+  --log-requests            print every request the guest makes, to stderr
+
+Add-ons (optional overlays; addons/README.md):
+  --addon NAME              boot with that add-on (repeatable)
+  --addon-config NAME:KEY=VALUE
+                            one of its settings (repeatable; implies --addon NAME), e.g.
+                            claude-code:provider=openai; an apiKey becomes a --secret
+
+Terminal:
+  --no-raw                  leave this terminal line-buffered (Ctrl-C then ends the engine)
+  By default the shell gets this terminal raw and at its size, so keys (Ctrl-C too) reach the
+  guest as they are typed and full-screen programs work. Ctrl-] then q leaves.
+
+Examples (in a runtime folder):
+  bin/collabo-core-engine --kernel app/images/vmlinux.wasm \\
+      --initramfs app/images/initramfs.cpio --initramfs app/images/python.cpio \\
+      --mount \"$PWD:/work\"
+  bin/collabo-core-engine exec --kernel app/images/vmlinux.wasm \\
+      --initramfs app/images/initramfs.cpio --no-network -- uname -a
+  manifest.json's `entry` holds the arguments an app starts it with, before --stdio.
+";
+
+/// The options that take a value, so `--help` can be told from an option's value.
+const TAKES_VALUE: &[&str] = &[
+    "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--kernel",
+    "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--cwd", "--arg",
+];
+
+/// Whether the command line asks for help: `-h`, `--help` or `help` as an option (not as an
+/// option's value, and not in the command after `--`).
+fn wants_help(argv: &[String]) -> bool {
+    let mut words = argv.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "-h" | "--help" | "help" => return true,
+            "--" => return false,
+            option if TAKES_VALUE.contains(&option) => {
+                words.next();
+            }
+            _ => {}
+        }
+    }
+    false
+}
 
 /// `HOST:GUEST[:ro]`. The host path may contain ':' (a Windows drive letter), so the guest
 /// path and the read-only marker are taken from the right.
@@ -197,7 +249,16 @@ fn main() -> Result<()> {
     let mut log_requests = false;
     let mut raw = true;
 
-    let mut argv = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if wants_help(&argv) {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    if argv.is_empty() {
+        eprint!("{USAGE}");
+        exit(2);
+    }
+    let mut argv = argv.into_iter();
     while let Some(argument) = argv.next() {
         match argument.as_str() {
             "exec" => exec = true,
@@ -233,6 +294,9 @@ fn main() -> Result<()> {
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
             "--" => command.extend(argv.by_ref()),
+            option if option.starts_with('-') => {
+                anyhow::bail!("unknown option {option} (collabo-core-engine --help lists them)")
+            }
             other => args.push(other.to_string()),
         }
     }
@@ -240,7 +304,7 @@ fn main() -> Result<()> {
         anyhow::bail!("exec needs a command after --");
     }
 
-    let kernel_path = kernel_path.context("--kernel is required")?;
+    let kernel_path = kernel_path.context("--kernel is required (collabo-core-engine --help)")?;
     if stdio {
         // The app describes the sandbox in its `start` request; the command line only says
         // where the images are.
@@ -424,6 +488,29 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_is_an_option_not_a_value_or_the_command() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert!(wants_help(&argv(&["--help"])));
+        assert!(wants_help(&argv(&["--kernel", "k.wasm", "-h"])));
+        assert!(wants_help(&argv(&["exec", "help"])));
+        assert!(!wants_help(&argv(&["exec", "--kernel", "k.wasm", "--", "ls", "--help"])));
+        assert!(!wants_help(&argv(&["--arg", "help", "--kernel", "k.wasm"])));
+        assert!(!wants_help(&argv(&[])));
+        // Every option main() matches is in --help, and the ones that read a value are in
+        // TAKES_VALUE (they are the arms that call argv.next()).
+        for line in include_str!("main.rs").lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("\"--").filter(|_| line.contains("\" => ")) else { continue };
+            let option = format!("--{}", &rest[..rest.find('"').unwrap()]);
+            if option == "--" {
+                continue;
+            }
+            assert!(USAGE.contains(&format!("{option} ")), "{option} is not in USAGE");
+            let takes_value = line.contains("argv.next()") || line.ends_with("=> {");
+            assert_eq!(TAKES_VALUE.contains(&option.as_str()), takes_value, "{option} and TAKES_VALUE");
+        }
+    }
 
     #[test]
     fn mounts_take_unix_and_windows_paths() {
