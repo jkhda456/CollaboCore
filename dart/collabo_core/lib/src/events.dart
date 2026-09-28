@@ -99,7 +99,9 @@ class PermissionRequest {
 class SandboxExit {
   SandboxExit(this.reason, [this.message]);
 
-  /// "stopped" (normal), "panic" (the guest kernel crashed), "error", or "runtime-exited".
+  /// "stopped" (normal), "poweroff" (the guest shut itself down: shutdown, poweroff, halt or
+  /// reboot), "panicked" (the guest kernel crashed), "failed" (the engine failed: see
+  /// [message]), or "runtime-exited".
   final String reason;
   final String? message;
 

@@ -72,7 +72,8 @@ Add-ons (optional overlays; addons/README.md):
 Terminal:
   --no-raw                  leave this terminal line-buffered (Ctrl-C then ends the engine)
   By default the shell gets this terminal raw and at its size, so keys (Ctrl-C too) reach the
-  guest as they are typed and full-screen programs work. Ctrl-] then q leaves.
+  guest as they are typed and full-screen programs work. Ctrl-] then q leaves; so does
+  `shutdown` (or poweroff) in the guest, which stops its programs first and syncs the mounts.
 
 Examples (in a runtime folder):
   bin/collabo-core-engine --kernel app/images/vmlinux.wasm \\
@@ -478,6 +479,9 @@ fn main() -> Result<()> {
             if termination == machine::Termination::Panic {
                 eprintln!("[engine] the guest panicked");
                 exit(1);
+            }
+            if termination == machine::Termination::PowerOff && !exec {
+                eprint!("\r\n[collabo-core] the guest shut down\r\n");
             }
             host_tty::restore();
             Ok(())

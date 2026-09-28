@@ -3,13 +3,17 @@
 #
 #   dist/runtime/collabo-core-<platform>/
 #     bin/collabo-core-engine[.exe]   the native engine (engine/, Rust + wasmtime)
+#     launcher[.exe], launcher.conf   starts the engine as launcher.conf says, with no arguments
+#     work/                           the folder launcher.conf shares with the guest as /work
 #     app/images/vmlinux.wasm         the kernel
 #     app/images/initramfs.cpio       guest root (busybox, /init, the agent)
 #     app/images/python.cpio          CPython 3.13 overlay
 #     app/images/tools.cpio           network tools overlay (curl, ssh, git)
 #     app/images/addons/*             add-ons, off unless the app asks (addons/README.md)
 #     app/licenses/*
-#     manifest.json                   { platform, engine, protocol, entry, files }
+#     manifest.json                   { platform, engine, protocol, entry, addons, files }
+#                                     (files: every file's sha256, but launcher.conf, which is
+#                                     meant to be edited)
 #
 # Start it as:  <dir>/bin/collabo-core-engine <entry arguments…> --stdio
 # (the Dart package reads `entry` from the manifest and adds --stdio; see dart/collabo_core).
@@ -66,18 +70,24 @@ for platform in $PLATFORMS; do
   if [[ "$platform" == "$HERE" ]]; then
     (cd "$ROOT/engine" && cargo build --release >/dev/null)
     built="$ROOT/engine/target/release/collabo-core-engine"
+    launcher="$ROOT/engine/target/release/launcher"
   else
     (cd "$ROOT/engine" && cargo build --release --target "$target" >/dev/null)
     built="$ROOT/engine/target/$target/release/collabo-core-engine"
+    launcher="$ROOT/engine/target/$target/release/launcher"
   fi
   case "$platform" in win-*) exe=collabo-core-engine.exe ;; *) exe=collabo-core-engine ;; esac
   [[ -f "$built" ]] || built="$built.exe"
+  [[ -f "$launcher" ]] || launcher="$launcher.exe"
   [[ -f "$built" ]] || { echo "the engine was not built for $platform" >&2; exit 1; }
 
   dir="$OUT/collabo-core-$platform"
-  rm -rf "$dir"; mkdir -p "$dir/bin" "$dir/app/images"
+  rm -rf "$dir"; mkdir -p "$dir/bin" "$dir/app/images" "$dir/work"
   cp "$built" "$dir/bin/$exe"
   chmod +x "$dir/bin/$exe"
+  cp "$launcher" "$dir/$(basename "$launcher")"
+  chmod +x "$dir/$(basename "$launcher")"
+  cp "$ROOT/engine/launcher.conf" "$dir/launcher.conf"
   cp "$ENGINE/kernel/vmlinux.wasm" "$dir/app/images/"
   cp "$ENGINE"/images/*.cpio "$dir/app/images/"
   [[ -d "$ENGINE/images/addons" ]] && cp -r "$ENGINE/images/addons" "$dir/app/images/addons"
@@ -91,7 +101,7 @@ for root, _, names in os.walk(d):
     for n in names:
         p = os.path.join(root, n)
         rel = os.path.relpath(p, d).replace(os.sep, "/")
-        if rel != "manifest.json":
+        if rel not in ("manifest.json", "launcher.conf"):
             files[rel] = hashlib.sha256(open(p, "rb").read()).hexdigest()
 entry = ["bin/" + exe,
          "--kernel", "app/images/vmlinux.wasm",

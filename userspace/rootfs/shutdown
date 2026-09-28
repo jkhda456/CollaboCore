@@ -1,0 +1,25 @@
+#!/bin/sh
+# shutdown: stop the sandbox. /init stops every program, syncs the shared folders and ends the
+# machine; the engine then exits (an app gets the `exit` event, reason "poweroff").
+#
+#   shutdown [-h|-P|-H] [now|+0]   power off (the same as poweroff)
+#   shutdown -r [now|+0]           reboot: the engine cannot restart a machine, so this ends it too
+#
+# busybox has no shutdown applet; this is the usual spelling of its poweroff/halt/reboot.
+usage() {
+	echo "usage: shutdown [-h|-P|-H|-r] [now|+0]   stop the sandbox (the engine exits with it)" >&2
+	exit "$1"
+}
+action=poweroff
+for a in "$@"; do
+	case $a in
+	-h|-P|--poweroff) action=poweroff ;;
+	-H|--halt) action=halt ;;
+	-r|--reboot) action=reboot ;;
+	now|+0|0) ;;
+	--help) usage 0 ;;
+	+*|[0-9]*:[0-9]*) echo "shutdown: only now is supported (no delayed shutdown)" >&2; exit 1 ;;
+	*) usage 2 ;;
+	esac
+done
+exec "$action"

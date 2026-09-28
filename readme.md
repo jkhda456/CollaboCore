@@ -110,6 +110,10 @@ bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
   --mount "$OLDPWD:/work"                     # a root shell in this terminal; Ctrl-] then q leaves
 ```
 
+Or, with no arguments at all, `./launcher` (`launcher.exe`) in the runtime folder: it starts the
+engine with the manifest's images and the options in `launcher.conf` beside it — by default the
+empty `work/` folder next to `bin/`, shared as `/work`. `./launcher --dry-run` shows the command line.
+
 `bin/collabo-core-engine --help` lists every option (`exec` for one command, the network policy,
 add-ons, the terminal).
 

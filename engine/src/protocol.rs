@@ -584,6 +584,9 @@ impl Server {
                 Ok(machine::Termination::Clean) => {
                     fields.insert("reason".into(), json!("stopped"));
                 }
+                Ok(machine::Termination::PowerOff) => {
+                    fields.insert("reason".into(), json!("poweroff"));
+                }
                 Ok(machine::Termination::Panic) => {
                     fields.insert("reason".into(), json!("panicked"));
                 }

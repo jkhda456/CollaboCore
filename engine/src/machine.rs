@@ -25,7 +25,11 @@ const KERNEL_MEMORY_MAXIMUM_PAGES: u64 = 0xffff; // 4 GiB - 64 KiB, as the kerne
 /// Why the guest stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
+    /// The host stopped it (Stopper).
     Clean,
+    /// The guest ended itself: poweroff, halt, reboot or shutdown (reboot(2), which the kernel
+    /// reports as a clean termination).
+    PowerOff,
     Panic,
 }
 
@@ -171,7 +175,7 @@ fn link_kernel(linker: &mut Linker<HostState>) -> Result<()> {
         "kernel",
         "terminate_machine",
         |caller: Caller<'_, HostState>, reason: i32| -> Result<()> {
-            let termination = if reason == 0 { Termination::Clean } else { Termination::Panic };
+            let termination = if reason == 0 { Termination::PowerOff } else { Termination::Panic };
             caller.data().shared.send(Request::Terminate(termination));
             Err(anyhow!(Halt))
         },

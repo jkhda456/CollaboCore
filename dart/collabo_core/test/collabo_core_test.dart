@@ -203,5 +203,14 @@ void main() {
       expect(other.run('true'), throwsA(isA<CollaboException>()));
       expect((await sandbox.run('echo still-alive')).stdoutText, 'still-alive\n');
     });
+
+    test('shutdown in the guest ends that sandbox with reason poweroff', () async {
+      final other = await CollaboCore.start(const CollaboConfig(cpus: 1, python: false, networkEnabled: false, quiet: true));
+      await other.writeConsole('shutdown\n');
+      final exit = await other.done.timeout(const Duration(seconds: 30));
+      expect(exit.reason, 'poweroff');
+      expect(other.run('true'), throwsA(isA<CollaboException>()));
+      expect((await sandbox.run('echo still-alive')).stdoutText, 'still-alive\n');
+    });
   });
 }

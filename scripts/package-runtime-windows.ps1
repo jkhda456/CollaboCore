@@ -3,6 +3,8 @@
 #
 #   dist/runtime/collabo-core-<platform>/
 #     bin/collabo-core-engine.exe      the native engine (engine/, Rust + wasmtime)
+#     launcher.exe, launcher.conf      starts the engine as launcher.conf says, with no arguments
+#     work/                            the folder launcher.conf shares with the guest as /work
 #     app/images/vmlinux.wasm          the kernel
 #     app/images/*.cpio                guest root, the CPython and network tools overlays
 #     app/images/addons/*              add-ons, off unless the app asks (addons/README.md)
@@ -56,8 +58,10 @@ if (-not (Test-Path $Built)) { throw "the engine was not built for $Platform" }
 
 $Dir = Join-Path $Out "collabo-core-$Platform"
 if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
-New-Item -ItemType Directory -Force (Join-Path $Dir "bin"), (Join-Path $Dir "app\images") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $Dir "bin"), (Join-Path $Dir "app\images"), (Join-Path $Dir "work") | Out-Null
 Copy-Item $Built (Join-Path $Dir "bin\collabo-core-engine.exe")
+Copy-Item (Join-Path $Root "engine\target\release\launcher.exe") (Join-Path $Dir "launcher.exe")
+Copy-Item (Join-Path $Root "engine\launcher.conf") (Join-Path $Dir "launcher.conf")
 Copy-Item (Join-Path $Engine "kernel\vmlinux.wasm") (Join-Path $Dir "app\images")
 Copy-Item (Join-Path $Engine "images\*.cpio") (Join-Path $Dir "app\images")
 if (Test-Path (Join-Path $Engine "images\addons")) {
@@ -69,7 +73,7 @@ Copy-Item -Recurse (Join-Path $Engine "licenses") (Join-Path $Dir "app\licenses"
 $Files = [System.Collections.Generic.SortedDictionary[string, string]]::new([System.StringComparer]::Ordinal)
 Get-ChildItem -Recurse -File $Dir | ForEach-Object {
     $Rel = $_.FullName.Substring($Dir.Length + 1).Replace("\", "/")
-    if ($Rel -ne "manifest.json") { $Files[$Rel] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() }
+    if ($Rel -ne "manifest.json" -and $Rel -ne "launcher.conf") { $Files[$Rel] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() }
 }
 $FileMap = [ordered]@{}
 # The add-ons shipped (app/images/addons/<name>.cpio), off unless the app asks (addons/README.md).
