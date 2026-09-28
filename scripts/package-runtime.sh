@@ -7,6 +7,7 @@
 #     app/images/initramfs.cpio       guest root (busybox, /init, the agent)
 #     app/images/python.cpio          CPython 3.13 overlay
 #     app/images/tools.cpio           network tools overlay (curl, ssh, git)
+#     app/images/addons/*             add-ons, off unless the app asks (addons/README.md)
 #     app/licenses/*
 #     manifest.json                   { platform, engine, protocol, entry, files }
 #
@@ -79,6 +80,7 @@ for platform in $PLATFORMS; do
   chmod +x "$dir/bin/$exe"
   cp "$ENGINE/kernel/vmlinux.wasm" "$dir/app/images/"
   cp "$ENGINE"/images/*.cpio "$dir/app/images/"
+  [[ -d "$ENGINE/images/addons" ]] && cp -r "$ENGINE/images/addons" "$dir/app/images/addons"
   cp -r "$ENGINE/licenses" "$dir/app/licenses"
 
   "$PYTHON" - "$dir" "$platform" "$exe" <<'PY'
@@ -97,8 +99,12 @@ entry = ["bin/" + exe,
          "--python-image", "app/images/python.cpio"]
 if os.path.exists(os.path.join(d, "app/images/tools.cpio")):
     entry += ["--tools-image", "app/images/tools.cpio"]
+addons_dir = os.path.join(d, "app/images/addons")
+addons = sorted(n[:-5] for n in os.listdir(addons_dir) if n.endswith(".cpio")) if os.path.isdir(addons_dir) else []
+if addons:
+    entry += ["--addon-dir", "app/images/addons"]
 json.dump({"name": "collabo-core-runtime", "platform": platform, "engine": "wasmtime", "protocol": 1,
-           "entry": entry, "files": dict(sorted(files.items()))},
+           "entry": entry, "addons": addons, "files": dict(sorted(files.items()))},
           open(os.path.join(d, "manifest.json"), "w"), indent=1)
 PY
 

@@ -6,12 +6,13 @@
 //!   engine -> app   {"id": 1, "result": {...}}  or  {"id": 1, "error": {"kind", "message"}}
 //!   engine -> app   {"event": "console", ...}
 //!
-//! Methods: start, exec, readFile, writeFile, console.write, console.resize, policy.update,
+//! Methods: start, exec, readFile, writeFile, console.write, console.resize (the guest tty's size,
+//! set through the agent), policy.update,
 //! reply, exportZip, stop. Events: ready, console, network, execOutput, hostCall, permission,
 //! sshAgent, exit.
 //!
-//! start.config: cpus, python, tools, mounts, network {allow, deny, allowHostLoopback, secrets,
-//! extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
+//! start.config: cpus, python, tools, addons {name: settings} (addons.rs), mounts, network {allow,
+//! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
 //! "ask", "allow"), sshAgentSocket, quiet, consoleSize. policy.update takes network, hostExec,
 //! hostFunctions, sshAgent and sshAgentSocket.
 //!
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{agent, console, fs, hostfn, http, intercept, machine, net, sshagent, virtio, vsock, zip};
+use crate::{addons, agent, console, fs, hostfn, http, intercept, machine, net, sshagent, virtio, vsock, zip};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -77,6 +78,8 @@ pub struct Images {
     pub python: Option<PathBuf>,
     /// The network tools overlay (curl, ssh, git), added unless the app asks for `tools: false`.
     pub tools: Option<PathBuf>,
+    /// Where the add-on images are (`<name>.cpio` + `<name>.json`), added only when asked for.
+    pub addon_dir: Option<PathBuf>,
 }
 
 struct Mount {
@@ -203,7 +206,7 @@ impl Server {
             "readFile" => self.read_file(params),
             "writeFile" => self.write_file(params),
             "console.write" => self.console_write(params),
-            "console.resize" => Ok(json!({})),
+            "console.resize" => self.console_resize(params),
             "policy.update" => self.update_policy(params),
             "reply" => self.reply(params),
             "exportZip" => self.export_zip(params),
@@ -275,7 +278,16 @@ impl Server {
             });
         }
 
+        let addons = match addons::resolve(self.images.addon_dir.as_deref(), config.get("addons")) {
+            Ok(addons) => addons,
+            Err(message) => return failed("bad-request", message),
+        };
         let network = Arc::new(RwLock::new(network_policy(config.get("network"))));
+        {
+            let mut policy = network.write().unwrap();
+            policy.addon_headers = addons.headers.clone();
+            policy.addon_secrets = addons.secrets.clone();
+        }
         let vsock = vsock::Vsock::new(3);
         // Host functions: what the app answers itself, and whether it lets the guest run
         // programs on this computer.
@@ -541,6 +553,7 @@ impl Server {
                 None => return failed("bad-request", "this runtime has no network tools image; start with tools: false"),
             }
         }
+        initcpio.extend_from_slice(&addons.initcpio);
         if let Some(pem) = &session_ca {
             initcpio.extend(cpio_overlay(&[("etc", None), ("etc/ssl", None), ("etc/ssl/collabo-ca.pem", Some(pem.as_bytes()))]));
         }
@@ -594,6 +607,7 @@ impl Server {
             "hostFunctions": config.get("hostFunctions").cloned().unwrap_or_else(|| json!([])),
             "python": python,
             "tools": tools,
+            "addons": addons.names,
             "sshAgent": config.get("sshAgent").cloned().unwrap_or_else(|| json!("off")),
             "quiet": quiet,
             "mounts": mounts.iter().map(|mount| json!({
@@ -730,6 +744,23 @@ impl Server {
         }
     }
 
+    /// The app's terminal changed size: the guest's tty follows (in the background: the agent
+    /// may be busy for a moment, and the app need not wait).
+    fn console_resize(&self, params: &Value) -> Answer {
+        let running = self.running()?;
+        let size = |key: &str| params.get(key).and_then(Value::as_u64).map(|n| n.clamp(10, 1000) as u16);
+        let (Some(columns), Some(rows)) = (size("cols"), size("rows")) else {
+            return failed("bad-request", "console.resize needs cols and rows");
+        };
+        let vsock = running.vsock.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = agent::resize_console(&vsock, columns, rows) {
+                eprintln!("collabo-core: console.resize: {error:#}");
+            }
+        });
+        Ok(json!({}))
+    }
+
     fn console_write(&self, params: &Value) -> Answer {
         let running = self.running()?;
         let bytes = match (params.get("dataBase64").and_then(Value::as_str), params.get("data").and_then(Value::as_str)) {
@@ -833,7 +864,7 @@ fn safe_guest_path(path: &str) -> bool {
 
 /// A newc cpio archive of a few directories and files (root-owned, 755 / 644), to append after
 /// the images: the kernel unpacks archives placed back to back.
-fn cpio_overlay(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+pub fn cpio_overlay(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut add = |ino: usize, name: &str, mode: u32, data: &[u8]| {
         let header = format!(

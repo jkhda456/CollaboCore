@@ -5,6 +5,7 @@ class CollaboConfig {
     this.cpus,
     this.python = true,
     this.tools = true,
+    this.addons = const {},
     this.mounts = const [],
     this.network = const NetworkPolicy(),
     this.networkEnabled = true,
@@ -25,6 +26,18 @@ class CollaboConfig {
   /// Boot with the network tools: curl, ssh (dropbear) and git (adds ~14 MB). busybox's wget,
   /// nc and telnet are always there.
   final bool tools;
+
+  /// Add-ons to boot with (addons/README.md), by name, each with its settings (`{}` for none).
+  /// None by default. An `apiKey` setting never reaches the sandbox: the host adds it to the
+  /// add-on's https requests, like a [Secret]. For the claude-code add-on see
+  /// [ClaudeCodeSettings]:
+  ///
+  /// ```dart
+  /// addons: {'claude-code': ClaudeCodeSettings.openai(baseUrl: 'http://localhost:11434/v1',
+  ///     model: 'qwen3-coder').toJson()},
+  /// network: NetworkPolicy(allowHostLoopback: true),   // localhost is this computer
+  /// ```
+  final Map<String, Map<String, Object?>> addons;
 
   /// Local folders to share with the sandbox.
   final List<Mount> mounts;
@@ -54,6 +67,7 @@ class CollaboConfig {
         if (cpus != null) 'cpus': cpus,
         'python': python,
         'tools': tools,
+        if (addons.isNotEmpty) 'addons': addons,
         'mounts': [for (final m in mounts) m.toJson()],
         'network': networkEnabled ? network.toJson() : false,
         'hostExec': hostExec.name,
@@ -62,6 +76,69 @@ class CollaboConfig {
         'quiet': quiet,
         'consoleSize': {'cols': consoleColumns, 'rows': consoleRows},
       };
+}
+
+/// Settings of the claude-code add-on: `claude` in the sandbox, a coding agent that talks to
+/// the Anthropic Messages API or to an OpenAI-compatible server (a local LLM). Written to
+/// /etc/collabo/addons/claude-code.json in the sandbox; `claude --show-config` shows them.
+class ClaudeCodeSettings {
+  const ClaudeCodeSettings({
+    this.provider = 'anthropic',
+    this.baseUrl,
+    this.model,
+    this.apiKey,
+    this.maxTokens,
+    this.stream,
+    this.permissionMode,
+    this.appendSystemPrompt,
+    this.maxTurns,
+  });
+
+  /// Anthropic's API (or a gateway that speaks it).
+  const ClaudeCodeSettings.anthropic({String? baseUrl, String? model, String? apiKey, int? maxTokens})
+      : this(provider: 'anthropic', baseUrl: baseUrl, model: model, apiKey: apiKey, maxTokens: maxTokens);
+
+  /// An OpenAI-compatible Chat Completions server: Ollama (`http://localhost:11434/v1`),
+  /// llama.cpp, vLLM, LM Studio, … The request is made by this computer, so `localhost` is
+  /// this computer: that needs [NetworkPolicy.allowHostLoopback]. Without [model], the first
+  /// one the server lists is used.
+  const ClaudeCodeSettings.openai({required String baseUrl, String? model, String? apiKey, int? maxTokens})
+      : this(provider: 'openai', baseUrl: baseUrl, model: model, apiKey: apiKey, maxTokens: maxTokens);
+
+  /// `anthropic` or `openai`.
+  final String provider;
+  final String? baseUrl;
+  final String? model;
+
+  /// Added by the host to https requests for [baseUrl]'s host; never in the sandbox. (A
+  /// plain-http [baseUrl] gets it in the sandbox's settings instead: the host adds keys to
+  /// https requests only.)
+  final String? apiKey;
+  final int? maxTokens;
+  final bool? stream;
+
+  /// `default` (ask before commands and edits), `acceptEdits`, `plan` or `bypassPermissions`
+  /// (the sandbox is the boundary). With `claude -p` nobody can answer, so what needs a yes is
+  /// refused unless the mode or the permission rules allow it.
+  final String? permissionMode;
+  final String? appendSystemPrompt;
+  final int? maxTurns;
+
+  Map<String, Object?> toJson() => {
+        'provider': provider,
+        if (baseUrl != null) 'baseUrl': baseUrl,
+        if (model != null) 'model': model,
+        if (apiKey != null) 'apiKey': apiKey,
+        if (maxTokens != null) 'maxTokens': maxTokens,
+        if (stream != null) 'stream': stream,
+        if (permissionMode != null) 'permissionMode': permissionMode,
+        if (appendSystemPrompt != null) 'appendSystemPrompt': appendSystemPrompt,
+        if (maxTurns != null) 'maxTurns': maxTurns,
+      };
+
+  @override
+  String toString() => 'ClaudeCodeSettings($provider, ${baseUrl ?? 'default URL'}, ${model ?? 'default model'}'
+      '${apiKey != null ? ', key ***' : ''})';
 }
 
 /// A local folder shared with the sandbox (virtio-fs). Changes are live in both directions.

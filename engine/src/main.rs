@@ -20,7 +20,16 @@
 //!          --cwd PATH         the guest directory to run the command in (exec)
 //!          --python-image FILE  the CPython overlay, added unless the app turns it off
 //!          --tools-image FILE   the network tools overlay (curl, ssh, git), likewise
+//!          --addon-dir DIR    where the add-on images are (<name>.cpio + <name>.json)
+//!          --addon NAME       boot with that add-on (repeatable; with --stdio the app chooses)
+//!          --addon-config NAME:KEY=VALUE  one of an add-on's settings (repeatable; implies
+//!                             --addon NAME), e.g. claude-code:provider=openai
 //!          --arg TEXT         an extra kernel command line argument (repeatable)
+//!          --no-raw           leave this terminal as it is (line-buffered, Ctrl-C ends the engine)
+//!
+//! In a terminal, the guest's root shell gets the terminal raw, at its size: keys reach the guest
+//! as they are typed (Ctrl-C too), so full-screen programs work. Ctrl-] then q leaves.
+mod addons;
 mod agent;
 mod console;
 mod devicetree;
@@ -66,9 +75,96 @@ fn parse_mount(spec: &str, index: usize) -> Result<fs::Share> {
     })
 }
 
+/// This process's terminal in raw mode while the guest's console owns it; restored on exit.
+#[cfg(unix)]
+mod host_tty {
+    use std::sync::Mutex;
+
+    static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+    /// Raw mode for stdin's terminal, if stdin is one. True when it was switched.
+    pub fn enter() -> bool {
+        // SAFETY: termios calls on fd 0 with a zeroed struct that tcgetattr fills.
+        unsafe {
+            if libc::isatty(0) == 0 {
+                return false;
+            }
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut termios) != 0 {
+                return false;
+            }
+            *SAVED.lock().unwrap() = Some(termios);
+            let mut raw = termios;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(0, libc::TCSANOW, &raw) == 0
+        }
+    }
+
+    pub fn restore() {
+        if let Some(termios) = SAVED.lock().unwrap().take() {
+            // SAFETY: the settings tcgetattr gave back.
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, &termios) };
+        }
+    }
+
+    pub fn active() -> bool {
+        SAVED.lock().unwrap().is_some()
+    }
+
+    /// The terminal's size (columns, rows), if stdout is one.
+    pub fn size() -> Option<(u16, u16)> {
+        // SAFETY: TIOCGWINSZ fills the winsize.
+        unsafe {
+            let mut size: libc::winsize = std::mem::zeroed();
+            (libc::ioctl(1, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0).then_some((size.ws_col, size.ws_row))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod host_tty {
+    pub fn enter() -> bool {
+        false
+    }
+    pub fn restore() {}
+    pub fn active() -> bool {
+        false
+    }
+    pub fn size() -> Option<(u16, u16)> {
+        None
+    }
+}
+
+/// Leaves with the terminal as it was.
+fn exit(code: i32) -> ! {
+    host_tty::restore();
+    std::process::exit(code)
+}
+
 /// Writes to a stream of this process, flushing each chunk so output appears as it happens.
+/// A raw terminal does not turn \n into \r\n; the kernel's early messages need it done here
+/// (the guest's tty already does it for what programs write).
 fn writer(to_stderr: bool) -> Box<dyn FnMut(&[u8]) + Send> {
+    let mut previous = 0u8;
     Box::new(move |bytes: &[u8]| {
+        let converted;
+        let bytes = if host_tty::active() && bytes.contains(&b'\n') {
+            let mut out = Vec::with_capacity(bytes.len() + 16);
+            for &byte in bytes {
+                if byte == b'\n' && previous != b'\r' {
+                    out.push(b'\r');
+                }
+                out.push(byte);
+                previous = byte;
+            }
+            converted = out;
+            &converted[..]
+        } else {
+            if let Some(&last) = bytes.last() {
+                previous = last;
+            }
+            bytes
+        };
         if to_stderr {
             let mut out = std::io::stderr().lock();
             let _ = out.write_all(bytes);
@@ -92,11 +188,14 @@ fn main() -> Result<()> {
     let mut stdio = false;
     let mut python_image: Option<String> = None;
     let mut tools_image: Option<String> = None;
+    let mut addon_dir: Option<String> = None;
+    let mut addon_settings = serde_json::Map::new();
     let mut mounts: Vec<fs::Share> = Vec::new();
     let mut policy = http::Policy::default();
     let mut allow: Vec<String> = Vec::new();
     let mut network = true;
     let mut log_requests = false;
+    let mut raw = true;
 
     let mut argv = std::env::args().skip(1);
     while let Some(argument) = argv.next() {
@@ -105,6 +204,15 @@ fn main() -> Result<()> {
             "--stdio" => stdio = true,
             "--python-image" => python_image = argv.next(),
             "--tools-image" => tools_image = argv.next(),
+            "--addon-dir" => addon_dir = argv.next(),
+            "--addon" => {
+                let name = argv.next().context("--addon needs a name")?;
+                addon_settings.entry(name).or_insert(serde_json::json!(true));
+            }
+            "--addon-config" => {
+                let spec = argv.next().context("--addon-config needs NAME:KEY=VALUE")?;
+                addons::parse_setting(&spec, &mut addon_settings).map_err(anyhow::Error::msg)?;
+            }
             "--kernel" => kernel_path = argv.next(),
             "--initramfs" => initramfs_paths.extend(argv.next()),
             "--cpus" => cpus = argv.next().context("--cpus needs a number")?.parse()?,
@@ -121,6 +229,7 @@ fn main() -> Result<()> {
                 policy.secrets.push(http::parse_secret(&spec)?);
             }
             "--log-requests" => log_requests = true,
+            "--no-raw" => raw = false,
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
             "--" => command.extend(argv.by_ref()),
@@ -140,6 +249,7 @@ fn main() -> Result<()> {
             initramfs: initramfs_paths.iter().map(Into::into).collect(),
             python: python_image.map(Into::into),
             tools: tools_image.map(Into::into),
+            addon_dir: addon_dir.map(Into::into),
         })
         .serve();
     }
@@ -148,6 +258,18 @@ fn main() -> Result<()> {
     for path in &initramfs_paths {
         initcpio.extend(std::fs::read(path).with_context(|| format!("reading {path}"))?);
     }
+    // The overlays --stdio adds unless the app turns them off, here only when named.
+    for path in python_image.iter().chain(&tools_image) {
+        initcpio.extend(std::fs::read(path).with_context(|| format!("reading {path}"))?);
+    }
+    let addons = match addon_settings.is_empty() {
+        true => addons::Resolved::default(),
+        false => addons::resolve(addon_dir.as_deref().map(std::path::Path::new), Some(&serde_json::Value::Object(addon_settings)))
+            .map_err(anyhow::Error::msg)?,
+    };
+    initcpio.extend_from_slice(&addons.initcpio);
+    policy.addon_headers = addons.headers;
+    policy.addon_secrets = addons.secrets;
 
     // The guest's own output stays out of the command's stdout, which belongs to the command.
     let console_to_stderr = exec;
@@ -180,7 +302,27 @@ fn main() -> Result<()> {
         }),
         None,
     )?;
-    let console = console::Console::new(100, 30, writer(console_to_stderr));
+    // The guest's shell gets this terminal, raw and at its size (not for one command: its
+    // output is this process's output, and Ctrl-C ends it).
+    let raw = raw && !exec && host_tty::enter();
+    let (columns, rows) = if raw { host_tty::size().unwrap_or((100, 30)) } else { (100, 30) };
+    if raw {
+        // The guest's agent sets its tty to this terminal's size when the window changes.
+        args.push("collabo.agent=1".into());
+        let vsock = vsock.clone();
+        std::thread::spawn(move || {
+            let mut last = (columns, rows);
+            loop {
+                std::thread::sleep(Duration::from_millis(400));
+                if let Some(now) = host_tty::size() {
+                    if now != last && agent::resize_console(&vsock, now.0, now.1).is_ok() {
+                        last = now;
+                    }
+                }
+            }
+        });
+    }
+    let console = console::Console::new(columns, rows, writer(console_to_stderr));
     let mut devices: Vec<Box<dyn virtio::Device>> = vec![Box::new(console), vsock.device()];
 
     // The guest's own sockets, through a NIC whose gateway is this process.
@@ -218,8 +360,28 @@ fn main() -> Result<()> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buffer = [0u8; 1024];
+        // Ctrl-] then q leaves; Ctrl-] then anything else sends both on.
+        let mut escaped = false;
         while let Ok(read) = stdin.read(&mut buffer) {
-            if read == 0 || input.send(buffer[..read].to_vec()).is_err() {
+            if read == 0 {
+                break;
+            }
+            let mut bytes = Vec::with_capacity(read + 1);
+            for &byte in &buffer[..read] {
+                match (raw, escaped, byte) {
+                    (true, false, 0x1d) => escaped = true,
+                    (true, true, b'q' | b'Q' | b'.') => {
+                        eprint!("\r\n[collabo-core] left the guest\r\n");
+                        exit(0);
+                    }
+                    (true, true, other) => {
+                        escaped = false;
+                        bytes.extend_from_slice(&[0x1d, other]);
+                    }
+                    _ => bytes.push(byte),
+                }
+            }
+            if !bytes.is_empty() && input.send(bytes).is_err() {
                 break;
             }
         }
@@ -243,16 +405,17 @@ fn main() -> Result<()> {
     let termination = machine.run()?;
     let outcome = result.lock().unwrap().take();
     match outcome {
-        Some(Ok((exit, _))) => std::process::exit(exit.status()),
+        Some(Ok((status, _))) => exit(status.status()),
         Some(Err(error)) => {
             eprintln!("collabo-core: {error:#}");
-            std::process::exit(125);
+            exit(125);
         }
         None => {
             if termination == machine::Termination::Panic {
                 eprintln!("[engine] the guest panicked");
-                std::process::exit(1);
+                exit(1);
             }
+            host_tty::restore();
             Ok(())
         }
     }

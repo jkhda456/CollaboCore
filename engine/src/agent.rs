@@ -129,3 +129,17 @@ pub fn run(
         }
     }
 }
+
+/// Sets the guest console's window size (the kernel then signals SIGWINCH to the program in
+/// front): the virtio console's size is fixed at boot, the tty's is not.
+pub fn resize_console(vsock: &crate::vsock::Vsock, columns: u16, rows: u16) -> Result<()> {
+    let stream = connect(vsock, Duration::from_secs(10))?;
+    let command = Command {
+        argv: ["stty", "-F", "/dev/console", "cols", &columns.to_string(), "rows", &rows.to_string()].iter().map(|s| s.to_string()).collect(),
+        env: Vec::new(),
+        cwd: None,
+        stdin: Vec::new(),
+    };
+    run(&stream, &command, Some(Duration::from_secs(10)), |_| {}, |_| {})?;
+    Ok(())
+}

@@ -5,6 +5,7 @@
 #     bin/collabo-core-engine.exe      the native engine (engine/, Rust + wasmtime)
 #     app/images/vmlinux.wasm          the kernel
 #     app/images/*.cpio                guest root, the CPython and network tools overlays
+#     app/images/addons/*              add-ons, off unless the app asks (addons/README.md)
 #     app/licenses/*
 #     manifest.json                    { platform, engine, protocol, entry, files }
 #
@@ -59,6 +60,9 @@ New-Item -ItemType Directory -Force (Join-Path $Dir "bin"), (Join-Path $Dir "app
 Copy-Item $Built (Join-Path $Dir "bin\collabo-core-engine.exe")
 Copy-Item (Join-Path $Engine "kernel\vmlinux.wasm") (Join-Path $Dir "app\images")
 Copy-Item (Join-Path $Engine "images\*.cpio") (Join-Path $Dir "app\images")
+if (Test-Path (Join-Path $Engine "images\addons")) {
+    Copy-Item -Recurse (Join-Path $Engine "images\addons") (Join-Path $Dir "app\images\addons")
+}
 Copy-Item -Recurse (Join-Path $Engine "licenses") (Join-Path $Dir "app\licenses")
 
 # manifest.json: every file's sha256 by its /-separated path, sorted (ordinal, as Python's sorted).
@@ -68,6 +72,13 @@ Get-ChildItem -Recurse -File $Dir | ForEach-Object {
     if ($Rel -ne "manifest.json") { $Files[$Rel] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() }
 }
 $FileMap = [ordered]@{}
+# The add-ons shipped (app/images/addons/<name>.cpio), off unless the app asks (addons/README.md).
+[string[]]$Addons = @()
+$AddonDir = Join-Path $Dir "app\images\addons"
+if (Test-Path $AddonDir) {
+    $Addons = @(Get-ChildItem -File (Join-Path $AddonDir "*.cpio") | ForEach-Object { $_.BaseName })
+    [Array]::Sort($Addons, [System.StringComparer]::Ordinal)
+}
 foreach ($Pair in $Files.GetEnumerator()) { $FileMap[$Pair.Key] = $Pair.Value }
 $Manifest = [ordered]@{
     name     = "collabo-core-runtime"
@@ -78,7 +89,9 @@ $Manifest = [ordered]@{
                  "--kernel", "app/images/vmlinux.wasm",
                  "--initramfs", "app/images/initramfs.cpio",
                  "--python-image", "app/images/python.cpio") + $(
-                 if (Test-Path (Join-Path $Dir "app\images\tools.cpio")) { @("--tools-image", "app/images/tools.cpio") } else { @() })
+                 if (Test-Path (Join-Path $Dir "app\images\tools.cpio")) { @("--tools-image", "app/images/tools.cpio") } else { @() }) + $(
+                 if ($Addons.Count) { @("--addon-dir", "app/images/addons") } else { @() })
+    addons   = $Addons
     files    = $FileMap
 }
 # Written without a BOM: Windows PowerShell's -Encoding UTF8 would add one.

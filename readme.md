@@ -58,6 +58,7 @@ IndexedDB.
 | `nettools/` | curl, dropbear (ssh) and git for the guest, with distro's patches → `tools.cpio` |
 | `dart/collabo_core/` | the Dart package an app uses; `SandboxTools` exposes the sandbox as LLM tools |
 | `flutter/collabo_core_demo/` | a desktop demo app, including how to bundle the runtime on all three platforms |
+| `addons/` | optional overlays the app can boot with (`addons/README.md`); `claude-code`: Claude Code for the guest, with Anthropic or OpenAI-compatible (local) models |
 | `web/`, `host/` | the browser build and the host modules it shares with it |
 | `runtime/src/` | the earlier Node implementation, kept as the reference the engine was ported from (not shipped) |
 | `tests/`, `docs/note.md` | the checks, and a running log of decisions and pitfalls |
@@ -106,7 +107,7 @@ Try it without an app:
 cd dist/runtime/collabo-core-linux-x64        # the paths below are relative to it
 bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
   --initramfs app/images/initramfs.cpio --initramfs app/images/python.cpio \
-  --mount "$OLDPWD:/work"                     # a root shell in this terminal; Ctrl-C ends it
+  --mount "$OLDPWD:/work"                     # a root shell in this terminal; Ctrl-] then q leaves
 ```
 
 ## More

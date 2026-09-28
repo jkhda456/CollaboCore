@@ -46,6 +46,11 @@ pub struct Policy {
     pub secrets: Vec<Secret>,
     /// Request headers the guest may set beyond the defaults.
     pub extra_headers: Vec<String>,
+    /// What the add-ons the sandbox booted with add (addons.rs): kept apart so that a
+    /// `policy.update` replacing the lists above leaves them in place. An app secret for the
+    /// same host and header wins over an add-on's.
+    pub addon_headers: Vec<String>,
+    pub addon_secrets: Vec<Secret>,
     /// A host neither list names is asked about (the app's `permission` event, kind "network")
     /// instead of refused.
     pub ask: bool,
@@ -63,6 +68,8 @@ impl Default for Policy {
             allow_loopback: false,
             secrets: Vec::new(),
             extra_headers: Vec::new(),
+            addon_headers: Vec::new(),
+            addon_secrets: Vec::new(),
             ask: false,
         }
     }
@@ -131,7 +138,16 @@ impl Policy {
     fn secrets_for(&self, https: bool, host: &str) -> Vec<&Secret> {
         match https {
             false => Vec::new(),
-            true => self.secrets.iter().filter(|secret| host_matches(&secret.host, host)).collect(),
+            true => {
+                let mut matching: Vec<&Secret> = self.secrets.iter().filter(|secret| host_matches(&secret.host, host)).collect();
+                let app = matching.len();
+                for secret in self.addon_secrets.iter().filter(|secret| host_matches(&secret.host, host)) {
+                    if !matching[..app].iter().any(|own| own.header == secret.header) {
+                        matching.push(secret);
+                    }
+                }
+                matching
+            }
         }
     }
 
@@ -142,7 +158,7 @@ impl Policy {
 
     /// Is there a secret for this host? Its TLS connections are then taken over (intercept.rs).
     pub fn has_secret_for(&self, host: &str) -> bool {
-        self.secrets.iter().any(|secret| host_matches(&secret.host, host))
+        self.secrets.iter().chain(&self.addon_secrets).any(|secret| host_matches(&secret.host, host))
     }
 
     /// `redact`, for other modules.
@@ -151,13 +167,14 @@ impl Policy {
     }
 
     fn allows_header(&self, name: &str) -> bool {
-        DEFAULT_ALLOWED_HEADERS.contains(&name) || self.extra_headers.iter().any(|allowed| allowed == name)
+        DEFAULT_ALLOWED_HEADERS.contains(&name)
+            || self.extra_headers.iter().chain(&self.addon_headers).any(|allowed| allowed == name)
     }
 
     /// Hides secret values in a message the guest will see.
     fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
-        for secret in &self.secrets {
+        for secret in self.secrets.iter().chain(&self.addon_secrets) {
             if secret.value.len() >= 4 {
                 out = out.replace(&secret.value, "[secret]");
             }
@@ -373,7 +390,14 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certificates()?).build())
-            .timeout_global(Some(Duration::from_secs(60)))
+            // Per phase rather than one deadline for the whole exchange: a model's answer streams
+            // for minutes, and a local model can take minutes to start. A body that stops
+            // arriving still ends, at 30 minutes.
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_send_request(Some(Duration::from_secs(60)))
+            .timeout_send_body(Some(Duration::from_secs(120)))
+            .timeout_recv_response(Some(Duration::from_secs(600)))
+            .timeout_recv_body(Some(Duration::from_secs(1800)))
             .max_redirects(10)
             // 404 is an answer, not a failure: the guest gets the status like a browser does.
             .http_status_as_error(false)
@@ -448,7 +472,7 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
 
         let mut response = match agent.run(built) {
             Ok(response) => response,
-            Err(ureq::Error::Timeout(_)) => return fail("timeout", "no response within 60 s"),
+            Err(ureq::Error::Timeout(phase)) => return fail("timeout", format!("timed out ({phase})")),
             Err(error) => return fail("network", policy.redact(&error.to_string())),
         };
 

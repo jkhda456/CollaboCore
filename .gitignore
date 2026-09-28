@@ -1,4 +1,4 @@
-# Machine-local tools and all build outputs; ./build.sh recreates them.
+# Machine-local tools and all build outputs; `python3 build.py` recreates them.
 .tools/
 dist/
 tests/node_modules/
@@ -14,12 +14,23 @@ python/build-host/
 python/build-wasm/
 python/build-zlib/
 python/zlib/
+python/deps/
+python/build-deps/
+python/build-native/
+python/build-etc/
 python/stage/
 python/out/
 python/*.log
+nettools/src/
+nettools/build/
+nettools/stage/
+nettools/out/
 dart/collabo_core/.dart_tool/
 dart/collabo_core/pubspec.lock
 engine/target/
+addons/*/out/
+addons/*/build/
+addons/*/tests/__pycache__/
 engine/build.log
 # Made by userspace/build.sh from whichever LLVM 19 this machine has.
 userspace/tools/llvm-*
@@ -30,4 +41,23 @@ flutter/collabo_core_demo/build/
 flutter/collabo_core_demo/.dart_tool/
 flutter/collabo_core_demo/pubspec.lock
 flutter/collabo_core_demo/**/ephemeral/
+# Editor and OS clutter.
+*.log
+.idea/
+*.iml
+.vscode/
 .DS_Store
+__pycache__/
+.deploy-target
+/addons
+/docs
+/engine/guest
+/engine/images
+/engine/kernel
+/engine/licenses
+readme.detail.md
+/runtime/collabo-core-linux-x64
+/runtime/collabo-core-win-x64
+/web/app
+/web/static
+/web/vendor

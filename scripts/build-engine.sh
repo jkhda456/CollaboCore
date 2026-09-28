@@ -9,6 +9,7 @@
 #   dist/engine/images/initramfs.cpio  busybox + /init + tools        (userspace/build.sh)
 #   dist/engine/images/python.cpio     CPython 3.13 overlay, optional (python/build.sh)
 #   dist/engine/images/tools.cpio      curl, ssh, git overlay, optional (nettools/build.sh)
+#   dist/engine/images/addons/<name>.cpio + <name>.json   the add-ons (addons/build.sh)
 #
 # The kernel and guest JS come from third_party/distro with our patches (patches/*.patch).
 set -euo pipefail
@@ -63,6 +64,16 @@ else
   echo "note: nettools/out/tools.cpio missing; the sandbox will have no curl/ssh/git (python3 build.py nettools)" >&2
 fi
 
+# The add-ons that were built (addons/README.md); none is required.
+for cpio in "$ROOT"/addons/*/out/*.cpio; do
+  [[ -f "$cpio" ]] || continue
+  name="$(basename "$cpio" .cpio)"
+  mkdir -p "$OUT/images/addons"
+  cp "$cpio" "$OUT/images/addons/"
+  [[ -f "${cpio%.cpio}.json" ]] && cp "${cpio%.cpio}.json" "$OUT/images/addons/"
+  echo "== addon $name"
+done
+
 # License texts travel with the redistributed binaries.
 mkdir -p "$OUT/licenses"
 cp "$DISTRO/packages/kernel/LICENSE" "$OUT/licenses/kernel-js.MIT.txt"
@@ -101,6 +112,13 @@ if [[ -f "$ROOT/nettools/out/tools.cpio" ]]; then
   cp "$B/dropbear-2026.92/LICENSE" "$OUT/licenses/dropbear.MIT.txt"
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
 fi
+
+# What each add-on carries, as its build.sh left it in out/licenses.
+for licenses in "$ROOT"/addons/*/out/licenses; do
+  [[ -d "$licenses" ]] || continue
+  name="$(basename "$(dirname "$(dirname "$licenses")")")"
+  for file in "$licenses"/*; do cp "$file" "$OUT/licenses/addon-$name-$(basename "$file")"; done
+done
 
 echo "== engine ready"
 du -sh "$OUT"

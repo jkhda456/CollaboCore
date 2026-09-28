@@ -32,6 +32,7 @@ if [[ "$LEVEL" == build || "$LEVEL" == all ]]; then
          "$ROOT/engine/target" "$ROOT/tests/node_modules" \
          "$ROOT/dart/collabo_core/.dart_tool" "$ROOT/flutter/collabo_core_demo/build" \
          "$ROOT/flutter/collabo_core_demo/.dart_tool"
+  remove "$ROOT"/addons/*/out "$ROOT"/addons/*/build
   remove "$ROOT"/python/*.log "$ROOT"/engine/build.log
   # The kernel keeps its own object tree; `make clean` there is the kernel's business.
   [[ -d "$ROOT/kernel/linux" ]] && echo "  (kernel/linux: run 'make ARCH=wasm clean' in it yourself)"
