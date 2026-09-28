@@ -16,6 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use anyhow::Result;
 use wasmtime::SharedMemory;
 
 use crate::http::{Asker, Policy};
+use crate::icmp;
 use crate::intercept::Interceptor;
 use crate::machine::Waker;
 use crate::virtio::{write_bytes, Device, Queue};
@@ -57,6 +59,8 @@ const MAX_SEGMENT: usize = 1400;
 pub enum Event {
     Dns { host: String, addresses: Vec<String>, blocked: bool, reason: Option<String> },
     Connect { id: u64, ip: String, port: u16, phase: &'static str, blocked: bool, reason: Option<String> },
+    /// One echo request the guest sent (ping): answered after `rtt`, or not (timeout / refused).
+    Ping { ip: String, rtt: Option<Duration>, blocked: bool, reason: Option<String> },
 }
 
 pub type Observer = Arc<dyn Fn(Event) + Send + Sync>;
@@ -189,7 +193,13 @@ pub struct Stack {
     asker: Option<Asker>,
     /// Takes the TLS connections to hosts that have secrets, to add them (intercept.rs).
     interceptor: Option<Arc<Interceptor>>,
+    /// Echo requests on their way (a thread each).
+    pings: AtomicUsize,
 }
+
+const MAX_PINGS: usize = 32;
+/// As long as ping waits by default, so a slow host still answers.
+const PING_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// What to do with a connection the guest opens.
 enum Decision {
@@ -216,6 +226,7 @@ impl Stack {
             next_id: Mutex::new(1),
             asker,
             interceptor,
+            pings: AtomicUsize::new(0),
         })
     }
 
@@ -241,7 +252,8 @@ impl Stack {
     }
 
     /// May the guest reach this address (as `address`, really `target`) on `port`?
-    fn decide(&self, address: Ipv4Addr, target: Ipv4Addr, port: u16) -> Decision {
+    /// `port` None: a ping, asked about as "host (ping)".
+    fn decide(&self, address: Ipv4Addr, target: Ipv4Addr, port: Option<u16>) -> Decision {
         let policy = self.policy.read().unwrap();
         // The gateway is this computer: `allowHostLoopback` alone governs it.
         if target.is_loopback() {
@@ -263,7 +275,10 @@ impl Stack {
                 false => names.iter().find(|name| policy.unlisted(name)).map(String::as_str),
             };
             if let Some(host) = unlisted {
-                return Decision::Ask(format!("{host}:{port}"));
+                return Decision::Ask(match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => format!("{host} (ping)"),
+                });
             }
         }
         Decision::Refuse(match names.first() {
@@ -327,17 +342,51 @@ impl Stack {
         }
     }
 
-    /// Answers a ping to the gateway, which is how the guest checks the link.
-    fn receive_icmp(&self, destination: Ipv4Addr, payload: &[u8]) {
-        if destination != GATEWAY || payload.len() < 8 || payload[0] != 8 {
+    /// An echo request. The gateway is this process and answers at once (how the guest checks
+    /// its link); any other address gets a real echo from this computer, under the policy, and
+    /// the guest sees that host's answer and round trip — or no answer, as a real ping would.
+    fn receive_icmp(self: &Arc<Stack>, destination: Ipv4Addr, payload: &[u8]) {
+        if payload.len() < 8 || payload[0] != 8 {
             return;
         }
-        let mut reply = payload.to_vec();
-        reply[0] = 0; // echo reply
-        reply[2..4].copy_from_slice(&[0, 0]);
-        let sum = checksum(&[&reply]);
-        reply[2..4].copy_from_slice(&sum.to_be_bytes());
-        self.send(ipv4(PROTO_ICMP, destination, &reply));
+        if destination == GATEWAY {
+            return self.send(echo_reply(destination, payload));
+        }
+        // `ping -f` must not become a thread per packet.
+        if self.pings.fetch_add(1, Ordering::Relaxed) >= MAX_PINGS {
+            self.pings.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        let (stack, request) = (self.clone(), payload.to_vec());
+        std::thread::spawn(move || {
+            stack.ping(destination, &request);
+            stack.pings.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    fn ping(&self, destination: Ipv4Addr, request: &[u8]) {
+        let ip = destination.to_string();
+        let refused = match self.decide(destination, destination, None) {
+            Decision::Allow => None,
+            Decision::Refuse(reason) => Some(reason),
+            Decision::Ask(what) => match self.asker.as_ref().is_some_and(|ask| ask("net", &what)) {
+                true => None,
+                false => Some(format!("blocked by the network policy: the app did not allow \"{what}\"")),
+            },
+        };
+        if let Some(reason) = refused {
+            return self.report(Event::Ping { ip, rtt: None, blocked: true, reason: Some(reason) });
+        }
+        // The guest's own data goes out; the reply it gets carries its own identifier and
+        // sequence number back (this computer's socket uses others).
+        match icmp::echo(destination, &request[8..], PING_TIMEOUT) {
+            Ok(Some(reply)) => {
+                self.send(echo_reply(destination, request));
+                self.report(Event::Ping { ip, rtt: Some(reply.rtt), blocked: false, reason: None });
+            }
+            Ok(None) => self.report(Event::Ping { ip, rtt: None, blocked: false, reason: Some("no reply".into()) }),
+            Err(error) => self.report(Event::Ping { ip, rtt: None, blocked: false, reason: Some(format!("{error:#}")) }),
+        }
     }
 
     // ---- DNS ----------------------------------------------------------------------------
@@ -541,7 +590,7 @@ impl Stack {
         };
         // The gateway is this computer, so that is where the connection really goes.
         let target = if destination == GATEWAY { Ipv4Addr::LOCALHOST } else { destination };
-        let asking = match self.decide(destination, target, port) {
+        let asking = match self.decide(destination, target, Some(port)) {
             Decision::Allow => None,
             Decision::Refuse(reason) => return self.refuse(id, destination, port, guest_port, sequence, reason),
             Decision::Ask(what) => Some(what),
@@ -802,6 +851,16 @@ fn close_socket(connection: &mut Connection) {
     if let Some(socket) = connection.socket.take() {
         let _ = socket.shutdown(Shutdown::Both);
     }
+}
+
+/// The echo reply to an echo request, from `source`.
+fn echo_reply(source: Ipv4Addr, request: &[u8]) -> Frame {
+    let mut reply = request.to_vec();
+    reply[0] = 0;
+    reply[2..4].copy_from_slice(&[0, 0]);
+    let sum = checksum(&[&reply]);
+    reply[2..4].copy_from_slice(&sum.to_be_bytes());
+    ipv4(PROTO_ICMP, source, &reply)
 }
 
 /// A TCP segment from `source` (the address the guest is talking to) back to the guest.

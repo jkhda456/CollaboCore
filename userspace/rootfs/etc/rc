@@ -17,6 +17,10 @@ if [ -f /etc/ssl/collabo-ca.pem ]; then
 	cat /etc/ssl/collabo-ca.pem >> /etc/ssl/cert.pem
 fi
 
+# The console's line discipline counts UTF-8 characters, so backspace in a line being typed
+# (cat, read, a password prompt) removes a whole Korean or Chinese character, not one byte of it.
+stty iutf8 2>/dev/null
+
 MOUNTS=
 for a in $(cat /proc/cmdline); do
 	case $a in

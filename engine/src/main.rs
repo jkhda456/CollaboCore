@@ -27,6 +27,7 @@ mod devicetree;
 mod fs;
 mod hostfn;
 mod http;
+mod icmp;
 mod intercept;
 mod machine;
 mod protocol;

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:collabo_core/collabo_core.dart';
 import 'package:flutter/material.dart';
@@ -40,7 +39,7 @@ class _SandboxViewState extends State<SandboxView> {
       }
       sandbox.onPermission = _askPermission;
       _subscriptions
-        ..add(sandbox.console.listen((bytes) => _append(utf8.decode(bytes, allowMalformed: true))))
+        ..add(sandbox.consoleText.listen(_append))
         ..add(sandbox.networkEvents.listen((e) => setState(() => _network.insert(0, e))));
       setState(() => _sandbox = sandbox);
       await sandbox.writeConsole('\n'); // show a prompt

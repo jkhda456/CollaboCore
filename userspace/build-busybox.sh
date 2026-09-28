@@ -10,7 +10,7 @@ cd "$SRC"
 
 config() { # name value
   sed -i "/CONFIG_$1=/d;/CONFIG_$1 is not set/d" .config
-  case $2 in y|n) echo "CONFIG_$1=$2" >> .config ;; *) echo "CONFIG_$1=\"$2\"" >> .config ;; esac
+  case $2 in y|n|[0-9]*) echo "CONFIG_$1=$2" >> .config ;; *) echo "CONFIG_$1=\"$2\"" >> .config ;; esac
 }
 if [[ "${1:-}" != "--no-config" ]]; then
   make CC="$U/bin/wasm-cc" HOSTCC=clang-19 defconfig >/dev/null
@@ -31,6 +31,12 @@ if [[ "${1:-}" != "--no-config" ]]; then
   for k in INSMOD RMMOD LSMOD MODINFO MODPROBE DEPMOD MODPROBE_SMALL; do config $k n; done
   for k in BOOTCHARTD CONSPY DEVMEM FBSPLASH HDPARM HEXEDIT INETD NSENTER SWAPOFF SWAPON TC TELNETD \
            SENDMAIL REFORMIME MAKEMIME POPMAILDIR INIT LINUXRC RUNSV RUNSVDIR SVLOGD HWCLOCK RTCWAKE; do config $k n; done
+  # Every script, not busybox's default of U+02FF and below: past that, output (the line editor's
+  # echo, ls, less, …) showed "?" for each column, so Korean typed at the prompt read "??".
+  # Wide (CJK) and zero-width (combining) characters count their real columns.
+  config LAST_SUPPORTED_WCHAR 0
+  config UNICODE_WIDE_WCHARS y
+  config UNICODE_COMBINING_WCHARS y
   # `yes` dies of SIGPIPE when oldconfig stops reading; that must not trip pipefail.
   (set +o pipefail; yes "" | make CC="$U/bin/wasm-cc" HOSTCC=clang-19 oldconfig >/dev/null)
 fi

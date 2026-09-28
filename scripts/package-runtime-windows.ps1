@@ -15,11 +15,14 @@
 # dist/engine (kernel and images) comes from a Linux build: copy it over first.
 #
 # Toolchain notes (see docs/note.md, 2026-09-22):
-# - The engine is built with a Rust toolchain whose host is the target (for win-x64 on an ARM64
-#   machine: `rustup toolchain install stable-x86_64-pc-windows-msvc`, run under emulation).
+# - The engine is built with the Rust version engine/rust-toolchain.toml pins, for a host that is the
+#   target (for win-x64 on an ARM64 machine: <version>-x86_64-pc-windows-msvc, run under
+#   emulation). This script installs it with rustup when it is missing; an older "stable" fails
+#   on Cargo.lock v4 and on the dependencies' minimum Rust.
 #   Cross-building from an aarch64 host links the build scripts for ARM64, which needs an ARM64
 #   CRT that an x64-only Build Tools install lacks (LNK1120).
-# - engine/.cargo/config.toml sets CC=clang-19 for the Linux build; CC=cl.exe here overrides it.
+# - The C helper wasmtime compiles needs MSVC (Visual Studio Build Tools, "Desktop development with
+#   C++" with the x64 tools). cc-rs finds it by itself: no Developer prompt and no CC needed.
 param(
     [ValidateSet("win-x64", "win-arm64")] [string] $Platform = "win-x64",
     [switch] $Archive
@@ -32,10 +35,14 @@ $Out = Join-Path $Root "dist\runtime"
 if (-not (Test-Path (Join-Path $Engine "kernel\vmlinux.wasm"))) {
     throw "missing dist\engine; build it on Linux (python3 build.py engine) and copy it here"
 }
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw "no cargo; install Rust (rustup)" }
+if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) { throw "no rustup; install Rust from https://rustup.rs" }
 
-$Toolchain = @{ "win-x64" = "stable-x86_64-pc-windows-msvc"; "win-arm64" = "stable-aarch64-pc-windows-msvc" }[$Platform]
-if (-not $env:CC) { $env:CC = "cl.exe" }
+$Pinned = Select-String -Path (Join-Path $Root "engine\rust-toolchain.toml") -Pattern '^channel\s*=\s*"([^"]+)"'
+if (-not $Pinned) { throw "no channel in engine\rust-toolchain.toml" }
+$Version = $Pinned.Matches[0].Groups[1].Value
+$Toolchain = "$Version-" + @{ "win-x64" = "x86_64-pc-windows-msvc"; "win-arm64" = "aarch64-pc-windows-msvc" }[$Platform]
+& rustup toolchain install $Toolchain --profile minimal --no-self-update
+if ($LASTEXITCODE) { throw "rustup could not install $Toolchain ($LASTEXITCODE)" }
 
 Write-Host "== build $Platform ($Toolchain)"
 Push-Location (Join-Path $Root "engine")

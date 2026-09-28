@@ -44,10 +44,10 @@ class NetworkEvent {
   /// "api" (request level: hfetch, python collabo_core) or "net" (sockets through the NIC).
   String get via => raw['via'] as String? ?? '';
 
-  /// "request", "dns" or "connect".
+  /// "request", "dns", "connect" or "ping".
   String get kind => raw['kind'] as String? ?? '';
 
-  /// start / response / failed (requests), open / closed / failed (connections).
+  /// start / response / failed (requests), open / closed / failed (connections), reply / failed (pings).
   String? get phase => raw['phase'] as String?;
   bool get blocked => raw['blocked'] == true || raw['errorKind'] == 'denied';
   String? get url => raw['url'] as String?;
@@ -55,6 +55,9 @@ class NetworkEvent {
   String? get ip => raw['ip'] as String?;
   int? get port => raw['port'] as int?;
   int? get status => raw['status'] as int?;
+
+  /// A ping's round trip, as this computer measured it.
+  double? get rttMs => (raw['rttMs'] as num?)?.toDouble();
   String? get reason => (raw['reason'] ?? raw['error']) as String?;
 
   @override

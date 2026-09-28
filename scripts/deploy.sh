@@ -11,11 +11,14 @@
 # DIR: the argument, else $COLLABO_DEPLOY_DIR, else the first line of .deploy-target (a local file,
 # not committed: each machine has its own target, e.g. a VirtualBox shared folder).
 #
-# The source copy deletes what no longer exists in the tree (dist/ at the target excepted);
-# dist/ is mirrored exactly. Files are compared by content, not size or time, because a shared
+# The source copy deletes what no longer exists in the tree (dist/ at the target excepted).
+# dist/ is mirrored, except that runtimes and release archives of platforms this machine does not
+# have are left alone: the target accumulates every platform (e.g. win-x64 built on Windows next to
+# linux-x64 from here), and its release index (VERSION, SHA256SUMS) is rewritten to cover them. Files are compared by content, not size or time, because a shared
 # folder keeps neither modes nor reliable times. Afterwards dist/release/SHA256SUMS and every
 # runtime's manifest.json are checked against the files at the target.
 set -euo pipefail
+PYTHON="${PYTHON:-python3}"   # build.py passes its own interpreter
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEST="" SOURCE=1 DIST=1 RELEASE="" CHECK=""
@@ -63,6 +66,22 @@ fi
 if [[ -n "$DIST" ]]; then
   options=(-rt --no-perms --no-owner --no-group --checksum --delete --itemize-changes)
   [[ -z "${DRY:-}" && -z "$CHECK" ]] || options+=(--dry-run)
+  # Other machines' platforms, and the release index (rewritten below for all of them).
+  kept=()
+  for there in "$DEST"/dist/runtime/collabo-core-*/ "$DEST"/dist/release/collabo-core-*; do
+    [[ -e "$there" ]] || continue
+    name="$(basename "$there")"
+    case "$there" in
+      */runtime/*) [[ -d "$ROOT/dist/runtime/$name" ]] || kept+=("runtime/$name") ;;
+      *) [[ -e "$ROOT/dist/release/$name" ]] || kept+=("release/$name") ;;
+    esac
+  done
+  for path in "${kept[@]}"; do options+=(--filter="P /$path" --filter="P /$path/**"); done
+  if [[ ${#kept[@]} != 0 ]]; then
+    echo "   kept at the target (not built here): ${kept[*]}"
+    # Rewritten there for all platforms (below), so not copied or compared as they are here.
+    options+=(--exclude=/release/VERSION --exclude=/release/SHA256SUMS)
+  fi
   echo "== dist/"
   mkdir -p "$DEST/dist"
   out="$(rsync "${options[@]}" "$ROOT/dist/" "$DEST/dist/" | grep -vE '^\.[df]' || true)"
@@ -78,10 +97,15 @@ fi
 
 # What arrived is what was built.
 if [[ -n "$DIST" ]]; then
+  # The release index covers this machine's archives and the ones kept from others.
+  if [[ -d "$DEST/dist/release" ]]; then
+    [[ ${#kept[@]} == 0 ]] || cp "$ROOT/dist/release/VERSION" "$DEST/dist/release/VERSION" 2>/dev/null || true
+    bash "$ROOT/scripts/release.sh" --index "$DEST/dist/release"
+  fi
   if [[ -f "$DEST/dist/release/SHA256SUMS" ]]; then
     (cd "$DEST/dist/release" && sha256sum --quiet -c SHA256SUMS) && echo "== dist/release: checksums ok"
   fi
-  python3 - "$DEST/dist/runtime" <<'PY'
+  "$PYTHON" - "$DEST/dist/runtime" <<'PY'
 import hashlib, json, os, sys
 base = sys.argv[1]
 bad = 0

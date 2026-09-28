@@ -20,6 +20,7 @@
 # Cross-building needs the Rust target and a linker for it (rustup target add …), so a release
 # for every platform is built on each platform, as .github/workflows does.
 set -euo pipefail
+PYTHON="${PYTHON:-python3}"   # build.py passes its own interpreter
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$ROOT/dist/engine"
@@ -80,7 +81,7 @@ for platform in $PLATFORMS; do
   cp "$ENGINE"/images/*.cpio "$dir/app/images/"
   cp -r "$ENGINE/licenses" "$dir/app/licenses"
 
-  python3 - "$dir" "$platform" "$exe" <<'PY'
+  "$PYTHON" - "$dir" "$platform" "$exe" <<'PY'
 import json, os, sys, hashlib
 d, platform, exe = sys.argv[1:]
 files = {}
@@ -103,7 +104,7 @@ PY
 
   if [[ -n "${ARCHIVE:-}" ]]; then
     case "$platform" in
-      win-*) (cd "$OUT" && rm -f "collabo-core-$platform.zip" && python3 -c "
+      win-*) (cd "$OUT" && rm -f "collabo-core-$platform.zip" && "$PYTHON" -c "
 import os, sys, zipfile
 root = sys.argv[1]
 with zipfile.ZipFile(root + '.zip', 'w', zipfile.ZIP_DEFLATED) as z:

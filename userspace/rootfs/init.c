@@ -51,6 +51,9 @@ int main(void)
 	setenv("HOME", "/root", 1);
 	setenv("TERM", "xterm-256color", 1);
 	setenv("USER", "root", 1);
+	// UTF-8 everywhere (musl's only multibyte encoding anyway): Python, git, curl and less
+	// look at LANG to decide how to treat text.
+	setenv("LANG", "C.UTF-8", 1);
 	// Python would otherwise write __pycache__ next to the agent's scripts, i.e. into the
 	// /work archive the user downloads.
 	setenv("PYTHONDONTWRITEBYTECODE", "1", 1);

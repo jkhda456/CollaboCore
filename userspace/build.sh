@@ -112,7 +112,7 @@ if stage rt "$RT_LIB"; then
   cmake --build "$U/build/rt" --target install >/dev/null
 fi
 
-if stage busybox "$U/out/busybox/bin/busybox"; then
+if stage busybox "$U/out/busybox/bin/busybox" "$U/build-busybox.sh"; then
   bash "$U/build-busybox.sh"
 fi
 

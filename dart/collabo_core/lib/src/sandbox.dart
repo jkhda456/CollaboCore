@@ -56,7 +56,13 @@ class CollaboCore {
   }
 
   /// Everything the guest console prints (its root shell, and kernel messages while booting).
+  /// Raw bytes: a multibyte character may be split between two chunks, so decode with a decoder
+  /// that keeps state across them (a terminal widget does), or use [consoleText].
   Stream<Uint8List> get console => _console.stream;
+
+  /// The console as text (UTF-8, decoded across chunk boundaries: Korean, emoji and every other
+  /// script arrive whole). Each listener gets its own decoder.
+  Stream<String> get consoleText => _console.stream.cast<List<int>>().transform(const Utf8Decoder(allowMalformed: true));
 
   /// Every network access attempt of the sandbox.
   Stream<NetworkEvent> get networkEvents => _network.stream;

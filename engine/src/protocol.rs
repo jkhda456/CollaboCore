@@ -452,6 +452,25 @@ impl Server {
                                 fields.insert("reason".into(), json!(reason));
                             }
                         }
+                        net::Event::Ping { ip, rtt, blocked, reason } => {
+                            fields.insert("kind".into(), json!("ping"));
+                            fields.insert("ip".into(), json!(ip));
+                            match rtt {
+                                Some(rtt) => {
+                                    fields.insert("phase".into(), json!("reply"));
+                                    fields.insert("rttMs".into(), json!((rtt.as_secs_f64() * 1000.0 * 10.0).round() / 10.0));
+                                }
+                                None => {
+                                    fields.insert("phase".into(), json!("failed"));
+                                }
+                            }
+                            if blocked {
+                                fields.insert("blocked".into(), json!(true));
+                            }
+                            if let Some(reason) = reason {
+                                fields.insert("reason".into(), json!(reason));
+                            }
+                        }
                         net::Event::Connect { id, ip, port, phase, blocked, reason } => {
                             fields.insert("kind".into(), json!("connect"));
                             fields.insert("id".into(), json!(id));

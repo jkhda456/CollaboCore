@@ -4,6 +4,8 @@
 linker = "clang-19"
 rustflags = ["-C", "link-arg=-fuse-ld=lld-19"]
 
-# wasmtime's build script compiles one small C helper; name the compiler for it too.
+# wasmtime's build script compiles one small C helper; name the compiler for it too — for this
+# target only (cc-rs reads CC_<target> before CC), so that on Windows cc-rs finds MSVC by itself
+# and on macOS the system clang.
 [env]
-CC = "clang-19"
+CC_x86_64_unknown_linux_gnu = "clang-19"

@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createTcpServer } from "node:net";
-import { tmpdir, platform, arch, userInfo } from "node:os";
+import { tmpdir, platform, arch, userInfo, networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -490,6 +490,30 @@ print(data.split(b'\\r\\n\\r\\n', 1)[1].decode())"`);
     assert.match(listed.stdout, /sandbox-test@host/);
     answers["ssh-agent"] = () => true;
   });
+  test("ping is a real echo from this computer, under the same policy", async () => {
+    // An address this computer can surely ping: its own LAN address (not loopback: the guest's
+    // 127.0.0.1 is its own, and 192.0.2.1 is answered by the engine itself).
+    const lan = Object.values(networkInterfaces()).flat().find((a) => a.family === "IPv4" && !a.internal)?.address;
+    const gateway = await c.sh("ping -c 1 -W 3 192.0.2.1 | grep -c 'bytes from'");
+    assert.equal(gateway.stdout.trim(), "1", gateway.stderr);
+    await c.call("policy.update", { network: { allow: ["localhost"], ask: true } });
+    try {
+      const asked = [];
+      answers.network = (target) => (asked.push(target), target === `${lan} (ping)`);
+      if (lan) {
+        const r = await c.sh(`ping -c 2 -W 5 ${lan}`);
+        assert.match(r.stdout, /2 packets received/, r.stdout + r.stderr);
+        assert.ok(c.events.some((e) => e.event === "network" && e.kind === "ping" && e.ip === lan && e.phase === "reply" && typeof e.rttMs === "number"));
+      }
+      const refused = await c.sh("ping -c 1 -W 3 203.0.113.20");
+      assert.match(refused.stdout, /0 packets received/);
+      assert.ok(c.events.some((e) => e.event === "network" && e.kind === "ping" && e.ip === "203.0.113.20" && e.blocked && /did not allow "203\.0\.113\.20 \(ping\)"/.test(e.reason)));
+      assert.deepEqual(asked, [...(lan ? [`${lan} (ping)`] : []), "203.0.113.20 (ping)"], "one question per host, remembered");
+    } finally {
+      answers.network = () => false;
+      await c.call("policy.update", { network: { allow: ["localhost", "*.allowed.test", "example.com"], ask: false } });
+    }
+  });
   test("network ask: a host neither list names is the app's call, per host:port", async () => {
     await c.call("policy.update", { network: { allow: ["localhost"], ask: true } });
     try {
@@ -605,6 +629,33 @@ describe("console and lifecycle", () => {
     const r = await c.sh("python3 -c \"import os; m, s = os.openpty(); print(os.ttyname(s))\"");
     assert.equal(r.exitCode, 0, r.stderr);
     assert.match(r.stdout, /^\/dev\/pts\/\d+$/m);
+  });
+  test("the console shows every script as typed: Korean, CJK, emoji, combining marks (no ??)", async () => {
+    const text = "한글 漢字 😀 e\u0301";
+    await c.call("console.write", { data: `echo "[${text}]" "$LANG"\n` });
+    // The echo of the typed line and the command's output both carry the text itself.
+    await c.waitEvent(() => c.console.includes(`[${text}] C.UTF-8`), 10_000);
+    assert.doesNotMatch(c.console.slice(-400), /\?\?/);
+    // A character split between two writes still arrives whole.
+    const bytes = Buffer.from("echo 둘로-나눔\n");
+    await c.call("console.write", { dataBase64: bytes.subarray(0, 6).toString("base64") });
+    await c.call("console.write", { dataBase64: bytes.subarray(6).toString("base64") });
+    await c.waitEvent(() => c.console.includes("\n둘로-나눔"), 10_000);
+    assert.equal((await c.sh("stty -a </dev/console | grep -o -- '-\\?iutf8' | head -1")).stdout.trim(), "iutf8");
+  });
+  test("text and file names in every script: shell tools, python, a mounted folder, the zip", async () => {
+    const r = await c.sh(`printf '가나다😀' | wc -m; printf '한글' | wc -c; echo '안녕 世界' | tr ' ' '_'; python3 -c "import sys; print(sys.getfilesystemencoding(), sys.stdout.encoding, len('한글😀'))"`);
+    assert.equal(r.stdout, "4\n6\n안녕_世界\nutf-8 utf-8 3\n", r.stderr);
+    await c.sh("cd /work && mkdir -p 문서 && echo '내용 ✓' > '문서/보고서 초안.txt' && python3 -c \"open('日本語.txt','w').write('テスト')\"");
+    assert.equal(readFileSync(join(work, "문서", "보고서 초안.txt"), "utf8"), "내용 ✓\n");
+    assert.equal(readFileSync(join(work, "日本語.txt"), "utf8"), "テスト");
+    writeFileSync(join(work, "호스트가 만든 파일.txt"), "from the host\n");
+    const ls = await c.sh("ls /work | grep -E '호스트|日本語|문서'");
+    assert.equal(ls.stdout, "日本語.txt\n문서\n호스트가 만든 파일.txt\n", ls.stderr);
+    const out = join(tmp, "multilingual.zip");
+    await c.call("exportZip", { guestPath: "/work", outFile: out });
+    const names = readZip(new Uint8Array(readFileSync(out))).map((e) => e.path);
+    assert.ok(names.includes("문서/보고서 초안.txt") && names.includes("日本語.txt"), names.join(" "));
   });
   test("protocol errors are answered, not fatal", async () => {
     await assert.rejects(c.call("nope"), /no method "nope"/);
