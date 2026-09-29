@@ -164,6 +164,11 @@ mod host_tty {
         SAVED.lock().unwrap().is_some()
     }
 
+    /// What is typed.
+    pub fn input() -> Box<dyn std::io::Read + Send> {
+        Box::new(std::io::stdin())
+    }
+
     /// The terminal's size (columns, rows), if stdout is one.
     pub fn size() -> Option<(u16, u16)> {
         // SAFETY: TIOCGWINSZ fills the winsize.
@@ -174,7 +179,135 @@ mod host_tty {
     }
 }
 
-#[cfg(not(unix))]
+/// The console in raw mode: no line editing or echo of its own, Ctrl-C a key (0x03) rather than
+/// a signal to this process, keys as VT sequences, and VT output; restored on exit.
+#[cfg(windows)]
+mod host_tty {
+    use std::sync::Mutex;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleW,
+        SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO,
+        DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+
+    /// The modes and code pages to put back: (input mode, output mode if it is a console, input
+    /// code page, output code page).
+    static SAVED: Mutex<Option<(CONSOLE_MODE, Option<CONSOLE_MODE>, u32, u32)>> = Mutex::new(None);
+
+    /// Raw mode for stdin's console, if stdin is one. True when it was switched.
+    pub fn enter() -> bool {
+        // SAFETY: console calls on this process's standard handles.
+        unsafe {
+            let (input, output) = (GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE));
+            let mut in_mode: CONSOLE_MODE = 0;
+            if GetConsoleMode(input, &mut in_mode) == 0 {
+                return false;
+            }
+            let mut out_mode: CONSOLE_MODE = 0;
+            let out_mode = (GetConsoleMode(output, &mut out_mode) != 0).then_some(out_mode);
+            let raw = (in_mode & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if SetConsoleMode(input, raw) == 0 {
+                return false;
+            }
+            *SAVED.lock().unwrap() = Some((in_mode, out_mode, GetConsoleCP(), GetConsoleOutputCP()));
+            if let Some(mode) = out_mode {
+                // Without DISABLE_NEWLINE_AUTO_RETURN where the console does not know it.
+                let vt = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                if SetConsoleMode(output, vt | DISABLE_NEWLINE_AUTO_RETURN) == 0 {
+                    SetConsoleMode(output, vt);
+                }
+            }
+            SetConsoleCP(65001);
+            SetConsoleOutputCP(65001);
+            true
+        }
+    }
+
+    pub fn restore() {
+        if let Some((in_mode, out_mode, in_cp, out_cp)) = SAVED.lock().unwrap().take() {
+            // SAFETY: the settings the console gave back.
+            unsafe {
+                SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), in_mode);
+                if let Some(mode) = out_mode {
+                    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+                }
+                SetConsoleCP(in_cp);
+                SetConsoleOutputCP(out_cp);
+            }
+        }
+    }
+
+    pub fn active() -> bool {
+        SAVED.lock().unwrap().is_some()
+    }
+
+    /// The console window's size (columns, rows), if stdout is one.
+    pub fn size() -> Option<(u16, u16)> {
+        // SAFETY: the call fills the zeroed struct.
+        unsafe {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
+                return None;
+            }
+            let window = info.srWindow;
+            let (columns, rows) = (window.Right - window.Left + 1, window.Bottom - window.Top + 1);
+            (columns > 0 && rows > 0).then_some((columns as u16, rows as u16))
+        }
+    }
+
+    /// What is typed, as UTF-8. In raw mode the console is read directly: std's stdin reads a
+    /// lone Ctrl-Z as the end of input, which would stop the guest's keyboard.
+    pub fn input() -> Box<dyn std::io::Read + Send> {
+        if active() {
+            Box::new(Console { pending: Vec::new(), high: None })
+        } else {
+            Box::new(std::io::stdin())
+        }
+    }
+
+    struct Console {
+        pending: Vec<u8>,
+        /// A high surrogate whose pair is in the next read.
+        high: Option<u16>,
+    }
+
+    impl std::io::Read for Console {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            while self.pending.is_empty() {
+                let mut units = [0u16; 512];
+                let mut read = 0u32;
+                // SAFETY: the buffer holds as many units as asked for.
+                let ok = unsafe {
+                    ReadConsoleW(
+                        GetStdHandle(STD_INPUT_HANDLE),
+                        units.as_mut_ptr().cast(),
+                        units.len() as u32,
+                        &mut read,
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut units: Vec<u16> = self.high.take().into_iter().chain(units[..read as usize].iter().copied()).collect();
+                if units.last().is_some_and(|unit| (0xd800..0xdc00).contains(unit)) {
+                    self.high = units.pop();
+                }
+                let text: String = char::decode_utf16(units).map(|c| c.unwrap_or('\u{fffd}')).collect();
+                self.pending = text.into_bytes();
+            }
+            let count = buffer.len().min(self.pending.len());
+            buffer[..count].copy_from_slice(&self.pending[..count]);
+            self.pending.drain(..count);
+            Ok(count)
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod host_tty {
     pub fn enter() -> bool {
         false
@@ -185,6 +318,9 @@ mod host_tty {
     }
     pub fn size() -> Option<(u16, u16)> {
         None
+    }
+    pub fn input() -> Box<dyn std::io::Read + Send> {
+        Box::new(std::io::stdin())
     }
 }
 
@@ -423,7 +559,7 @@ fn main() -> Result<()> {
     // Whatever is typed here goes to the guest's console.
     let input = machine.console_input();
     std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
+        let mut stdin = host_tty::input();
         let mut buffer = [0u8; 1024];
         // Ctrl-] then q leaves; Ctrl-] then anything else sends both on.
         let mut escaped = false;

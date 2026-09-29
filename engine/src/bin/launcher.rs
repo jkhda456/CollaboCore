@@ -271,10 +271,72 @@ fn run() -> Result<i32, String> {
         let error = command.exec();
         Err(format!("{}: {error}", engine.display()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // The engine shares this console. Ctrl-C there is a key the engine hands the guest (or,
+        // with no-raw, what ends the engine); either way this process waits for the engine
+        // rather than dying and leaving it behind. The console modes the engine changes are put
+        // back even when it did not get to.
+        let saved = console::save();
+        console::ignore_ctrl_c();
+        let status = command.status().map_err(|e| format!("{}: {e}", engine.display()));
+        console::restore(saved);
+        Ok(status?.code().unwrap_or(1))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let status = command.status().map_err(|e| format!("{}: {e}", engine.display()))?;
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+#[cfg(windows)]
+mod console {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle, SetConsoleCP, SetConsoleCtrlHandler,
+        SetConsoleMode, SetConsoleOutputCP, CONSOLE_MODE, CTRL_BREAK_EVENT, CTRL_C_EVENT, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+
+    /// The input mode, output mode and code pages, where there is a console.
+    pub struct Saved(Option<CONSOLE_MODE>, Option<CONSOLE_MODE>, u32, u32);
+
+    pub fn save() -> Saved {
+        // SAFETY: console queries on this process's standard handles.
+        unsafe {
+            let mode = |handle| {
+                let mut mode: CONSOLE_MODE = 0;
+                (GetConsoleMode(handle, &mut mode) != 0).then_some(mode)
+            };
+            Saved(mode(GetStdHandle(STD_INPUT_HANDLE)), mode(GetStdHandle(STD_OUTPUT_HANDLE)), GetConsoleCP(), GetConsoleOutputCP())
+        }
+    }
+
+    pub fn restore(saved: Saved) {
+        // SAFETY: the settings save() read.
+        unsafe {
+            if let Some(mode) = saved.0 {
+                SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode);
+            }
+            if let Some(mode) = saved.1 {
+                SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), mode);
+            }
+            if saved.2 != 0 {
+                SetConsoleCP(saved.2);
+                SetConsoleOutputCP(saved.3);
+            }
+        }
+    }
+
+    /// Handles Ctrl-C and Ctrl-Break by doing nothing. Unlike ignoring them outright, a handler
+    /// is not inherited, so the engine still gets them.
+    pub fn ignore_ctrl_c() {
+        unsafe extern "system" fn handler(event: u32) -> BOOL {
+            (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT) as BOOL
+        }
+        // SAFETY: the handler is a plain function that lives as long as the process.
+        unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
     }
 }
 

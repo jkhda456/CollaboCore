@@ -22,12 +22,13 @@ webpki-roots = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 time = "0.3"
 
-# The host side of the guest's ping (icmp.rs): an ICMP datagram socket, or IcmpSendEcho.
+# The host side of the guest's ping (icmp.rs): an ICMP datagram socket, or IcmpSendEcho; the host
+# terminal in raw mode (main.rs): termios, or the console modes.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_Console"] }
 
 [profile.release]
 opt-level = 3
