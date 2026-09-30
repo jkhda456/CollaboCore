@@ -62,6 +62,8 @@ Network (the guest's sockets and its request API go through the same policy):
                             a header the host adds to https requests to HOST (repeatable);
                             the guest never sees it, and it is never logged
   --log-requests            print every request the guest makes, to stderr
+  --log-file FILE           append those lines to FILE instead, each with its UTC time
+                            (implies --log-requests)
 
 Add-ons (optional overlays; addons/README.md):
   --addon NAME              boot with that add-on (repeatable)
@@ -88,7 +90,45 @@ Examples (in a runtime folder):
 const TAKES_VALUE: &[&str] = &[
     "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--kernel",
     "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--cwd", "--arg",
+    "--log-file",
 ];
+
+/// Where --log-requests lines go: one line each, from any thread.
+type RequestLog = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A request log appending to `path` (made when missing, its folder too), each line after its UTC time. A write
+/// that fails is dropped: the guest's requests go on.
+fn request_log_to(path: &str) -> Result<RequestLog> {
+    if let Some(folder) = std::path::Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(folder).with_context(|| format!("making the folder of the log file {path}"))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening the log file {path}"))?;
+    let file = Mutex::new(file);
+    Ok(Arc::new(move |line: &str| {
+        let line = format!("{} {line}\n", utc_now());
+        if let Ok(mut file) = file.lock() {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }))
+}
+
+/// This moment as 2026-09-30T12:34:56Z.
+fn utc_now() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
 
 /// Whether the command line asks for help: `-h`, `--help` or `help` as an option (not as an
 /// option's value, and not in the command after `--`).
@@ -384,6 +424,7 @@ fn main() -> Result<()> {
     let mut allow: Vec<String> = Vec::new();
     let mut network = true;
     let mut log_requests = false;
+    let mut log_file: Option<String> = None;
     let mut raw = true;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -427,6 +468,7 @@ fn main() -> Result<()> {
                 policy.secrets.push(http::parse_secret(&spec)?);
             }
             "--log-requests" => log_requests = true,
+            "--log-file" => log_file = Some(argv.next().context("--log-file needs a file")?),
             "--no-raw" => raw = false,
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
@@ -487,17 +529,23 @@ fn main() -> Result<()> {
         policy.allow.clear();
     }
 
+    let request_log = match (log_requests, &log_file) {
+        (_, Some(path)) => Some(request_log_to(path)?),
+        (true, None) => Some(Arc::new(|line: &str| eprintln!("{line}")) as RequestLog),
+        (false, None) => None,
+    };
+
     let vsock = vsock::Vsock::new(3);
     let policy = std::sync::Arc::new(std::sync::RwLock::new(policy));
     http::serve(
         &vsock,
         http::DEFAULT_PORT,
         policy.clone(),
-        log_requests.then(|| -> std::sync::Arc<dyn Fn(http::Event) + Send + Sync> {
-            std::sync::Arc::new(|event: http::Event| match (event.status, event.error) {
-                (Some(status), _) => eprintln!("[network] {} {} -> {status}", event.method, event.url),
-                (None, Some(error)) if event.blocked => eprintln!("[network] blocked {} {}: {error}", event.method, event.url),
-                (None, Some(error)) => eprintln!("[network] {} {}: {error}", event.method, event.url),
+        request_log.clone().map(|log| -> std::sync::Arc<dyn Fn(http::Event) + Send + Sync> {
+            std::sync::Arc::new(move |event: http::Event| match (event.status, event.error) {
+                (Some(status), _) => log(&format!("[network] {} {} -> {status}", event.method, event.url)),
+                (None, Some(error)) if event.blocked => log(&format!("[network] blocked {} {}: {error}", event.method, event.url)),
+                (None, Some(error)) => log(&format!("[network] {} {}: {error}", event.method, event.url)),
                 _ => {}
             })
         }),
@@ -530,8 +578,8 @@ fn main() -> Result<()> {
     if network {
         let stack = net::Stack::new(
             policy,
-            log_requests.then(|| -> std::sync::Arc<dyn Fn(net::Event) + Send + Sync> {
-                std::sync::Arc::new(|event: net::Event| eprintln!("[network] {event:?}"))
+            request_log.clone().map(|log| -> std::sync::Arc<dyn Fn(net::Event) + Send + Sync> {
+                std::sync::Arc::new(move |event: net::Event| log(&format!("[network] {event:?}")))
             }),
             None,
             None,

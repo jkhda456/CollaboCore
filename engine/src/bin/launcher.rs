@@ -18,12 +18,12 @@ use std::process::Command;
 /// Engine options that take a value, by the name launcher.conf uses.
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
-    "arg", "allow", "deny", "secret", "addon", "addon-config",
+    "arg", "allow", "deny", "secret", "addon", "addon-config", "log-file",
 ];
 /// Engine options that are flags.
 const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "log-requests", "no-raw"];
 /// The keys whose value is a host path, relative to the runtime folder.
-const PATH_KEYS: &[&str] = &["kernel", "initramfs", "python-image", "tools-image", "addon-dir"];
+const PATH_KEYS: &[&str] = &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-file"];
 
 const USAGE: &str = "\
 launcher: starts this runtime's sandbox as launcher.conf describes
@@ -371,6 +371,7 @@ mod tests {
              cpus = 4\n\
              no-network = yes\n\
              log-requests = no\n\
+             log-file = logs/network.log\n\
              python = off\n\
              addon-config = claude-code:apiKey=${KEY}\n\
              command = sh -c 'echo # not a comment'\n",
@@ -382,7 +383,8 @@ mod tests {
             conf.args,
             [
                 "--mount", "/rt/work:/work", "--mount", "/home/me/proj:/proj:ro", "--cpus", "4",
-                "--no-network", "--addon-config", "claude-code:apiKey=sk-1",
+                "--no-network", "--log-file", "/rt/logs/network.log", "--addon-config",
+                "claude-code:apiKey=sk-1",
             ]
         );
         assert_eq!(conf.command, ["sh", "-c", "echo # not a comment"]);
