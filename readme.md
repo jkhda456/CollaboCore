@@ -71,9 +71,8 @@ Ubuntu x64. Install the system packages once, then build:
 sudo apt-get install -y make flex bison bc pkg-config libncurses-dev device-tree-compiler \
      wabt clang-19 lld-19 llvm-19 rsync python3 openssl git curl xz-utils patch
 
-python3 build.py deps       # what this machine is still missing
-python3 build.py            # everything: ~25 min the first time (kernel and CPython dominate)
-python3 build.py --help     # the steps and commands below
+./build.sh                  # everything: ~25 min the first time (kernel and CPython dominate)
+./build.sh --help           # the steps and commands below
 ```
 
 Everything else — Node, CMake, Ninja, Binaryen, the Rust toolchain, the two upstream clones
@@ -82,24 +81,31 @@ is built from (checksum-pinned in `python/sources.lock` and `python/packages.loc
 fetched by the build itself, without root.
 
 ```sh
-python3 build.py engine web runtime       # only these steps
-python3 build.py status                   # what each step has produced
-python3 build.py test --all               # unit, guest-boot, end-to-end, Dart and Flutter checks
-python3 build.py release                  # dist/release: archives, SHA256SUMS, VERSION
-python3 build.py clean [dist|build|all]   # remove build output (DRY=1 shows what would go)
-python3 build.py export DIR               # copy just the source, ready to commit
+./build.sh engine web runtime         # only these steps
+./build.sh test --all                 # unit, guest-boot, end-to-end, Dart and Flutter checks
+./build.sh release                    # dist/release: archives, SHA256SUMS, VERSION
+./build.sh clean [dist|build|all]     # remove build output (DRY=1 shows what would go)
+./build.sh export DIR                 # copy just the source, ready to commit
 ```
 
-`build.py` runs every script through `bash`, so a checkout that lost its executable bits (a commit
-made on Windows, a copy through a shared folder) builds anyway, and it puts the bits back on start.
-`python3 build.py perms --git` records them in the git index for the next commit. `.gitattributes`
-keeps scripts, patches and the guest's `/etc` in LF on every platform.
+`./build.sh` alone builds tools, kernel, userspace, python, engine, web and runtime. The guest's
+network tools (curl, ssh, git) and the add-ons are separate steps; run them after `python` and
+before `engine`, or the runtime ships without them:
+
+```sh
+./nettools/build.sh                   # -> nettools/out/tools.cpio
+./addons/build.sh                     # -> addons/*/out/*.cpio
+./build.sh engine runtime             # pick them up
+```
+
+The scripts call each other directly, so they need their executable bits: a checkout that lost
+them (a commit made on Windows, a copy through a shared folder) needs a `chmod +x` on the scripts
+first. `.gitattributes` keeps scripts, patches and the guest's `/etc` in LF on every platform.
 
 The kernel and the guest images are the same everywhere and are built once here. The engine is
-native code, so **each platform builds its own** with `python3 build.py runtime` (or
-`bash scripts/package-runtime.sh`; on Windows it runs `scripts/package-runtime-windows.ps1`,
-which needs no bash); the CI workflow does that for six platforms and runs the tests
-there.
+native code, so **each platform builds its own** with `./build.sh runtime` (=
+`scripts/package-runtime.sh`; on Windows run `scripts/package-runtime-windows.ps1`, which needs
+no bash); the CI workflow does that for six platforms and runs the tests there.
 
 Try it without an app:
 
