@@ -1,0 +1,7 @@
+# GNU screen's settings for every user (nettools/etc/screenrc); ~/.screenrc comes after it.
+
+# No copyright page to press Return through.
+startup_message off
+# The console's prompt (/etc/profile sets it, but only for login shells, which a window's
+# shell is not).
+setenv PS1 '\u@\h:\w\$ '

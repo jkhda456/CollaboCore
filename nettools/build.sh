@@ -4,13 +4,16 @@
 #   curl      8.21  HTTP(S)/FTP client and libcurl (OpenSSL, zlib); git's http(s) transport uses it
 #   dropbear  2026  `ssh` (dbclient) and dropbearkey; keys can stay in the host's ssh-agent
 #   git       2.55  with the http(s) and ssh transports
+#   screen    5.0   GNU screen, the terminal multiplexer (not a network tool; it lives here
+#                   because this is the guest's image of extra programs)
 #
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image.
 #
 # Mirrors third_party/distro/distro/{curl,dropbear,git}/package.nix without Nix, with distro's
-# patches. OpenSSL and zlib are the static libraries python/build-deps.sh builds (python/deps),
-# so the python step comes first. Stages skip when their output exists; FORCE=stage[,stage]
-# redoes them.   stages: curl dropbear git cpio
+# patches; distro has no screen, so its patch is ours (patches/screen-nofork.patch). OpenSSL,
+# zlib and ncurses are the static libraries python/build-deps.sh builds (python/deps), so the
+# python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
+# them.   stages: curl dropbear git screen cpio
 set -euo pipefail
 
 N="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +32,8 @@ LINK_FLAGS="-Wl,--import-memory -Wl,--max-memory=4294967296 -Wl,--shared-memory 
 export CONFIG_SITE="$ROOT/python/config.site"
 chmod +x "$CC"
 
-[[ -f "$DEPS/lib/libssl.a" && -f "$DEPS/lib/libz.a" ]] \
-  || { echo "missing OpenSSL/zlib for the guest; build the python step first (python3 build.py python)" >&2; exit 1; }
+[[ -f "$DEPS/lib/libssl.a" && -f "$DEPS/lib/libz.a" && -f "$DEPS/lib/libncursesw.a" ]] \
+  || { echo "missing OpenSSL/zlib/ncurses for the guest; build the python step first (python3 build.py python)" >&2; exit 1; }
 
 stage() { # name output: true when the stage must run
   if [[ "$FORCE" != *",$1,"* && -e "$2" ]]; then echo "== $1: up to date"; return 1; fi
@@ -116,8 +119,23 @@ if stage git "$STAGE/usr/bin/git"; then
   rm -f "$STAGE"/usr/libexec/git-core/git-{http-fetch,imap-send,daemon,http-backend}
 fi
 
+STEP=screen  # the patch replaces screen's fork()s: the backend is screen started again, a window's
+             # shell a clone(CLONE_VM | CLONE_VFORK) child that takes its pty before exec (see its
+             # header). No PAM (the guest has only root, and screen asks for a password only with
+             # `auth on`), utmp or telnet. Sockets in ~/.screen; terminfo is the cpio's own copy.
+if stage screen "$STAGE/usr/bin/screen"; then
+  S="$(unpack screen)"
+  (cd "$S" && patch -p1 --quiet < "$N/patches/screen-nofork.patch")
+  (cd "$S" && log ./configure "${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
+     --prefix=/usr CFLAGS="-O2" CPPFLAGS="-I$DEPS/include" LDFLAGS="-L$DEPS/lib $LINK_FLAGS" \
+     --disable-pam --disable-utmp --disable-telnet)
+  log make -C "$S" -j"$JOBS"
+  install -D "$S/screen" "$STAGE/usr/bin/screen"
+fi
+
 # The image: an overlay after initramfs.cpio (and python.cpio, if present). etc/ssl/cert.pem is the
-# same Mozilla bundle python.cpio carries, so either image alone has a trust store.
+# same Mozilla bundle python.cpio carries, so either image alone has a trust store; likewise
+# usr/share/terminfo, which screen needs for the terminal in front of it.
 echo "== cpio"   # always: packing takes a second
 {
   CACERT="$ROOT/python/src/$(awk '$1 == "cacert" {n = split($2, a, "/"); print a[n]}' "$ROOT/python/sources.lock")"
@@ -130,6 +148,8 @@ echo "== cpio"   # always: packing takes a second
     --file usr/bin/dropbearconvert="$STAGE/usr/bin/dropbearconvert" \
     --tree usr/libexec/git-core="$STAGE/usr/libexec/git-core" \
     --tree usr/share/git-core="$STAGE/usr/share/git-core" \
+    --file usr/bin/screen="$STAGE/usr/bin/screen" \
+    --tree usr/share/terminfo="$DEPS/share/terminfo" \
     --file etc/ssl/cert.pem="$CACERT" \
     --etc "$N/etc"
 }

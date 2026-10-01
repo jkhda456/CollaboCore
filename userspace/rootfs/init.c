@@ -97,6 +97,16 @@ int main(void)
 	mnt("proc", "/proc", "proc", 0);	// busybox (NOMMU) re-execs /proc/self/exe
 	mnt("sysfs", "/sys", "sysfs", 0);
 	mnt("devtmpfs", "/dev", "devtmpfs", 0);
+	// The kernel opened fds 0-2 on the initramfs's /dev/console, which devtmpfs now covers:
+	// the same terminal, but ttyname() compares inodes, so `tty`, screen and Python's
+	// os.ttyname() would find no name for it. Everything after this inherits devtmpfs's.
+	int console = open("/dev/console", O_RDWR | O_NOCTTY);
+	if (console >= 0) {
+		for (int fd = 0; fd < 3; fd++)
+			dup2(console, fd);
+		if (console > 2)
+			close(console);
+	}
 	// Without it os.openpty() is ENOENT and Python's pty falls back to the BSD /dev/ttyp*
 	// pairs, whose slave it opens without O_NOCTTY.
 	mnt("devpts", "/dev/pts", "devpts", 0);

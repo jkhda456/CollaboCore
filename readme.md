@@ -18,7 +18,7 @@ reach on the network and on the host.
                                                      │                     1080 HTTP request API
                                                      │                     1081 host-function proxy
                                                      │                     1082 host ssh-agent
-                                                     └ guest: busybox, CPython 3.13 + pip, curl, ssh, git,
+                                                     └ guest: busybox, CPython 3.13 + pip, curl, ssh, git, screen,
                                                               hfetch, hostcall
 ```
 
@@ -40,7 +40,8 @@ IndexedDB.
   and telnet. They go through the same policy and events; with `network.ask` the app decides about
   hosts its lists do not name, `sshAgent` lends the host's ssh-agent (private keys stay outside), and
   `secrets` also reach curl's, git's and Python's own HTTPS to those hosts (the engine terminates
-  that TLS with a per-session CA the guest trusts).
+  that TLS with a per-session CA the guest trusts). The same overlay carries **GNU screen** 5.0
+  (sessions, windows, detach and reattach), ported to a guest that has no `fork()`.
 - **Host access** — the app exposes named functions; running host programs is `deny` / `ask` /
   `allow`, and `ask` reaches the app for every request.
 - **One folder to ship** — a 94 MB runtime folder: the engine (11 MB), the kernel and the guest
@@ -55,7 +56,7 @@ IndexedDB.
 | `kernel/` | builds the WebAssembly kernel (the tree itself is cloned) |
 | `userspace/` | musl, compiler-rt, busybox, `/init` and the guest tools (`hfetch`, `hostcall`, `collabo-agentd`) → `initramfs.cpio` |
 | `python/` | CPython 3.13 cross-built for the guest, its C libraries, Rust for the guest (pydantic-core, jiter), pip and the openai SDK → `python.cpio`; `lib/` has `collabo_core` and `mmap` |
-| `nettools/` | curl, dropbear (ssh) and git for the guest, with distro's patches → `tools.cpio` |
+| `nettools/` | curl, dropbear (ssh), git and GNU screen for the guest, with distro's patches (screen's is ours) → `tools.cpio` |
 | `dart/collabo_core/` | the Dart package an app uses; `SandboxTools` exposes the sandbox as LLM tools |
 | `flutter/collabo_core_demo/` | a desktop demo app, including how to bundle the runtime on all three platforms |
 | `addons/` | optional overlays the app can boot with (`addons/README.md`); `claude-code`: Claude Code for the guest, with Anthropic or OpenAI-compatible (local) models |
@@ -89,7 +90,7 @@ fetched by the build itself, without root.
 ```
 
 `./build.sh` alone builds tools, kernel, userspace, python, engine, web and runtime. The guest's
-network tools (curl, ssh, git) and the add-ons are separate steps; run them after `python` and
+network tools (curl, ssh, git, screen) and the add-ons are separate steps; run them after `python` and
 before `engine`, or the runtime ships without them:
 
 ```sh

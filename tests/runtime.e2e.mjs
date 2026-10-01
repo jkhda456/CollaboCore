@@ -429,7 +429,14 @@ describe("network tools (tools.cpio)", () => {
     assert.equal(nc.stdout, "echo:ping", nc.stderr);
     const telnet = await c.sh(`(sleep 0.5; printf 'hi\\r\\n'; sleep 1) | telnet 192.0.2.1 ${TCP_PORT}`);
     assert.match(telnet.stdout, /echo:hi/, telnet.stderr);
-    assert.match((await c.sh("git --version; ssh -V 2>&1; curl --version | head -1")).stdout, /git version 2\.55\.0\nDropbear v2026\.92\ncurl 8\.21\.0/);
+    assert.match((await c.sh("git --version; ssh -V 2>&1; curl --version | head -1; screen -v")).stdout, /git version 2\.55\.0\nDropbear v2026\.92\ncurl 8\.21\.0.*\nScreen version 5\.0\.2 /);
+  });
+  test("screen: a detached session runs its shell on a pty and takes commands (no fork in the guest)", async () => {
+    const r = await c.sh(`screen -dmS e2e && screen -S e2e -X stuff 'echo in-window-$((6*7)); tty\\n' && screen -ls
+for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; screen -S e2e -X hardcopy /tmp/screen.txt; grep -q in-window-42 /tmp/screen.txt && break; done
+screen -S e2e -X quit; grep -E '^(in-window|/dev/pts)' /tmp/screen.txt`);
+    assert.match(r.stdout, /\d+\.e2e\s+\(Detached\)/, r.stderr);
+    assert.match(r.stdout, /in-window-42\n\/dev\/pts\/\d+\n$/, r.stderr);
   });
   test("the guest's own HTTPS clients get the app's secret for its host, and never see it", async () => {
     // localhost has secrets in this sandbox's policy: its TLS ends in the engine, which adds

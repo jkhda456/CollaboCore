@@ -2,7 +2,8 @@
 # All automated checks, no browser needed.
 #   tests/run.sh           unit tests (host modules, web panels) + web import graph
 #   tests/run.sh --boot    + guest boots: networking, workspace, Python (a few minutes)
-#   tests/run.sh --all     + the desktop runtime (stdio protocol) and the Dart package
+#   tests/run.sh --all     + the desktop runtime (stdio protocol, screen in a terminal) and the
+#                            Dart package
 # Needs a built tree (python3 build.py). Run through it: python3 build.py test [--boot|--all].
 set -euo pipefail
 T="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,6 +103,13 @@ if [[ "$MODE" == "--all" ]]; then
     grep -E "^✖|Error|expected|actual" "$log" | head -30; echo "FAIL: runtime tests"; exit 1
   fi
   grep -E "^ℹ (tests|pass|fail)" "$log"
+
+  echo "== screen in a terminal (dist/runtime in a pseudo-terminal, as a person types)"
+  runtime="$(ls -d "$ROOT"/dist/runtime/collabo-core-*/ | head -1)"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/nettools/tests/test_screen.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: screen"; exit 1
+  fi
+  tail -1 "$log"
 
   echo "== Dart package (dart/collabo_core) against the runtime"
   DART="$ROOT/.tools/dart-sdk/bin/dart"

@@ -8,7 +8,7 @@
 #   dist/engine/guest/*.js           host side of guest networking and the NodeFS disk backend
 #   dist/engine/images/initramfs.cpio  busybox + /init + tools        (userspace/build.sh)
 #   dist/engine/images/python.cpio     CPython 3.13 overlay, optional (python/build.sh)
-#   dist/engine/images/tools.cpio      curl, ssh, git overlay, optional (nettools/build.sh)
+#   dist/engine/images/tools.cpio      curl, ssh, git, screen overlay, optional (nettools/build.sh)
 #   dist/engine/images/addons/<name>.cpio + <name>.json   the add-ons (addons/build.sh)
 #
 # The kernel and guest JS come from third_party/distro with our patches (patches/*.patch).
@@ -111,6 +111,7 @@ if [[ -f "$ROOT/nettools/out/tools.cpio" ]]; then
   cp "$B/curl-8.21.0/COPYING" "$OUT/licenses/curl.curl.txt"
   cp "$B/dropbear-2026.92/LICENSE" "$OUT/licenses/dropbear.MIT.txt"
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
+  cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
 fi
 
 # What each add-on carries, as its build.sh left it in out/licenses.

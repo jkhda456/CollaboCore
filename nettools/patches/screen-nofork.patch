@@ -1,0 +1,845 @@
+screen without fork(): Linux compiled to WebAssembly has no MMU, so fork() does not exist
+(unistd.h does not even declare it). screen forks in five places; none of them needs a copy of
+the process, only a child that execs:
+
+- the backend (screen.c): the attacher forks it and the child carries on in main(). Here the
+  backend is screen itself again, started (posix_spawn of /proc/self/exe) with the same
+  arguments and SCREEN_NOFORK_BACKEND set, which makes it take the child's side at that point;
+  it is still the attacher's child, as before.
+- a window's process (window.c), the blanker (display.c), and the printcmd and backtick pipes
+  (fileio.c): SpawnChild (misc.c) runs the child's half the way musl's posix_spawn does, with
+  clone(CLONE_VM | CLONE_VFORK) on a stack of its own, so it can still setsid, take the pty
+  as its controlling terminal (TIOCSCTTY, which posix_spawn cannot) and set its modes before
+  exec. Everything the child needs is worked out first, in the parent, because the child runs
+  in the parent's memory; when it cannot exec it says why (ChildFail) and the parent shows it
+  with Msg(), where a forked child sent the same message to the backend over the socket.
+
+--- a/misc.h
++++ b/misc.h
+@@ -7,6 +7,13 @@
+ 
+ #include "image.h"
+ 
++/* Why a child started with SpawnChild did not get to exec: the parent reports it. */
++struct childerr {
++	const char *fmt;	/* NULL: it did */
++	const char *arg;	/* for a %s in fmt */
++	int err;
++};
++
+ char *SaveStr (const char *);
+ char *SaveStrn (const char *, size_t);
+ #ifndef HAVE_STRERROR
+@@ -17,6 +24,8 @@
+ char *Filename (char *);
+ char *stripdev (char *);
+ void  closeallfiles (int);
++pid_t SpawnChild (int (*)(void *), void *);
++_Noreturn void ChildFail (struct childerr *, const char *, const char *);
+ int   UserContext (void);
+ void  UserReturn (int);
+ int   UserStatus (void);
+--- a/misc.c
++++ b/misc.c
+@@ -31,6 +31,9 @@
+ #include "misc.h"
+ 
+ #include <poll.h>
++#include <sched.h>
++#include <stdlib.h>
++#include <unistd.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>		/* mkdir() declaration */
+ #include <signal.h>
+@@ -179,6 +182,67 @@
+ }
+ 
+ /*
++ * There is no fork() here (Linux compiled to WebAssembly has no MMU). A child starts the way
++ * posix_spawn starts one: clone(CLONE_VM | CLONE_VFORK) runs fn on a stack of its own, in our
++ * memory, while we wait until it calls exec or exits. So fn may only make system calls and exec:
++ * whatever it writes, it writes into our memory, so no stdio, malloc, Msg() or Panic() there, and
++ * a failure goes through ChildFail for the parent to report. Signals stay blocked until the ones
++ * we catch are back at their default.
++ */
++#define SPAWN_STACK (64 * 1024)
++
++struct spawnctx {
++	int (*fn)(void *);
++	void *arg;
++	sigset_t mask;
++};
++
++static int SpawnEntry(void *p)
++{
++	struct spawnctx *ctx = p;
++	struct sigaction sa;
++
++	for (int sig = 1; sig < _NSIG; sig++)
++		if (sigaction(sig, NULL, &sa) == 0 && sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) {
++			memset(&sa, 0, sizeof(sa));
++			sa.sa_handler = SIG_DFL;
++			sigaction(sig, &sa, NULL);
++		}
++	sigprocmask(SIG_SETMASK, &ctx->mask, NULL);
++	return ctx->fn(ctx->arg);
++}
++
++pid_t SpawnChild(int (*fn)(void *), void *arg)
++{
++	struct spawnctx ctx;
++	sigset_t all;
++	char *stack;
++	pid_t pid;
++	int err;
++
++	if (!(stack = malloc(SPAWN_STACK)))
++		return -1;
++	ctx.fn = fn;
++	ctx.arg = arg;
++	sigfillset(&all);
++	sigprocmask(SIG_BLOCK, &all, &ctx.mask);
++	pid = clone(SpawnEntry, stack + SPAWN_STACK, CLONE_VM | CLONE_VFORK | SIGCHLD, &ctx);
++	err = errno;
++	sigprocmask(SIG_SETMASK, &ctx.mask, NULL);
++	free(stack);
++	errno = err;
++	return pid;
++}
++
++void ChildFail(struct childerr *e, const char *fmt, const char *arg)
++{
++	e->err = errno;
++	e->arg = arg;
++	e->fmt = fmt;
++	_exit(127);
++}
++
++/*
+  *  Security - switch to real uid
+  */
+ 
+--- a/screen.c
++++ b/screen.c
+@@ -46,6 +46,7 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <limits.h>
++#include <spawn.h>
+ 
+ #include <locale.h>
+ #if defined(HAVE_LANGINFO_H)
+@@ -61,6 +62,8 @@
+ 
+ extern char **environ;
+ 
++#define BACKEND_ENV "SCREEN_NOFORK_BACKEND"
++
+ int           force_vt = 1;
+ int           VBellWait;
+ int           MsgWait;
+@@ -86,6 +89,7 @@
+ static char  *ParseChar(char *, char *);
+ static int    ParseEscape(char *);
+ static void   SetTtyname(bool fatal, struct stat *st);
++static pid_t  SpawnBackend(char **);
+ 
+ int nversion;			/* numerical version, used for secondary DA */
+ 
+@@ -320,6 +324,13 @@
+ 	char     *sty = NULL;
+ 	char     *multi_home = NULL;
+ 	bool      cmdflag = 0;
++	char    **mainargv = argv;
++	bool      backend = false;	/* SpawnBackend started us */
++
++	if (getenv(BACKEND_ENV)) {
++		backend = true;
++		unsetenv(BACKEND_ENV);
++	}
+ 
+ 	/*
+ 	 *  First, close all unused descriptors
+@@ -974,10 +985,10 @@
+ 	}
+ 	nwin_compose(&nwin_default, &nwin_options, &nwin_default);
+ 
+-	if (!detached || dflag != 2)
+-		MasterPid = fork();
+-	else
++	if (backend || (detached && dflag == 2))
+ 		MasterPid = 0;
++	else
++		MasterPid = SpawnBackend(mainargv);
+ 
+ 	switch (MasterPid) {
+ 	case -1:
+@@ -1921,6 +1932,38 @@
+ 	return 0;
+ }
+ 
++/*
++ * There is no fork() here (Linux compiled to WebAssembly has no MMU), so the backend is this
++ * program again: the same arguments, and BACKEND_ENV in its environment, which makes it take
++ * the forked child's side in main(). It works the same things out from them as we did up to
++ * that point, and its parent is us, the attacher, as a forked child's would be.
++ */
++static pid_t SpawnBackend(char **argv)
++{
++	char exe[MAXPATHLEN];
++	char **env, **ep;
++	ssize_t len;
++	pid_t pid;
++	int err;
++
++	for (ep = environ; *ep; ep++) ;
++	if (!(env = malloc((ep - environ + 2) * sizeof(char *))))
++		Panic(0, "%s", strnomem);
++	env[0] = BACKEND_ENV "=1";
++	memcpy(env + 1, environ, (ep - environ + 1) * sizeof(char *));
++	if ((len = readlink("/proc/self/exe", exe, sizeof(exe) - 1)) > 0) {
++		exe[len] = 0;
++		err = posix_spawn(&pid, exe, NULL, NULL, argv, env);
++	} else
++		err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, env);
++	free(env);
++	if (err) {
++		errno = err;
++		return -1;
++	}
++	return pid;
++}
++
+ static void SetTtyname(bool fatal, struct stat *st)
+ {
+ 	int ret;
+--- a/window.c
++++ b/window.c
+@@ -1005,6 +1005,106 @@
+ }
+ 
+ /*
++ * What ForkWindow's child needs, all of it worked out before it starts (see SpawnChild).
++ */
++struct winchild {
++	Window *win;
++	char **args;
++	char *proc;
++	char *ttyn;
++	char **env;
++	struct mode mode;
++	struct winsize wz;
++	int userfd;		/* the display's tty, -1: none */
++	int slave;
++	int pat;
++	struct childerr e;
++};
++
++static int WindowChild(void *arg)
++{
++	struct winchild *c = arg;
++	Window *win = c->win;
++	int newfd = -1, wfdused = 0, slave = c->slave;
++
++	xsignal(SIGHUP, SIG_DFL);
++	xsignal(SIGINT, SIG_DFL);
++	xsignal(SIGQUIT, SIG_DFL);
++	xsignal(SIGTERM, SIG_DFL);
++	xsignal(SIGTTIN, SIG_DFL);
++	xsignal(SIGTTOU, SIG_DFL);
++#ifdef SIGXFSZ
++	xsignal(SIGXFSZ, SIG_DFL);
++#endif
++
++	if (setgid(real_gid) || setuid(real_uid))
++		ChildFail(&c->e, "Setuid/gid", NULL);
++	if (!win->w_pwin)	/* ignore directory if pseudo */
++		if (win->w_dir && *win->w_dir && chdir(win->w_dir))
++			ChildFail(&c->e, "Cannot chdir to %s", win->w_dir);
++
++	brktty(c->userfd);
++	if (slave != -1) {
++		close(0);
++		if (dup(slave) < 0)
++			ChildFail(&c->e, "Cannot duplicate file descriptor", NULL);
++		close(slave);
++		closeallfiles(win->w_ptyfd);
++		slave = dup(0);
++	} else
++		closeallfiles(win->w_ptyfd);
++	/* Close the three /dev/null descriptors */
++	close(0);
++	close(1);
++	close(2);
++	/*
++	 * distribute filedescriptors between the ttys
++	 */
++	for (int i = 0; i < 3; i++) {
++		if (c->pat & F_PFRONT << F_PSHIFT * i) {
++			if (newfd < 0) {
++#ifdef O_NOCTTY
++				if (separate_sids)
++					newfd = open(c->ttyn, O_RDWR);
++				else
++					newfd = open(c->ttyn, O_RDWR | O_NOCTTY);
++#else
++				newfd = open(c->ttyn, O_RDWR);
++#endif
++				if (newfd < 0)
++					ChildFail(&c->e, "Cannot open %s", c->ttyn);
++			} else {
++				if (dup(newfd) < 0)
++					ChildFail(&c->e, "Cannot duplicate file descriptor", NULL);
++			}
++			fgtty(newfd);
++		} else {
++			if (dup(win->w_ptyfd) < 0)
++				ChildFail(&c->e, "Cannot duplicate file descriptor", NULL);
++			wfdused = 1;
++		}
++	}
++	if (wfdused) {
++		/*
++		 * the pseudo window process should not be surprised with a
++		 * nonblocking filedescriptor. Poor Backend!
++		 */
++		(void)fcntl(win->w_ptyfd, F_SETFL, 0);
++	}
++	close(win->w_ptyfd);
++	if (slave != -1)
++		close(slave);
++	if (newfd >= 0) {
++		(void)tcsetattr(newfd, TCSADRAIN, &c->mode.tio);
++		(void)ioctl(newfd, TIOCSWINSZ, (char *)&c->wz);
++		/* Always turn off nonblocking mode */
++		(void)fcntl(newfd, F_SETFL, 0);
++	}
++	execvpe(c->proc, c->args, c->env);
++	ChildFail(&c->e, "Cannot exec '%s'", c->proc);
++}
++
++/*
+  * Fields w_width, w_height, aflag, number (and w_tty)
+  * are read from Window *win. No fields written.
+  * If pwin is nonzero, filedescriptors are distributed
+@@ -1018,16 +1118,13 @@
+ 	char ebuf[20];
+ 	char shellbuf[7 + MAXPATHLEN];
+ 	char *proc;
+-	int newfd;
+-	int w = win->w_width;
+-	int h = win->w_height;
+-	int pat, wfdused;
+ 	struct pseudowin *pwin = win->w_pwin;
+-	int slave = -1;
++	struct winchild c = { .win = win, .ttyn = ttyn, .slave = -1 };
++	size_t n;
+ 
+ #ifdef O_NOCTTY
+ 	if (pty_preopen) {
+-		if ((slave = open(ttyn, O_RDWR | O_NOCTTY)) == -1) {
++		if ((c.slave = open(ttyn, O_RDWR | O_NOCTTY)) == -1) {
+ 			Msg(errno, "ttyn");
+ 			return -1;
+ 		}
+@@ -1040,147 +1137,69 @@
+ 	}
+ 	fflush(stdout);
+ 	fflush(stderr);
+-	switch (pid = fork()) {
+-	case -1:
+-		Msg(errno, "fork");
+-		break;
+-	case 0:
+-		xsignal(SIGHUP, SIG_DFL);
+-		xsignal(SIGINT, SIG_DFL);
+-		xsignal(SIGQUIT, SIG_DFL);
+-		xsignal(SIGTERM, SIG_DFL);
+-		xsignal(SIGTTIN, SIG_DFL);
+-		xsignal(SIGTTOU, SIG_DFL);
+-#ifdef SIGXFSZ
+-		xsignal(SIGXFSZ, SIG_DFL);
+-#endif
+ 
+-		displays = NULL;	/* beware of Panic() */
+-		ServerSocket = -1;
+-		if (setgid(real_gid) || setuid(real_uid))
+-			Panic(errno, "Setuid/gid");
+-		eff_uid = real_uid;
+-		eff_gid = real_gid;
+-		if (!pwin)	/* ignore directory if pseudo */
+-			if (win->w_dir && *win->w_dir && chdir(win->w_dir))
+-				Panic(errno, "Cannot chdir to %s", win->w_dir);
+-
+-		if (display) {
+-			brktty(D_userfd);
+-			freetty();
+-		} else
+-			brktty(-1);
+-		if (slave != -1) {
+-			close(0);
+-			if(dup(slave) < 0)
+-				Panic(errno, "Cannot duplicate file descriptor");
+-			close(slave);
+-			closeallfiles(win->w_ptyfd);
+-			slave = dup(0);
+-		} else
+-			closeallfiles(win->w_ptyfd);
+-		/* Close the three /dev/null descriptors */
+-		close(0);
+-		close(1);
+-		close(2);
+-		newfd = -1;
+-		/*
+-		 * distribute filedescriptors between the ttys
+-		 */
+-		pat = pwin ? pwin->p_fdpat : ((F_PFRONT << (F_PSHIFT * 2)) | (F_PFRONT << F_PSHIFT) | F_PFRONT);
+-		wfdused = 0;
+-		for (int i = 0; i < 3; i++) {
+-			if (pat & F_PFRONT << F_PSHIFT * i) {
+-				if (newfd < 0) {
+-#ifdef O_NOCTTY
+-					if (separate_sids)
+-						newfd = open(ttyn, O_RDWR);
+-					else
+-						newfd = open(ttyn, O_RDWR | O_NOCTTY);
+-#else
+-					newfd = open(ttyn, O_RDWR);
+-#endif
+-					if (newfd < 0)
+-						Panic(errno, "Cannot open %s", ttyn);
+-				} else {
+-					if (dup(newfd) < 0)
+-						Panic(errno, "Cannot duplicate file descriptor");
+-				}
+-				if (fgtty(newfd))
+-					Msg(errno, "fgtty");
+-			} else {
+-				if(dup(win->w_ptyfd) < 0)
+-					Panic(errno, "Cannot duplicate file descriptor");
+-				wfdused = 1;
+-			}
+-		}
+-		if (wfdused) {
+-			/*
+-			 * the pseudo window process should not be surprised with a
+-			 * nonblocking filedescriptor. Poor Backend!
+-			 */
+-			if (fcntl(win->w_ptyfd, F_SETFL, 0))
+-				Msg(errno, "Warning: clear NBLOCK fcntl failed");
+-		}
+-		close(win->w_ptyfd);
+-		if (slave != -1)
+-			close(slave);
+-		if (newfd >= 0) {
+-			struct mode fakemode, *modep;
+-			if (display) {
+-				modep = &D_OldMode;
+-			} else {
+-				modep = &fakemode;
+-				InitTTY(modep, 0);
+-			}
+-			/* We only want echo if the users input goes to the pseudo
+-			 * and the pseudo's stdout is not send to the window.
+-			 */
+-			if (pwin && (!(pat & F_UWP) || (pat & F_PBACK << F_PSHIFT))) {
+-				modep->tio.c_lflag &= ~ECHO;
+-				modep->tio.c_iflag &= ~ICRNL;
+-			}
+-			SetTTY(newfd, modep);
+-			glwz.ws_col = w;
+-			glwz.ws_row = h;
+-			(void)ioctl(newfd, TIOCSWINSZ, (char *)&glwz);
+-			/* Always turn off nonblocking mode */
+-			(void)fcntl(newfd, F_SETFL, 0);
+-		}
+-		NewEnv[2] = MakeTermcap(display == NULL || win->w_aflag);
+-		strcpy(shellbuf, "SHELL=");
+-		strncpy(shellbuf + 6, ShellProg + (*ShellProg == '-'), ARRAY_SIZE(shellbuf) - 7);
+-		shellbuf[ARRAY_SIZE(shellbuf) - 1] = 0;
+-		NewEnv[4] = shellbuf;
+-		if (win->w_term && *win->w_term && strcmp(screenterm, win->w_term) && (strlen(win->w_term) < MAXTERMLEN)) {
+-			char *s1, *s2, tl;
+-
+-			snprintf(tebuf, ARRAY_SIZE(tebuf), "TERM=%s", win->w_term);
+-			tl = strlen(win->w_term);
+-			NewEnv[1] = tebuf;
+-			if ((s1 = strchr(NewEnv[2], '|'))) {
+-				if ((s2 = strchr(++s1, '|'))) {
+-					if (strlen(NewEnv[2]) - (s2 - s1) + tl < 1024) {
+-						memmove(s1 + tl, s2, strlen(s2) + 1);
+-						memmove(s1, win->w_term, tl);
+-					}
++	c.pat = pwin ? pwin->p_fdpat : ((F_PFRONT << (F_PSHIFT * 2)) | (F_PFRONT << F_PSHIFT) | F_PFRONT);
++	c.userfd = display ? D_userfd : -1;
++	if (display)
++		c.mode = D_OldMode;
++	else
++		InitTTY(&c.mode, 0);
++	/* We only want echo if the users input goes to the pseudo
++	 * and the pseudo's stdout is not send to the window.
++	 */
++	if (pwin && (!(c.pat & F_UWP) || (c.pat & F_PBACK << F_PSHIFT))) {
++		c.mode.tio.c_lflag &= ~ECHO;
++		c.mode.tio.c_iflag &= ~ICRNL;
++	}
++	c.wz.ws_col = win->w_width;
++	c.wz.ws_row = win->w_height;
++
++	/* NewEnv[2..4] are slots for TERMCAP, WINDOW and SHELL, filled in here */
++	for (n = 5; NewEnv[n]; n++) ;
++	if (!(c.env = malloc((n + 1) * sizeof(char *)))) {
++		Msg(0, "%s", strnomem);
++		if (c.slave != -1)
++			close(c.slave);
++		return -1;
++	}
++	memcpy(c.env, NewEnv, (n + 1) * sizeof(char *));
++	c.env[2] = MakeTermcap(display == NULL || win->w_aflag);
++	strcpy(shellbuf, "SHELL=");
++	strncpy(shellbuf + 6, ShellProg + (*ShellProg == '-'), ARRAY_SIZE(shellbuf) - 7);
++	shellbuf[ARRAY_SIZE(shellbuf) - 1] = 0;
++	c.env[4] = shellbuf;
++	if (win->w_term && *win->w_term && strcmp(screenterm, win->w_term) && (strlen(win->w_term) < MAXTERMLEN)) {
++		char *s1, *s2, tl;
++
++		snprintf(tebuf, ARRAY_SIZE(tebuf), "TERM=%s", win->w_term);
++		tl = strlen(win->w_term);
++		c.env[1] = tebuf;
++		if ((s1 = strchr(c.env[2], '|'))) {
++			if ((s2 = strchr(++s1, '|'))) {
++				if (strlen(c.env[2]) - (s2 - s1) + tl < 1024) {
++					memmove(s1 + tl, s2, strlen(s2) + 1);
++					memmove(s1, win->w_term, tl);
+ 				}
+ 			}
+ 		}
+-		snprintf(ebuf, ARRAY_SIZE(ebuf), "WINDOW=%d", win->w_number);
+-		NewEnv[3] = ebuf;
+-
+-		if (*proc == '-')
+-			proc++;
+-		if (!*proc)
+-			proc = DefaultShell;
+-		execvpe(proc, args, NewEnv);
+-		Panic(errno, "Cannot exec '%s'", proc);
+-	default:
+-		break;
+ 	}
+-	if (slave != -1)
+-		close(slave);
++	snprintf(ebuf, ARRAY_SIZE(ebuf), "WINDOW=%d", win->w_number);
++	c.env[3] = ebuf;
++
++	if (*proc == '-')
++		proc++;
++	if (!*proc)
++		proc = DefaultShell;
++	c.proc = proc;
++	c.args = args;
++
++	if ((pid = SpawnChild(WindowChild, &c)) == -1)
++		Msg(errno, "fork");
++	else if (c.e.fmt)
++		Msg(c.e.err, c.e.fmt, c.e.arg);
++	free(c.env);
++	if (c.slave != -1)
++		close(c.slave);
+ 	return pid;
+ }
+ 
+--- a/display.c
++++ b/display.c
+@@ -2977,14 +2977,62 @@
+ 	ClearAll();
+ }
+ 
++/* What RunBlanker's child needs (see SpawnChild). */
++struct blankchild {
++	char **cmdv;
++	char *ttyn;
++	char **env;
++	struct mode mode;
++	struct winsize wz;
++	int userfd;
++	int ptyfd;
++	int slave;
++	struct childerr e;
++};
++
++static int BlankerChild(void *arg)
++{
++	struct blankchild *c = arg;
++	int slave = c->slave;
++
++	if (setgid(real_gid) || setuid(real_uid))
++		ChildFail(&c->e, "setuid/setgid", NULL);
++	brktty(c->userfd);
++	if (slave != -1) {
++		close(0);
++		dup(slave);
++		close(slave);
++		closeallfiles(c->ptyfd);
++		slave = dup(0);
++	} else
++		closeallfiles(c->ptyfd);
++	close(0);
++	close(1);
++	close(2);
++	if (open(c->ttyn, O_RDWR))
++		ChildFail(&c->e, "Cannot open %s", c->ttyn);
++	if (dup(0) < 0)
++		ChildFail(&c->e, "Cannot dup() %s", c->ttyn);
++	if (dup(0) < 0)
++		ChildFail(&c->e, "Cannot dup() %s", c->ttyn);
++	if (slave != -1)
++		close(slave);
++	close(c->ptyfd);
++	fgtty(0);
++	(void)tcsetattr(0, TCSADRAIN, &c->mode.tio);
++	(void)ioctl(0, TIOCSWINSZ, (char *)&c->wz);
++	execvpe(*c->cmdv, c->cmdv, c->env);
++	ChildFail(&c->e, "Cannot exec '%s'", *c->cmdv);
++}
++
+ void RunBlanker(char **cmdv)
+ {
+ 	char *m;
+ 	pid_t pid;
+-	int slave = -1;
+ 	int ptype = 0;
+ 	char termname[MAXTERMLEN + 6];
+-	char **np;
++	struct blankchild c = { .cmdv = cmdv, .slave = -1 };
++	size_t n;
+ 
+ 	strncpy(termname, "TERM=", 6);
+ 	strncpy(termname + 5, D_termname, MAXTERMLEN - 6);
+@@ -2997,7 +3045,7 @@
+ 	}
+ #ifdef O_NOCTTY
+ 	if (pty_preopen) {
+-		if ((slave = open(m, O_RDWR | O_NOCTTY)) == -1) {
++		if ((c.slave = open(m, O_RDWR | O_NOCTTY)) == -1) {
+ 			Msg(errno, "%s", m);
+ 			ClosePTY(D_blankerev.fd);
+ 			D_blankerev.fd = -1;
+@@ -3005,63 +3053,43 @@
+ 		}
+ 	}
+ #endif
+-	switch (pid = fork()) {
+-	case -1:
++	/* STY, TERM and what NewEnv has after its slots for SHELL, TERMCAP and WINDOW */
++	for (n = 5; NewEnv[n]; n++) ;
++	if (!(c.env = malloc((n - 2) * sizeof(char *)))) {
++		Msg(0, "%s", strnomem);
++		ClosePTY(D_blankerev.fd);
++		D_blankerev.fd = -1;
++		if (c.slave != -1)
++			close(c.slave);
++		return;
++	}
++	c.env[0] = NewEnv[0];
++	c.env[1] = termname;
++	memcpy(c.env + 2, NewEnv + 5, (n - 4) * sizeof(char *));
++	c.ttyn = m;
++	c.mode = D_OldMode;
++	c.userfd = D_userfd;
++	c.ptyfd = D_blankerev.fd;
++	c.wz.ws_col = D_width;
++	c.wz.ws_row = D_height;
++	if ((pid = SpawnChild(BlankerChild, &c)) == -1) {
+ 		Msg(errno, "fork");
++		free(c.env);
+ 		ClosePTY(D_blankerev.fd);
+ 		D_blankerev.fd = -1;
+-		if (slave != -1)
+-			close(slave);
++		if (c.slave != -1)
++			close(c.slave);
+ 		return;
+-	case 0:
+-		displays = NULL;
+-		ServerSocket = -1;
+-		if (setgid(real_gid) || setuid(real_uid))
+-			Panic(errno, "setuid/setgid");
+-		eff_uid = real_uid;
+-		eff_gid = real_gid;
+-		brktty(D_userfd);
+-		freetty();
+-		if (slave != -1) {
+-			close(0);
+-			dup(slave);
+-			close(slave);
+-			closeallfiles(D_blankerev.fd);
+-			slave = dup(0);
+-		} else
+-			closeallfiles(D_blankerev.fd);
+-		close(0);
+-		close(1);
+-		close(2);
+-		if (open(m, O_RDWR))
+-			Panic(errno, "Cannot open %s", m);
+-		if (dup(0) < 0)
+-			Panic(errno, "Cannot dup() %s", m);
+-		if (dup(0) < 0)
+-			Panic(errno, "Cannot dup() %s", m);
+-		if (slave != -1)
+-			close(slave);
+-		close(D_blankerev.fd);
+-		fgtty(0);
+-		SetTTY(0, &D_OldMode);
+-		np = NewEnv + 3;
+-		*np++ = NewEnv[0];
+-		*np++ = termname;
+-		glwz.ws_col = D_width;
+-		glwz.ws_row = D_height;
+-		(void)ioctl(0, TIOCSWINSZ, (char *)&glwz);
+-		display = NULL;
+-		execvpe(*cmdv, cmdv, NewEnv + 3);
+-		Panic(errno, "Cannot exec '%s'", *cmdv);
+-	default:
+-		break;
+ 	}
++	if (c.e.fmt)
++		Msg(c.e.err, c.e.fmt, c.e.arg);
++	free(c.env);
+ 	D_blankerpid = pid;
+ 	evenq(&D_blankerev);
+ 	D_blocked = 4;
+ 	ClearAll();
+-	if (slave != -1)
+-		close(slave);
++	if (c.slave != -1)
++		close(c.slave);
+ }
+ 
+ void ClearScrollbackBuffer(void)
+--- a/fileio.c
++++ b/fileio.c
+@@ -556,74 +556,81 @@
+ 	return fd;
+ }
+ 
++/* What printpipe's and readpipe's children need (see SpawnChild). */
++struct pipechild {
++	char **cmdv;		/* readpipe; printpipe runs cmd with /bin/sh */
++	char *cmd;
++	int fd;			/* the pipe's end, to become stdin (printpipe) or stdout */
++	struct childerr e;
++};
++
++static int PrintChild(void *arg)
++{
++	struct pipechild *c = arg;
++
++	close(0);
++	if (dup(c->fd) < 0)
++		ChildFail(&c->e, "printpipe dup", NULL);
++	closeallfiles(0);
++	if (setgid(real_gid) || setuid(real_uid))
++		ChildFail(&c->e, "printpipe setuid", NULL);
++#ifdef SIGPIPE
++	xsignal(SIGPIPE, SIG_DFL);
++#endif
++	execl("/bin/sh", "sh", "-c", c->cmd, NULL);
++	ChildFail(&c->e, "/bin/sh", NULL);
++}
++
+ int printpipe(Window *p, char *cmd)
+ {
+ 	int pi[2];
++	struct pipechild c = { .cmd = cmd };
++
+ 	if (pipe(pi)) {
+ 		WMsg(p, errno, "printing pipe");
+ 		return -1;
+ 	}
+-	switch (fork()) {
+-	case -1:
++	c.fd = pi[0];
++	if (SpawnChild(PrintChild, &c) == -1) {
+ 		WMsg(p, errno, "printing fork");
+ 		return -1;
+-	case 0:
+-		display = p->w_pdisplay;
+-		displays = NULL;
+-		ServerSocket = -1;
+-		close(0);
+-		if (dup(pi[0]) < 0)
+-			Panic(errno, "printpipe dup");
+-		closeallfiles(0);
+-		if (setgid(real_gid) || setuid(real_uid))
+-			Panic(errno, "printpipe setuid");
+-		eff_uid = real_uid;
+-		eff_gid = real_gid;
+-#ifdef SIGPIPE
+-		xsignal(SIGPIPE, SIG_DFL);
+-#endif
+-		execl("/bin/sh", "sh", "-c", cmd, NULL);
+-		Panic(errno, "/bin/sh");
+-	default:
+-		break;
+ 	}
++	if (c.e.fmt)
++		WMsg(p, c.e.err, (char *)c.e.fmt);	/* no %s in PrintChild's */
+ 	close(pi[0]);
+ 	return pi[1];
+ }
+ 
++static int ReadChild(void *arg)
++{
++	struct pipechild *c = arg;
++
++	close(1);
++	if (dup(c->fd) != 1)
++		ChildFail(&c->e, "dup", NULL);
++	closeallfiles(1);
++	if (setgid(real_gid) || setuid(real_uid))
++		ChildFail(&c->e, "setuid/setgid", NULL);
++	execvp(*c->cmdv, c->cmdv);
++	ChildFail(&c->e, "%s", *c->cmdv);
++}
++
+ int readpipe(char **cmdv)
+ {
+ 	int pi[2];
++	struct pipechild c = { .cmdv = cmdv };
+ 
+ 	if (pipe(pi)) {
+ 		Msg(errno, "pipe");
+ 		return -1;
+ 	}
+-	switch (fork()) {
+-	case -1:
++	c.fd = pi[1];
++	if (SpawnChild(ReadChild, &c) == -1) {
+ 		Msg(errno, "fork");
+ 		return -1;
+-	case 0:
+-		displays = NULL;
+-		ServerSocket = -1;
+-		close(1);
+-		if (dup(pi[1]) != 1) {
+-			close(pi[1]);
+-			Panic(0, "dup");
+-		}
+-		closeallfiles(1);
+-		if (setgid(real_gid) || setuid(real_uid)) {
+-			close(1);
+-			Panic(errno, "setuid/setgid");
+-		}
+-		eff_uid = real_uid;
+-		eff_gid = real_gid;
+-		execvp(*cmdv, cmdv);
+-		close(1);
+-		Panic(errno, "%s", *cmdv);
+-	default:
+-		break;
+ 	}
++	if (c.e.fmt)
++		Msg(c.e.err, c.e.fmt, c.e.arg);
+ 	close(pi[1]);
+ 	return pi[0];
+ }

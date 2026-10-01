@@ -8,7 +8,7 @@
 #     app/images/vmlinux.wasm         the kernel
 #     app/images/initramfs.cpio       guest root (busybox, /init, the agent)
 #     app/images/python.cpio          CPython 3.13 overlay
-#     app/images/tools.cpio           network tools overlay (curl, ssh, git)
+#     app/images/tools.cpio           network tools overlay (curl, ssh, git) and screen
 #     app/images/addons/*             add-ons, off unless the app asks (addons/README.md)
 #     app/licenses/*
 #     manifest.json                   { platform, engine, protocol, entry, addons, files }
