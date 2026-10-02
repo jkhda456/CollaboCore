@@ -468,12 +468,22 @@ pub struct BootOptions {
     pub boot_console: Box<dyn FnMut(&[u8]) + Send>,
 }
 
+/// Native stack a guest thread's WebAssembly may use (wasmtime's `max_wasm_stack`).
+pub const MAX_WASM_STACK: usize = 32 << 20;
+/// Stack of the host threads that run guest CPUs: the wasm stack plus room for the host's own
+/// frames (wasmtime, the kernel's host functions).
+const CPU_THREAD_STACK: usize = MAX_WASM_STACK + (8 << 20);
+
 impl Machine {
     pub fn boot(options: BootOptions) -> Result<Machine> {
         let mut config = Config::new();
         // Guest programs are compiled with LLVM's setjmp/longjmp lowering, which uses the
         // exception-handling instructions.
         config.wasm_threads(true).wasm_simd(true).wasm_bulk_memory(true).wasm_exceptions(true);
+        // Guest programs that recurse deeply (a JavaScript engine's interpreter, say) need more
+        // than wasmtime's 512 KiB of native stack, or a deep call traps and takes the whole
+        // machine down. CPU threads are spawned with room for it (CPU_THREAD_STACK).
+        config.max_wasm_stack(MAX_WASM_STACK);
         let engine = Engine::new(&config)?;
         let module = Module::new(&engine, &options.kernel).context("compiling the kernel")?;
 
@@ -564,7 +574,7 @@ impl Machine {
                 Request::SpawnCpu { function, arg, name, user } => {
                     let shared = self.shared.clone();
                     cpus += 1;
-                    std::thread::Builder::new().name(name).spawn(move || {
+                    std::thread::Builder::new().name(name).stack_size(CPU_THREAD_STACK).spawn(move || {
                         if let Err(error) = run_cpu(shared.clone(), function, arg, user) {
                             eprintln!("collabo-core: cpu thread failed: {error:?}");
                             shared.send(Request::Terminate(Termination::Panic));
@@ -671,7 +681,8 @@ fn build_devicetree(
         getrandom(&mut seed);
         chosen.prop("rng-seed", Value::Bytes(seed.to_vec()));
         let args = if options.args.is_empty() { String::new() } else { format!(" {}", options.args.join(" ")) };
-        chosen.prop("bootargs", Value::Str(format!("console=hvc0{args}")));
+        // collabo.wasmstack: how deep guest programs may recurse (bytes of native wasm stack).
+        chosen.prop("bootargs", Value::Str(format!("console=hvc0 collabo.wasmstack={MAX_WASM_STACK}{args}")));
         chosen.prop("ncpus", Value::U32(options.cpus));
         if !options.initcpio.is_empty() {
             chosen.prop("linux,initrd-start", Value::U32(initcpio_address as u32));

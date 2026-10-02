@@ -1,0 +1,888 @@
+vi with UTF-8 text. busybox vi knows only bytes: anything from 0x80 up is drawn as '.' (or, with
+FEATURE_VI_8BIT, passed through but counted as one column a byte), the cursor moves a byte at a
+time, and x, r or a backspace remove one byte of a multibyte character, which corrupts the file.
+Korean text showed as rows of dots and edited into garbage.
+
+With Unicode support on (UNICODE_SUPPORT, and unicode_status ON), text[] is taken as UTF-8:
+
+- a character is a valid UTF-8 sequence plus the combining (zero width) characters after it;
+  next_char/prev_char/char_start step over one. Bytes that are not valid UTF-8 stay one
+  character each and are drawn as '.', as before.
+- the screen buffer is one cell per column (cell_t: the bytes drawn there; an empty cell is the
+  right half of a wide character), so a wide (CJK) character takes 2 columns, refresh() redraws
+  it whole, and a wide character cut by the left or right edge of a scrolled line shows as
+  '<' or '>'. Columns (cursor, j/k keeping the column, |, autoindent) count real widths; the
+  cursor sits on a wide character's first column.
+- h/l, x/X/s, the Delete key, r, R, a, backspace in insert mode, Esc, and the end of an operator's
+  range (de, d$, dl, ...) take whole characters. In Replace mode the first byte of a typed
+  character replaces the character under the cursor and the rest are inserted after it; a
+  backspace puts the replaced character back. The undo queue keeps a multibyte backspace in one
+  object (it used to drop deletions longer than a byte).
+- word motions (w, b, e, E) count non-ASCII characters as word characters, and step a whole
+  character, so they do not stop inside one (e used to stick at the end of a Korean word).
+- f/F/t/T and r read a whole UTF-8 character; the backspace on the : / ? line removes one;
+  :list and "not implemented" messages show printable UTF-8 as it is.
+
+Without Unicode support the code paths reduce to the byte-wise ones (utf8_char() says every byte
+is a character of width 1).
+
+diff --git a/editors/vi.c b/editors/vi.c
+index 34932f6..5d5721e 100644
+--- a/editors/vi.c
++++ b/editors/vi.c
+@@ -198,6 +198,15 @@
+ #if ENABLE_FEATURE_VI_REGEX_SEARCH
+ # include <regex.h>
+ #endif
++#if ENABLE_UNICODE_SUPPORT
++# include "unicode.h"
++// text[] is UTF-8: see "UTF-8 characters" below
++# define vi_utf8 (unicode_status == UNICODE_ON)
++#else
++# define vi_utf8 0
++# define wcwidth(wc) 1
++# define init_unicode() ((void)0)
++#endif
+ 
+ // the CRASHME code is unmaintained, and doesn't currently build
+ #define ENABLE_FEATURE_VI_CRASHME 0
+@@ -234,8 +243,17 @@ enum {
+ 	// Sanity limits. We have only one buffer of this size.
+ 	MAX_SCR_COLS = CONFIG_FEATURE_VI_MAX_LEN,
+ 	MAX_SCR_ROWS = CONFIG_FEATURE_VI_MAX_LEN,
++	// A screen cell holds a character and its combining characters (Hangul
++	// spelled as conjoining jamo needs 9 bytes); more combining ones are not drawn.
++	CELL_BYTES = 12,
+ };
+ 
++// One column of the screen: the bytes drawn there, NUL padded.
++// All NUL: the right half of the wide character to its left.
++typedef struct cell {
++	char c[CELL_BYTES];
++} cell_t;
++
+ // VT102 ESC sequences.
+ // See "Xterm Control Sequences"
+ // http://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+@@ -358,10 +376,10 @@ struct globals {
+ 	char *alt_filename;
+ #endif
+ 	char *screenbegin;       // index into text[], of top line on the screen
+-	char *screen;            // pointer to the virtual screen buffer
+-	int screensize;          //            and its size
++	cell_t *screen;          // pointer to the virtual screen buffer
++	int screensize;          //            and its size in cells
+ 	int tabstop;
+-	int last_search_char;    // last char searched for (int because of Unicode)
++	char last_search_char[5]; // last char searched for (a UTF-8 sequence)
+ 	smallint last_search_cmd;    // command used to invoke last char search
+ #if ENABLE_FEATURE_VI_CRASHME
+ 	char last_input_char;    // last char read from user
+@@ -424,7 +442,7 @@ struct globals {
+ #endif
+ 	char get_input_line__buf[MAX_INPUT_LEN]; // former static
+ 
+-	char scr_out_buf[MAX_SCR_COLS + MAX_TABSTOP * 2];
++	cell_t scr_out_buf[MAX_SCR_COLS];
+ 
+ #if ENABLE_FEATURE_VI_UNDO
+ // undo_push() operations
+@@ -791,38 +809,153 @@ static int prev_tabstop(int col)
+ 	return col - ((col % tabstop) ?: tabstop);
+ }
+ 
+-static int next_column(char c, int co)
++//----- UTF-8 characters ---------------------------------------
++// With Unicode on, a multibyte UTF-8 character together with the combining
++// (zero width) characters after it is one character: the cursor moves over it,
++// "x" deletes it and it is drawn in its real width (2 columns for CJK).
++// Bytes that are not valid UTF-8 stay one character each, drawn as '.'.
++
++// Length of the character at p (not reading from lim on); *wc is its code point,
++// or -1 if p does not start a valid UTF-8 sequence (the length is then 1).
++static int utf8_char(const char *p, const char *lim, int *wc)
+ {
++	unsigned c = (unsigned char)*p;
++	unsigned v;
++	int n, i;
++
++	*wc = c;
++	if (c < 0x80)
++		return 1;
++	*wc = -1;
++	if (!vi_utf8 || c < 0xc2 || c > 0xf4)
++		return 1;
++	n = c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
++	if (lim - p < n)
++		return 1;
++	v = c & (0x3f >> (n - 1));
++	for (i = 1; i < n; i++) {
++		c = (unsigned char)p[i];
++		if ((c & 0xc0) != 0x80)
++			return 1;
++		v = (v << 6) | (c & 0x3f);
++	}
++	// overlong forms, UTF-16 surrogates, past U+10FFFF
++	if (n == 3 && (v < 0x800 || (v >= 0xd800 && v <= 0xdfff)))
++		return 1;
++	if (n == 4 && (v < 0x10000 || v > 0x10ffff))
++		return 1;
++	*wc = v;
++	return n;
++}
++
++static int is_combining(int wc)
++{
++	return wc >= 0x80 && wcwidth(wc) == 0;
++}
++
++// The character after the one at p
++static char *next_char(char *p)
++{
++	int wc;
++
++	p += utf8_char(p, end, &wc);
++	// combining characters go with a printable character before them
++	if (wc >= ' ' && wc != 0x7f) {
++		while (p < end) {
++			int n = utf8_char(p, end, &wc);
++			if (!is_combining(wc))
++				break;
++			p += n;
++		}
++	}
++	return p;
++}
++
++// Start of the UTF-8 sequence that p is in
++static char *utf8_start(char *p)
++{
++	int wc, k;
++
++	for (k = 1; k <= 3 && ((unsigned char)p[1 - k] & 0xc0) == 0x80 && p - k >= text; k++) {
++		if (utf8_char(p - k, end, &wc) > k)
++			return p - k;
++	}
++	return p;
++}
++
++// Start of the character that p is in
++static char *char_start(char *p)
++{
++	int wc;
++
++	p = utf8_start(p);
++	while (p > text) {
++		char *q;
++
++		utf8_char(p, end, &wc);
++		if (!is_combining(wc))
++			break;
++		q = utf8_start(p - 1);
++		utf8_char(q, end, &wc);
++		if (wc < ' ' || wc == 0x7f) // as in next_char()
++			break;
++		p = q;
++	}
++	return p;
++}
++
++// The character before p
++static char *prev_char(char *p)
++{
++	return char_start(p - 1);
++}
++
++// Column after the character at p, which starts at column co
++static int next_column(char *p, int co)
++{
++	unsigned char c = *p;
++	int wc;
++
+ 	if (c == '\t')
+-		co = next_tabstop(co);
+-	else if ((unsigned char)c < ' ' || c == 0x7f)
+-		co++; // display as ^X, use 2 columns
+-	return co + 1;
++		return next_tabstop(co) + 1;
++	if (c < ' ' || c == 0x7f)
++		return co + 2; // display as ^X, use 2 columns
++	utf8_char(p, end, &wc);
++	return co + (wc >= 0x80 && wcwidth(wc) == 2 ? 2 : 1);
+ }
+ 
+ static int get_column(char *p)
+ {
+-	const char *r;
++	char *r;
+ 	int co = 0;
+ 
+-	for (r = begin_line(p); r < p; r++)
+-		co = next_column(*r, co);
++	for (r = begin_line(p); r < p; r = next_char(r))
++		co = next_column(r, co);
+ 	return co;
+ }
+ 
+ //----- Erase the Screen[] memory ------------------------------
++static void set_cell(cell_t *cell, const char *s, int len)
++{
++	memset(cell, 0, sizeof(*cell));
++	memcpy(cell->c, s, len);
++}
++
+ static void screen_erase(void)
+ {
+-	memset(screen, ' ', screensize);	// clear new screen
++	int i;
++
++	for (i = 0; i < screensize; i++)	// clear new screen
++		set_cell(&screen[i], " ", 1);
+ }
+ 
+ static void new_screen(int ro, int co)
+ {
+-	char *s;
++	cell_t *s;
+ 
+ 	free(screen);
+-	screensize = ro * co + 8;
+-	s = screen = xmalloc(screensize);
++	screensize = ro * co;
++	s = screen = xmalloc(screensize * sizeof(*screen));
+ 	// initialize the new screen. assume this will be a empty file.
+ 	screen_erase();
+ 	// non-existent text[] lines start with a tilde (~).
+@@ -833,7 +966,7 @@ static void new_screen(int ro, int co)
+ 	ro -= 2;
+ 	while (--ro >= 0) {
+ 		s += co;
+-		*s = '~';
++		set_cell(s, "~", 1);
+ 	}
+ }
+ 
+@@ -842,7 +975,7 @@ static void sync_cursor(char *d, int *row, int *col)
+ {
+ 	char *beg_cur;	// begin and end of "d" line
+ 	char *tp;
+-	int cnt, ro, co;
++	int cnt, ro, co, ce;
+ 
+ 	beg_cur = begin_line(d);	// first char of cur line
+ 
+@@ -884,18 +1017,15 @@ static void sync_cursor(char *d, int *row, int *col)
+ 		tp = next_line(tp);
+ 	}
+ 
+-	// find out what col "d" is on
++	// find out what col "d" is on: "co" its first column, "ce" its last
+ 	co = 0;
+-	do { // drive "co" to correct column
+-		if (*tp == '\n') //vda || *tp == '\0')
+-			break;
+-		co = next_column(*tp, co) - 1;
+-		// inserting text before a tab, don't include its position
+-		if (cmd_mode && tp == d - 1 && *d == '\t') {
+-			co++;
+-			break;
+-		}
+-	} while (tp++ < d && ++co);
++	while (tp < d && *tp != '\n') {
++		co = next_column(tp, co);
++		tp = next_char(tp);
++	}
++	ce = co;
++	if (tp < end && *tp != '\n')
++		ce = next_column(tp, co) - 1;
+ 
+ 	// "co" is the column where "dot" is.
+ 	// The screen has "columns" columns.
+@@ -913,14 +1043,22 @@ static void sync_cursor(char *d, int *row, int *col)
+ 	if (co < 0 + offset) {
+ 		offset = co;
+ 	}
+-	if (co >= columns + offset) {
+-		offset = co - columns + 1;
++	if (ce >= columns + offset) {
++		offset = ce - columns + 1;
+ 	}
+ 	// if the first char of the line is a tab, and "dot" is sitting on it
+ 	//  force offset to 0.
+ 	if (d == beg_cur && *d == '\t') {
+ 		offset = 0;
+ 	}
++	// The cursor is on the last column of a ^X, and of a tab in command
++	// mode (inserting text before a tab, it is on the tab's first column).
++	// A wide character has it on its first column.
++	if ((*d == '\t' && !cmd_mode)
++	 || ((unsigned char)*d < ' ' && *d != '\t' && *d != '\n') || *d == 0x7f
++	) {
++		co = ce;
++	}
+ 	co -= offset;
+ 
+ 	*row = ro;
+@@ -928,60 +1066,77 @@ static void sync_cursor(char *d, int *row, int *col)
+ }
+ 
+ //----- Format a text[] line into a buffer ---------------------
+-static char* format_line(char *src /*, int li*/)
++// Columns [offset, offset + columns) of the line, one cell each
++static cell_t* format_line(char *src /*, int li*/)
+ {
+-	unsigned char c;
+-	int co;
+-	int ofs = offset;
+-	char *dest = scr_out_buf; // [MAX_SCR_COLS + MAX_TABSTOP * 2]
+-
+-	c = '~'; // char in col 0 in non-existent lines is '~'
++	cell_t *dest = scr_out_buf; // [MAX_SCR_COLS]
++	int co, x;
++
++	for (x = 0; x < columns; x++)
++		set_cell(&dest[x], " ", 1);
++	if (src >= end) {
++		// char in col 0 in non-existent lines is '~'
++		if (offset == 0)
++			set_cell(&dest[0], "~", 1);
++		return dest;
++	}
++#define put(x, s, len) do { \
++	if ((x) >= 0 && (x) < columns) \
++		set_cell(&dest[x], (s), (len)); \
++} while (0)
+ 	co = 0;
+-	while (co < columns + tabstop) {
+-		// have we gone past the end?
+-		if (src < end) {
+-			c = *src++;
+-			if (c == '\n')
+-				break;
+-			if ((c & 0x80) && !Isprint(c)) {
+-				c = '.';
++	while (src < end && *src != '\n' && co < offset + columns) {
++		char *nx = next_char(src);
++		unsigned char c = *src;
++		int wc, w = 1;
++
++		x = co - offset;
++		if (c == '\t') {
++			w = next_tabstop(co) + 1 - co; // spaces
++		} else if (c < ' ' || c == 0x7f) {
++			char ctl = c == 0x7f ? '?' : c + '@'; // Ctrl-X -> 'X'
++			put(x, "^", 1);
++			put(x + 1, &ctl, 1);
++			w = 2;
++		} else if (utf8_char(src, end, &wc), wc < 0 || wcwidth(wc) < 0) {
++			// not UTF-8, or not printable
++			put(x, (!vi_utf8 && Isprint(c)) ? src : ".", 1);
++		} else {
++			// the character and as many of its combining characters as fit
++			cell_t cell;
++			char *q = src;
++			int len = 0;
++
++			memset(&cell, 0, sizeof(cell));
++			if (is_combining(wc))
++				cell.c[len++] = ' '; // nothing to combine with
++			while (q < nx) {
++				int n = utf8_char(q, nx, &wc);
++				if (len + n > CELL_BYTES)
++					break;
++				memcpy(cell.c + len, q, n);
++				len += n;
++				q += n;
+ 			}
+-			if (c < ' ' || c == 0x7f) {
+-				if (c == '\t') {
+-					c = ' ';
+-					//      co %    8     !=     7
+-					while ((co % tabstop) != (tabstop - 1)) {
+-						dest[co++] = c;
+-					}
+-				} else {
+-					dest[co++] = '^';
+-					if (c == 0x7f)
+-						c = '?';
+-					else
+-						c += '@'; // Ctrl-X -> 'X'
++			utf8_char(src, end, &wc);
++			if (wcwidth(wc) == 2) {
++				w = 2;
++				if (x == -1) // left half scrolled off
++					put(0, "<", 1);
++				else if (x == columns - 1) // right half does not fit
++					put(x, ">", 1);
++				else if (x >= 0) {
++					dest[x] = cell;
++					memset(&dest[x + 1], 0, sizeof(cell));
+ 				}
++			} else if (x >= 0) {
++				dest[x] = cell;
+ 			}
+ 		}
+-		dest[co++] = c;
+-		// discard scrolled-off-to-the-left portion,
+-		// in tabstop-sized pieces
+-		if (ofs >= tabstop && co >= tabstop) {
+-			memmove(dest, dest + tabstop, co);
+-			co -= tabstop;
+-			ofs -= tabstop;
+-		}
+-		if (src >= end)
+-			break;
++		co += w;
++		src = nx;
+ 	}
+-	// check "short line, gigantic offset" case
+-	if (co < ofs)
+-		ofs = co;
+-	// discard last scrolled off part
+-	co -= ofs;
+-	dest += ofs;
+-	// fill the rest with spaces
+-	if (co < columns)
+-		memset(&dest[co], ' ', columns - co);
++#undef put
+ 	return dest;
+ }
+ 
+@@ -995,7 +1150,8 @@ static void refresh(int full_screen)
+ #define old_offset refresh__old_offset
+ 
+ 	int li, changed;
+-	char *tp, *sp;		// pointer into text[] and screen[]
++	char *tp;		// pointer into text[]
++	cell_t *sp;		// pointer into screen[]
+ 
+ 	if (ENABLE_FEATURE_VI_WIN_RESIZE IF_FEATURE_VI_ASK_TERMINAL(&& !G.get_rowcol_error) ) {
+ 		unsigned c = columns, r = rows;
+@@ -1016,7 +1172,7 @@ static void refresh(int full_screen)
+ 	// compare text[] to screen[] and mark screen[] lines that need updating
+ 	for (li = 0; li < rows - 1; li++) {
+ 		int cs, ce;				// column start & end
+-		char *out_buf;
++		cell_t *out_buf;
+ 		// format current text line
+ 		out_buf = format_line(tp /*, li*/);
+ 
+@@ -1039,7 +1195,7 @@ static void refresh(int full_screen)
+ 		// compare newly formatted buffer with virtual screen
+ 		// look forward for first difference between buf and screen
+ 		for (; cs <= ce; cs++) {
+-			if (out_buf[cs] != sp[cs]) {
++			if (memcmp(&out_buf[cs], &sp[cs], sizeof(*sp)) != 0) {
+ 				changed = TRUE;	// mark for redraw
+ 				break;
+ 			}
+@@ -1047,7 +1203,7 @@ static void refresh(int full_screen)
+ 
+ 		// look backward for last difference between out_buf and screen
+ 		for (; ce >= cs; ce--) {
+-			if (out_buf[ce] != sp[ce]) {
++			if (memcmp(&out_buf[ce], &sp[ce], sizeof(*sp)) != 0) {
+ 				changed = TRUE;	// mark for redraw
+ 				break;
+ 			}
+@@ -1066,11 +1222,19 @@ static void refresh(int full_screen)
+ 		if (cs > ce) { cs = 0; ce = columns - 1; }
+ 		// is there a change between virtual screen and out_buf
+ 		if (changed) {
++			// wide characters are redrawn whole
++			while (cs > 0 && !out_buf[cs].c[0])
++				cs--;
++			while (ce < columns - 1 && !out_buf[ce + 1].c[0])
++				ce++;
+ 			// copy changed part of buffer to virtual screen
+-			memcpy(sp+cs, out_buf+cs, ce-cs+1);
++			memcpy(sp+cs, out_buf+cs, (ce-cs+1) * sizeof(*sp));
+ 			place_cursor(li, cs);
+ 			// write line out to terminal
+-			fwrite(&sp[cs], ce - cs + 1, 1, stdout);
++			for (; cs <= ce; cs++) {
++				if (sp[cs].c[0])
++					fwrite(sp[cs].c, strnlen(sp[cs].c, CELL_BYTES), 1, stdout);
++			}
+ 		}
+ 	}
+ 
+@@ -1200,6 +1364,27 @@ static int get_motion_char(void)
+ 	return c;
+ }
+ 
++// Get a key, and the rest of the UTF-8 character it starts: the bytes go to buf[5]
++// ("" for a cursor or function key)
++static int get_one_mbchar(char *buf)
++{
++	int c = get_one_char();
++	int len = 0, n = 1;
++
++	if (vi_utf8 && c >= 0xc2 && c <= 0xf4)
++		n = c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
++	if ((unsigned)c <= 0xff) // not a KEYCODE_xxx
++		buf[len++] = c;
++	while (len && len < n) {
++		int cc = get_one_char();
++		if ((cc & ~0x3f) != 0x80) // not a continuation byte
++			break;
++		buf[len++] = cc;
++	}
++	buf[len] = '\0';
++	return c;
++}
++
+ // Get input line (uses "status line" area)
+ static char *get_input_line(const char *prompt)
+ {
+@@ -1220,8 +1405,11 @@ static char *get_input_line(const char *prompt)
+ 		if (c == '\n' || c == '\r' || c == 27)
+ 			break;		// this is end of input
+ 		if (isbackspace(c)) {
+-			// user wants to erase prev char
+-			buf[--i] = '\0';
++			// user wants to erase prev char (all bytes of a UTF-8 one)
++			do {
++				c = (unsigned char)buf[--i];
++				buf[i] = '\0';
++			} while (vi_utf8 && i > 1 && (c & 0xc0) == 0x80);
+ 			go_bottom_and_clear_to_eol();
+ 			if (i <= 0) // user backs up before b-o-l, exit
+ 				break;
+@@ -1390,7 +1578,17 @@ static void print_literal(char *buf, const char *s)
+ 
+ 	d = buf;
+ 	for (; *s; s++) {
++		int wc, n;
++
+ 		c = *s;
++		// a printable UTF-8 character as it is
++		n = utf8_char(s, s + strlen(s), &wc);
++		if (n > 1 && wcwidth(wc) >= 0 && d - buf + n <= MAX_INPUT_LEN - 10) {
++			d = mempcpy(d, s, n);
++			*d = '\0';
++			s += n - 1;
++			continue;
++		}
+ 		if ((c & 0x80) && !Isprint(c))
+ 			c = '?';
+ 		if (c < ' ' || c == 0x7f) {
+@@ -1640,15 +1838,24 @@ static void undo_push(char *src, unsigned length, int u_type)
+ 	case UNDO_EMPTY:	// Just in case this ever happens...
+ 		return;
+ 	case UNDO_DEL_QUEUED:
+-		if (length != 1)
+-			return;	// Only queue single characters
++		// Single characters (several bytes in UTF-8) are queued
++		if (length > CONFIG_FEATURE_VI_UNDO_QUEUE_MAX) {
++			undo_queue_commit();
++			u_type = UNDO_DEL;
++			break;
++		}
+ 		switch (undo_queue_state) {
+ 		case UNDO_EMPTY:
+ 			undo_queue_state = UNDO_DEL;
+ 		case UNDO_DEL:
++			// keep a character's bytes in one undo object
++			if (undo_q + length > CONFIG_FEATURE_VI_UNDO_QUEUE_MAX) {
++				undo_queue_commit();
++				undo_queue_state = UNDO_DEL;
++			}
+ 			undo_queue_spos = src;
+-			undo_q++;
+-			undo_queue[CONFIG_FEATURE_VI_UNDO_QUEUE_MAX - undo_q] = *src;
++			while (length)
++				undo_queue[CONFIG_FEATURE_VI_UNDO_QUEUE_MAX - ++undo_q] = src[--length];
+ 			// If queue is full, dump it into an object
+ 			if (undo_q == CONFIG_FEATURE_VI_UNDO_QUEUE_MAX)
+ 				undo_queue_commit();
+@@ -1810,14 +2017,17 @@ static void dot_left(void)
+ {
+ 	undo_queue_commit();
+ 	if (dot > text && dot[-1] != '\n')
+-		dot--;
++		dot = prev_char(dot);
+ }
+ 
+ static void dot_right(void)
+ {
+ 	undo_queue_commit();
+-	if (dot < end - 1 && *dot != '\n')
+-		dot++;
++	if (dot < end - 1 && *dot != '\n') {
++		char *q = next_char(dot);
++		if (q < end)
++			dot = q;
++	}
+ }
+ 
+ static void dot_begin(void)
+@@ -1838,11 +2048,12 @@ static char *move_to_col(char *p, int l)
+ 
+ 	p = begin_line(p);
+ 	co = 0;
+-	do {
+-		if (*p == '\n') //vda || *p == '\0')
++	while (p < end && *p != '\n') {
++		co = next_column(p, co);
++		if (co > l)
+ 			break;
+-		co = next_column(*p, co);
+-	} while (co <= l && p++ < end);
++		p = next_char(p);
++	}
+ 	return p;
+ }
+ 
+@@ -1869,18 +2080,22 @@ static void dot_to_char(int cmd)
+ {
+ 	char *q = dot;
+ 	int dir = islower(cmd) ? FORWARD : BACK;
++	int len = strlen(last_search_char);
+ 
+-	if (last_search_char == 0)
++	if (len == 0)
+ 		return;
+ 
+ 	do {
+ 		do {
+-			q += dir;
++			if (dir == FORWARD)
++				q = q < end - 1 ? next_char(q) : end;
++			else
++				q = q > text ? prev_char(q) : text - 1;
+ 			if ((dir == FORWARD ? q > end - 1 : q < text) || *q == '\n') {
+ 				indicate_error();
+ 				return;
+ 			}
+-		} while (*q != last_search_char);
++		} while (end - q < len || memcmp(q, last_search_char, len) != 0);
+ 	} while (--cmdcnt > 0);
+ 
+ 	dot = q;
+@@ -2141,7 +2356,7 @@ static char *char_insert(char *p, char c, int undo) // insert the char c at 'p'
+ 		end_cmd_q();	// stop adding to q
+ 		last_status_cksum = 0;	// force status update
+ 		if ((dot > text) && (p[-1] != '\n')) {
+-			p--;
++			p = prev_char(p);
+ 		}
+ #if ENABLE_FEATURE_VI_SETOPTS
+ 		if (autoindent) {
+@@ -2188,14 +2403,14 @@ static char *char_insert(char *p, char c, int undo) // insert the char c at 'p'
+ 		if (cmd_mode == 2) {
+ 			// special treatment for backspace in Replace mode
+ 			if (p > rstart) {
+-				p--;
++				p = prev_char(p);
+ #if ENABLE_FEATURE_VI_UNDO
+ 				undo_pop();
+ #endif
+ 			}
+ 		} else if (p > text) {
+-			p--;
+-			p = text_hole_delete(p, p, ALLOW_UNDO_QUEUED);	// shrink buffer 1 char
++			char *q = prev_char(p);
++			p = text_hole_delete(q, p - 1, ALLOW_UNDO_QUEUED);	// shrink buffer 1 char
+ 		}
+ 	} else {
+ 		// insert a char into text[]
+@@ -3048,9 +3263,16 @@ static void colon(char *buf)
+ 		go_bottom_and_clear_to_eol();
+ 		puts("\r");
+ 		for (; q <= r; q++) {
+-			int c_is_no_print;
++			int c_is_no_print, wc, n;
+ 
+ 			c = *q;
++			// a printable UTF-8 character as it is
++			n = utf8_char(q, end, &wc);
++			if (n > 1 && wcwidth(wc) >= 0) {
++				fwrite(q, n, 1, stdout);
++				q += n - 1;
++				continue;
++			}
+ 			c_is_no_print = (c & 0x80) && !Isprint(c);
+ 			if (c_is_no_print) {
+ 				c = '.';
+@@ -3455,6 +3677,9 @@ static void colon(char *buf)
+ //    TAB NEWLINE VT FF RETURN SPACE
+ // DO NOT COUNT NEWLINE AS WHITESPACE
+ 
++// With UTF-8, a non-ASCII character is part of a word too.
++#define is_wordchar(c) (isalnum(c) || (c) == '_' || (vi_utf8 && ((unsigned char)(c) & 0x80)))
++
+ static int st_test(char *p, int type, int dir, char *tested)
+ {
+ 	char c, c0, ci;
+@@ -3483,7 +3708,7 @@ static int st_test(char *p, int type, int dir, char *tested)
+ 	}
+ 	if (type == S_END_ALNUM) {
+ 		c = ci;
+-		test = (isalnum(c) || c == '_');
++		test = is_wordchar(c);
+ 	}
+ 	*tested = c;
+ 	return test;
+@@ -3623,7 +3848,9 @@ static int find_range(char **start, char **stop, int cmd)
+ 		do_cmd(c);		// execute movement cmd
+ 		// exclude last char unless range isn't what we expected
+ 		// this indicates we've hit EOL
+-		if (tmpcnt == dot - p)
++		for (t = p; t < dot; t = next_char(t))
++			tmpcnt--;
++		if (tmpcnt == 0)
+ 			dot--;
+ 	}
+ 
+@@ -3655,6 +3882,10 @@ static int find_range(char **start, char **stop, int cmd)
+ 		}
+ 	}
+ 
++	// the range ends with all bytes of its last character
++	if ((buftype == PARTIAL || buftype == MULTI) && q < end)
++		q = next_char(q) - 1;
++
+ 	*start = p;
+ 	*stop = q;
+ 	return buftype;
+@@ -3723,6 +3954,11 @@ static void do_cmd(int c)
+ 		//  flip-flop Insert/Replace mode
+ 		if (c == KEYCODE_INSERT)
+ 			goto dc_i;
++		// the rest of a UTF-8 character: its first byte did the replacing
++		if (vi_utf8 && (c & ~0x3f) == 0x80) {
++			dot = char_insert(dot, c, ALLOW_UNDO_CHAIN);
++			goto dc1;
++		}
+ 		// we are 'R'eplacing the current *dot with new char
+ 		if (*dot == '\n') {
+ 			// don't Replace past E-o-l
+@@ -3731,7 +3967,7 @@ static void do_cmd(int c)
+ 		} else {
+ 			if (1 <= c || Isprint(c)) {
+ 				if (c != 27 && !isbackspace(c))
+-					dot = yank_delete(dot, dot, PARTIAL, YANKDEL, ALLOW_UNDO);
++					dot = yank_delete(dot, next_char(dot) - 1, PARTIAL, YANKDEL, ALLOW_UNDO);
+ 				dot = char_insert(dot, c, ALLOW_UNDO_CHAIN);
+ 			}
+ 			goto dc1;
+@@ -4006,7 +4242,7 @@ static void do_cmd(int c)
+ 	case 'F':			// F- backward to a user specified char
+ 	case 't':			// t- move to char prior to next x
+ 	case 'T':			// T- move to char after previous x
+-		last_search_char = get_one_char();	// get the search char
++		get_one_mbchar(last_search_char);	// get the search char
+ 		last_search_cmd = c;
+ 		// fall through
+ 	case ';':			// ;- look at rest of line for last search char
+@@ -4160,7 +4396,7 @@ static void do_cmd(int c)
+ 		//**** fall through to ... 'a'
+ 	case 'a':			// a- append after current char
+ 		if (*dot != '\n')
+-			dot++;
++			dot = next_char(dot);
+ 		goto dc_i;
+ 		break;
+ 	case 'B':			// B- back a blank-delimited Word
+@@ -4170,6 +4406,8 @@ static void do_cmd(int c)
+ 		if (c == 'B')
+ 			dir = BACK;
+ 		do {
++			if (dir == FORWARD)
++				dot = next_char(dot) - 1;
+ 			if (c == 'W' || isspace(dot[dir])) {
+ 				dot = skip_thing(dot, 1, dir, S_TO_WS);
+ 				dot = skip_thing(dot, 2, dir, S_OVER_WS);
+@@ -4302,7 +4540,7 @@ static void do_cmd(int c)
+ 		break;
+ 	case KEYCODE_DELETE:
+ 		if (dot < end - 1)
+-			dot = yank_delete(dot, dot, PARTIAL, YANKDEL, ALLOW_UNDO);
++			dot = yank_delete(dot, next_char(dot) - 1, PARTIAL, YANKDEL, ALLOW_UNDO);
+ 		break;
+ 	case 'X':			// X- delete char before dot
+ 	case 'x':			// x- delete the current char
+@@ -4313,8 +4551,8 @@ static void do_cmd(int c)
+ 		do {
+ 			if (dot[dir] != '\n') {
+ 				if (c == 'X')
+-					dot--;	// delete prev char
+-				dot = yank_delete(dot, dot, PARTIAL, YANKDEL, allow_undo);	// delete char
++					dot = prev_char(dot);	// delete prev char
++				dot = yank_delete(dot, next_char(dot) - 1, PARTIAL, YANKDEL, allow_undo);	// delete char
+ #if ENABLE_FEATURE_VI_UNDO
+ 				allow_undo = ALLOW_UNDO_CHAIN;
+ #endif
+@@ -4373,11 +4611,11 @@ static void do_cmd(int c)
+ 		do {
+ 			if ((dot + dir) < text || (dot + dir) > end - 1)
+ 				break;
+-			dot += dir;
++			dot = dir == FORWARD ? next_char(dot) : prev_char(dot);
+ 			if (isspace(*dot)) {
+ 				dot = skip_thing(dot, (c == 'e') ? 2 : 1, dir, S_OVER_WS);
+ 			}
+-			if (isalnum(*dot) || *dot == '_') {
++			if (is_wordchar(*dot)) {
+ 				dot = skip_thing(dot, 1, dir, S_END_ALNUM);
+ 			} else if (ispunct(*dot)) {
+ 				dot = skip_thing(dot, 1, dir, S_END_PUNCT);
+@@ -4467,26 +4705,33 @@ static void do_cmd(int c)
+ 		}
+ 		break;
+ 	case 'r':			// r- replace the current char with user input
+-		c1 = get_one_char();	// get the replacement char
+-		if (c1 != 27) {
+-			if (end_line(dot) - dot < (cmdcnt ?: 1)) {
++	{
++		char rc[5];
++		c1 = get_one_mbchar(rc);	// get the replacement char
++		if (c1 != 27 && rc[0]) {
++			// as many characters left on the line as are replaced?
++			for (cnt = 0, q = dot; q < end && *q != '\n' && cnt < (cmdcnt ?: 1); q = next_char(q))
++				cnt++;
++			if (cnt < (cmdcnt ?: 1)) {
+ 				indicate_error();
+ 				goto dc6;
+ 			}
+ 			do {
+-				dot = text_hole_delete(dot, dot, allow_undo);
++				dot = text_hole_delete(dot, next_char(dot) - 1, allow_undo);
+ #if ENABLE_FEATURE_VI_UNDO
+ 				allow_undo = ALLOW_UNDO_CHAIN;
+ #endif
+-				dot = char_insert(dot, c1, allow_undo);
++				for (q = rc; *q; q++)
++					dot = char_insert(dot, *q, allow_undo);
+ 			} while (--cmdcnt > 0);
+ 			dot_left();
+ 		}
+ 		end_cmd_q();	// stop adding to q
+ 		break;
++	}
+ 	case 'w':			// w- forward a word
+ 		do {
+-			if (isalnum(*dot) || *dot == '_') {	// we are on ALNUM
++			if (is_wordchar(*dot)) {	// we are on ALNUM
+ 				dot = skip_thing(dot, 1, FORWARD, S_END_ALNUM);
+ 			} else if (ispunct(*dot)) {	// we are on PUNCT
+ 				dot = skip_thing(dot, 1, FORWARD, S_END_PUNCT);
+@@ -4576,6 +4821,9 @@ static void do_cmd(int c)
+ 	// Try to stay off of the Newline
+ 	if (*dot == '\n' && cnt > 0 && cmd_mode == 0)
+ 		dot--;
++	// and on the first byte of a character
++	if (cmd_mode == 0 && dot < end)
++		dot = char_start(dot);
+ }
+ 
+ // NB!  the CRASHME code is unmaintained, and doesn't currently build
+@@ -4958,6 +5206,7 @@ int vi_main(int argc, char **argv)
+ 	int opts;
+ 
+ 	INIT_G();
++	init_unicode();
+ 
+ #if ENABLE_FEATURE_VI_UNDO
+ 	//undo_stack_tail = NULL; - already is

@@ -9,7 +9,10 @@
 #   dist/engine/images/initramfs.cpio  busybox + /init + tools        (userspace/build.sh)
 #   dist/engine/images/python.cpio     CPython 3.13 overlay, optional (python/build.sh)
 #   dist/engine/images/tools.cpio      curl, ssh, git, screen overlay, optional (nettools/build.sh)
-#   dist/engine/images/addons/<name>.cpio + <name>.json   the add-ons (addons/build.sh)
+#   dist/engine/images/addons/<name>.cpio + <name>.json   the bundled add-ons (addons/build.sh)
+#
+#   ADDONS="claude-code codex" scripts/build-engine.sh   bundle these add-ons instead of the ones
+#                                                       whose addon.json says "bundled": true
 #
 # The kernel and guest JS come from third_party/distro with our patches (patches/*.patch).
 set -euo pipefail
@@ -64,14 +67,36 @@ else
   echo "note: nettools/out/tools.cpio missing; the sandbox will have no curl/ssh/git (python3 build.py nettools)" >&2
 fi
 
-# The add-ons that were built (addons/README.md); none is required.
+# The add-ons that ship (addons/README.md): the ones ADDONS names, else those whose addon.json says
+# "bundled": true. The rest stay in addons/<name>/out, for an app that adds them itself.
+if [[ -n "${ADDONS+set}" ]]; then
+  bundled="$ADDONS"
+else
+  bundled=""
+  for json in "$ROOT"/addons/*/addon.json; do
+    [[ -f "$json" ]] || continue
+    python3 -c 'import json, sys; sys.exit(json.load(open(sys.argv[1])).get("bundled") is not True)' "$json" \
+      && bundled+=" $(basename "$(dirname "$json")")"
+  done
+fi
+shipped=" "
+for name in $bundled; do
+  cpio="$ROOT/addons/$name/out/$name.cpio"
+  if [[ ! -f "$cpio" ]]; then
+    [[ -z "${ADDONS+set}" ]] || { echo "missing addons/$name/out/$name.cpio; run: addons/build.sh $name" >&2; exit 1; }
+    echo "note: addons/$name/out/$name.cpio missing; the runtime ships without it (addons/build.sh $name)" >&2
+    continue
+  fi
+  mkdir -p "$OUT/images/addons"
+  cp "$cpio" "$OUT/images/addons/"
+  [[ -f "$ROOT/addons/$name/addon.json" ]] && cp "$ROOT/addons/$name/addon.json" "$OUT/images/addons/$name.json"
+  shipped+="$name "
+  echo "== addon $name"
+done
 for cpio in "$ROOT"/addons/*/out/*.cpio; do
   [[ -f "$cpio" ]] || continue
   name="$(basename "$cpio" .cpio)"
-  mkdir -p "$OUT/images/addons"
-  cp "$cpio" "$OUT/images/addons/"
-  [[ -f "${cpio%.cpio}.json" ]] && cp "${cpio%.cpio}.json" "$OUT/images/addons/"
-  echo "== addon $name"
+  [[ "$shipped" == *" $name "* ]] || echo "== addon $name: not bundled, stays in addons/$name/out"
 done
 
 # License texts travel with the redistributed binaries.
@@ -114,10 +139,10 @@ if [[ -f "$ROOT/nettools/out/tools.cpio" ]]; then
   cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
 fi
 
-# What each add-on carries, as its build.sh left it in out/licenses.
-for licenses in "$ROOT"/addons/*/out/licenses; do
+# What each bundled add-on carries, as its build.sh left it in out/licenses.
+for name in $shipped; do
+  licenses="$ROOT/addons/$name/out/licenses"
   [[ -d "$licenses" ]] || continue
-  name="$(basename "$(dirname "$(dirname "$licenses")")")"
   for file in "$licenses"/*; do cp "$file" "$OUT/licenses/addon-$name-$(basename "$file")"; done
 done
 

@@ -54,7 +54,7 @@ IndexedDB.
 |---|---|
 | `engine/` | the runtime that ships: Rust + wasmtime. Boots the kernel, serves virtio console/fs/net/vsock, the HTTP request API, host functions, and the stdio control protocol |
 | `kernel/` | builds the WebAssembly kernel (the tree itself is cloned) |
-| `userspace/` | musl, compiler-rt, busybox, `/init` and the guest tools (`hfetch`, `hostcall`, `collabo-agentd`) → `initramfs.cpio` |
+| `userspace/` | musl, compiler-rt, busybox, `/init` and the guest tools (`hfetch`, `hostcall`, `collabo-agentd`) → `initramfs.cpio`; `patches/` has our busybox patch (vi edits UTF-8 text, e.g. Korean) |
 | `python/` | CPython 3.13 cross-built for the guest, its C libraries, Rust for the guest (pydantic-core, jiter), pip and the openai SDK → `python.cpio`; `lib/` has `collabo_core` and `mmap` |
 | `nettools/` | curl, dropbear (ssh), git and GNU screen for the guest, with distro's patches (screen's is ours) → `tools.cpio` |
 | `dart/collabo_core/` | the Dart package an app uses; `SandboxTools` exposes the sandbox as LLM tools |
@@ -96,7 +96,7 @@ before `engine`, or the runtime ships without them:
 ```sh
 ./nettools/build.sh                   # -> nettools/out/tools.cpio
 ./addons/build.sh                     # -> addons/*/out/*.cpio
-./build.sh engine runtime             # pick them up
+./build.sh engine runtime             # pick them up (the bundled add-ons only: addons/README.md)
 ```
 
 The scripts call each other directly, so they need their executable bits: a checkout that lost

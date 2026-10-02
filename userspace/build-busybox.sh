@@ -8,6 +8,12 @@ export PATH="$U/tools:$PATH"
 LF="-Wl,--import-memory -Wl,--max-memory=4294967296 -Wl,--shared-memory -Wl,--export-table -Wl,-z,stack-size=8388608"
 cd "$SRC"
 
+# Our changes (patches/busybox-*.patch), applied to the pinned source: the files they touch go
+# back to the checkout first, so an edited patch applies again cleanly.
+mapfile -t patched < <(sed -n 's#^+++ b/##p' "$U"/patches/busybox-*.patch | sort -u)
+git checkout -q HEAD -- "${patched[@]}"
+for p in "$U"/patches/busybox-*.patch; do git apply "$p"; done
+
 config() { # name value
   sed -i "/CONFIG_$1=/d;/CONFIG_$1 is not set/d" .config
   case $2 in y|n|[0-9]*) echo "CONFIG_$1=$2" >> .config ;; *) echo "CONFIG_$1=\"$2\"" >> .config ;; esac
