@@ -1,6 +1,6 @@
 [package]
 name = "collabo-core-engine"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "collaboCore sandbox engine: runs the WebAssembly Linux kernel with wasmtime"
 license = "MIT"
