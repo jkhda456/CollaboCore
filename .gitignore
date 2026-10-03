@@ -49,6 +49,7 @@ flutter/collabo_core_demo/**/ephemeral/
 .DS_Store
 __pycache__/
 .deploy-target
+<<<<<<< Updated upstream
 /addons
 /docs
 /engine/guest
@@ -62,3 +63,5 @@ readme.detail.md
 /web/static
 /web/vendor
 /build.py
+=======
+>>>>>>> Stashed changes
