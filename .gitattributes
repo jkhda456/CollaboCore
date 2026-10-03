@@ -1,0 +1,16 @@
+# Line endings are fixed in the repository, whatever the checkout's platform: the build scripts,
+# the guest's /etc files and the patches break with CRLF (bash reads `\r` as part of a command,
+# `git apply` stops matching). Only Windows batch files keep CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.ico binary
+*.otf binary
+*.wasm binary
+*.cpio binary
+
+# The executable bit is not something .gitattributes can carry. A checkout that lost it still
+# builds, because build.py runs every script through bash and restores the bit on start;
+# `python3 build.py perms --git` records it in the index for the next commit.

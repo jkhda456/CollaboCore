@@ -1,0 +1,70 @@
+diff --git a/src/linux/brk.c b/src/linux/brk.c
+index 2507c42..92c0162 100644
+--- a/src/linux/brk.c
++++ b/src/linux/brk.c
+@@ -7,28 +7,38 @@
+ #include "pthread_impl.h"
+ 
+ extern void __heap_end; // synthesised by linker
+-static void *heap_limit;
++static uintptr_t heap_limit;
+ 
+ static void *current = &__heap_end;
+ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+-static int _brk(void *end) {
++/* Addresses are added and compared as integers: an overflowing pointer is undefined, and the
++ * compiler may drop the check that refuses an sbrk past 4 GiB (clang -O2 did).
++ * The end of memory is the last byte once all 65536 pages are in: 4 GiB does not fit, and
++ * wrapped to 0 (with all the memory there from the start, every brk failed). */
++static uintptr_t memory_end(void) {
++	size_t pages = __builtin_wasm_memory_size(0);
++	if (pages > SIZE_MAX / PAGESIZE) return UINTPTR_MAX;
++	return pages * PAGESIZE;
++}
++
++static int _brk(uintptr_t end) {
+ 	if (!heap_limit)
+-		heap_limit = (void *)(__builtin_wasm_memory_size(0) * PAGESIZE);
++		heap_limit = memory_end();
+ 
+-	if (end < current) goto fail;
++	if (end < (uintptr_t)current) goto fail;
+ 
+ 	if (end <= heap_limit) {
+-		current = end;
++		current = (void *)end;
+ 		return 0;
+ 	}
+ 
+-	size_t bytes = (uintptr_t)end - (uintptr_t)heap_limit;
+-	size_t pages = (bytes + PAGESIZE - 1) / PAGESIZE;
++	size_t bytes = end - heap_limit;
++	size_t pages = bytes / PAGESIZE + (bytes % PAGESIZE != 0);
+ 
+ 	if (__builtin_wasm_memory_grow(0, pages) == SIZE_MAX) goto fail;
+-	heap_limit = (void *)(__builtin_wasm_memory_size(0) * PAGESIZE);
+-	current = end;
++	heap_limit = memory_end();
++	current = (void *)end;
+ 
+ 	return 0;
+ fail:
+@@ -38,7 +48,7 @@ fail:
+ 
+ int brk(void *end) {
+ 	if (pthread_mutex_lock(&mutex) != 0) a_crash();
+-	int ret = _brk(end);
++	int ret = _brk((uintptr_t)end);
+ 	pthread_mutex_unlock(&mutex);
+ 	return ret;
+ }
+@@ -46,7 +56,7 @@ int brk(void *end) {
+ void *sbrk(intptr_t inc) {
+ 	if (pthread_mutex_lock(&mutex) != 0) a_crash();
+ 	void *old = current;
+-	int ret = _brk(current + inc);
++	int ret = _brk((uintptr_t)current + inc);
+ 	pthread_mutex_unlock(&mutex);
+ 	return ret == 0 ? old : (void *)-1;
+ }

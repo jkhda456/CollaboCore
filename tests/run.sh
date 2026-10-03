@@ -51,6 +51,22 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   grep -q '^204800' <<<"$out" || { echo "FAIL: 200KB body not received intact"; exit 1; }
   echo "hfetch request-level API ok"
 
+  echo "== guest boot: sbrk to the end of the 4 GiB memory (musl brk); futexes of two processes"
+  progs="$(mktemp -d)"
+  for p in brk-4gib futex-procs; do
+    "$ROOT/userspace/bin/wasm-cc" -O2 -Wl,--import-memory -Wl,--max-memory=4294967296 -Wl,--shared-memory \
+      -Wl,--export-table "$T/$p.c" -o "$progs/$p.wasm"
+  done
+  python3 "$ROOT/userspace/mkinitramfs.py" --overlay -o "$progs/progs.cpio" \
+    --file "usr/bin/brk-4gib=$progs/brk-4gib.wasm" --file "usr/bin/futex-procs=$progs/futex-procs.wasm" >/dev/null 2>&1
+  out="$(EXTRA_CPIO="$progs/progs.cpio" bash "$ROOT/userspace/test-boot.sh" "$ROOT/userspace/out/initramfs.cpio" \
+    "brk-4gib; echo brk-rc=\$?" "futex-procs wait & sleep 1; futex-procs wake; wait" | tr -d '\r')"
+  grep -q '^brk-rc=0' <<<"$out" || { grep -E "^brk-" <<<"$out"; echo "FAIL: sbrk did not reach the end of 4 GiB"; exit 1; }
+  grep -E "^brk-pages" <<<"$out"
+  grep -q '^futex-woke=0' <<<"$out" && grep -q '^futex-wait=timeout' <<<"$out" ||
+    { grep -E "^futex-" <<<"$out"; echo "FAIL: a futex wake reached another process (addons/mod/0008)"; exit 1; }
+  echo "futex wake stays in its process"
+
   echo "== guest boot: /work (virtiofs) exported as a zip, checked with Python's zipfile"
   zip="$(mktemp -d)/work.zip"
   WORK=1 WORK_OUT="$zip" bash "$ROOT/userspace/test-boot.sh" "$ROOT/userspace/out/initramfs.cpio" \

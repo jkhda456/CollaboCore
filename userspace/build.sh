@@ -70,8 +70,13 @@ if stage kheaders "$U/kheaders/include/linux"; then
 fi
 
 # musl: arch/wasm32/arch.mak already adds --target=wasm32 -matomics -mbulk-memory.
-if stage musl "$U/out/musl/lib/libc.a"; then
+if stage musl "$U/out/musl/lib/libc.a" "$U"/patches/musl-*.patch; then
   cd "$U/src/musl"
+  # Our changes (patches/musl-*.patch), applied to the pinned source after putting the files
+  # they touch back, as for busybox.
+  mapfile -t patched < <(sed -n 's#^+++ b/##p' "$U"/patches/musl-*.patch | sort -u)
+  git checkout -q HEAD -- "${patched[@]}"
+  for p in "$U"/patches/musl-*.patch; do git apply "$p"; done
   printf 'ARCH=wasm32\nprefix=%s\nsyslibdir=%s\nCFLAGS=\n' "$U/out/musl" "$U/out/musl" > config.mak
   MK=(make CC=clang-19 AR=llvm-ar-19 RANLIB=llvm-ranlib-19 "-j$(nproc)")
   "${MK[@]}" clean >/dev/null
@@ -81,7 +86,7 @@ if stage musl "$U/out/musl/lib/libc.a"; then
 fi
 
 # sysroot = kernel headers + musl headers/libs (musl's win on overlap, as in sysroot-base).
-if stage sysroot "$U/sysroot/lib/libc.a"; then
+if stage sysroot "$U/sysroot/lib/libc.a" "$U/out/musl/lib/libc.a"; then
   rm -rf "$U/sysroot"; mkdir -p "$U/sysroot/lib" "$U/sysroot/include"
   cp -r "$U/kheaders/include/." "$U/sysroot/include/"; chmod -R u+w "$U/sysroot/include"
   cp -r "$U/out/musl/include/." "$U/sysroot/include/"

@@ -328,7 +328,8 @@ pub fn link(linker: &mut Linker<HostState>) -> Result<()> {
         }
         let data = context.memory.data();
         for index in 0..length as usize {
-            unsafe { *data[to as usize + index].get() = 0 };
+            // `to as u32` first: a guest address at or above 2 GiB must not sign-extend
+            unsafe { *data[to as u32 as usize + index].get() = 0 };
         }
         0
     })?;
