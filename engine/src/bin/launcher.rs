@@ -4,6 +4,8 @@
 //! `bin/collabo-core-engine` with the arguments the manifest's `entry` gives (the kernel, the
 //! images, the add-on folder), then the options `launcher.conf` in the same folder sets, then its
 //! own arguments. The engine runs in the runtime folder, so the manifest's relative paths hold.
+//! An entry without `--addon-dir` (a runtime packaged with no add-ons) gets `app/images/addons`,
+//! the folder add-ons are put in, so `launcher --addon NAME` works without naming it.
 //!
 //! launcher.conf: one `key = value` per line, `#` starts a comment. A key is an engine option
 //! without its dashes (`mount = work:/work` is `--mount work:/work`); a flag takes yes/no.
@@ -24,6 +26,8 @@ const VALUE_KEYS: &[&str] = &[
 const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "log-requests", "no-raw"];
 /// The keys whose value is a host path, relative to the runtime folder.
 const PATH_KEYS: &[&str] = &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-file"];
+/// The add-on folder when the manifest names none, relative to the runtime folder.
+const DEFAULT_ADDON_DIR: &str = "app/images/addons";
 
 const USAGE: &str = "\
 launcher: starts this runtime's sandbox as launcher.conf describes
@@ -170,7 +174,8 @@ fn split_words(text: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// The manifest's `entry` without the program, less the overlays launcher.conf turns off.
+/// The manifest's `entry` without the program, less the overlays launcher.conf turns off, with
+/// the default add-on folder when it names none (a later `--addon-dir` still wins).
 fn entry_args(manifest: &str, python: bool, tools: bool) -> Result<Vec<String>, String> {
     let manifest: serde_json::Value = serde_json::from_str(manifest).map_err(|e| format!("manifest.json: {e}"))?;
     let entry: Vec<String> = manifest["entry"]
@@ -188,6 +193,9 @@ fn entry_args(manifest: &str, python: bool, tools: bool) -> Result<Vec<String>, 
         } else {
             args.push(word);
         }
+    }
+    if !args.iter().any(|a| a == "--addon-dir") {
+        args.extend(["--addon-dir".into(), DEFAULT_ADDON_DIR.into()]);
     }
     Ok(args)
 }
@@ -407,6 +415,12 @@ mod tests {
         let manifest = r#"{"entry": ["bin/e", "--kernel", "k", "--python-image", "p", "--tools-image", "t", "--addon-dir", "a"]}"#;
         assert_eq!(entry_args(manifest, true, true).unwrap(), ["--kernel", "k", "--python-image", "p", "--tools-image", "t", "--addon-dir", "a"]);
         assert_eq!(entry_args(manifest, false, false).unwrap(), ["--kernel", "k", "--addon-dir", "a"]);
+    }
+
+    #[test]
+    fn entry_without_an_addon_dir_gets_the_default() {
+        let manifest = r#"{"entry": ["bin/e", "--kernel", "k"]}"#;
+        assert_eq!(entry_args(manifest, true, true).unwrap(), ["--kernel", "k", "--addon-dir", "app/images/addons"]);
     }
 
     #[test]
