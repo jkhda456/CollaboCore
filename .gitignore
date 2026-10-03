@@ -61,3 +61,4 @@ readme.detail.md
 /web/app
 /web/static
 /web/vendor
+/build.py
