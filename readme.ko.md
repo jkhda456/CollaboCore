@@ -16,9 +16,9 @@
 
 관리자도 편안하고 / 에이전트도 편안한 - 올인원 샌드박스 머신 
 
-📦 **다운로드:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
-📦 **다운로드:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
-📦 **다운로드:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
+ * 📦 **다운로드:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
+ * 📦 **다운로드:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
+ * 📦 **다운로드:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
 
 
 
