@@ -16,6 +16,8 @@
 
 Easy on the admin, easy on the agent — an all-in-one sandbox machine.
 
+📦 **Download:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
+📦 **Download:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
 📦 **Download:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
 
 
