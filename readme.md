@@ -1,12 +1,70 @@
-# collaboCore
+<p align="center">
+  <img src="CollaboCore_Icon.png" width="200">
 
-A Linux machine for AI agents, compiled to WebAssembly and embedded in your app.
+<br>
 
-A WebAssembly build of the Linux kernel ([tombl/linux](https://github.com/tombl/linux), 7.1) runs
-inside a single native process. Booting drops straight into a root shell — no login, because the
-machine is the isolation. A Flutter desktop app (macOS, Windows, Linux) starts it through the Dart
-package `collabo_core`, runs commands in it, shares local folders with it, and decides what it may
-reach on the network and on the host.
+<sub>
+    Meet our mascot: a cute little friend from one of my games.
+    <br>
+    (Human-made! / untouched ANIMAL BOX)
+  </sub>
+</p>
+
+<h1 align="center">collaboCore</h1>
+
+<p align="center"><b>English</b> | <a href="readme.ko.md">한국어</a></p>
+
+Easy on the admin, easy on the agent — an all-in-one sandbox machine.
+
+📦 **Download:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
+
+
+## ⚡ Easy to use
+
+Just run the launcher, and you're done!
+
+<p align="center">
+  <img src="screenshot.png" width="600">
+
+<br>
+
+## 🌀 Comfort
+
+ * A WASM build of the Linux kernel ([tombl/linux](https://github.com/tombl/linux), 7.1) runs as a native process.
+ * Network, logging and sharing your files, all in one place.
+ * Handing your agent a root shell is safe.
+
+
+## 🚀 Just change launcher.conf
+
+Write only what you want in `launcher.conf` in the runtime folder. Say you want to hand your project to
+a Claude Code agent but decide where it may reach:
+
+```ini
+# My project as /work, reference data read-only
+mount = ~/projects/my-app:/work
+mount = ~/datasets:/data:ro
+
+# Only these hosts are reachable (everything else is blocked)
+allow = api.anthropic.com
+allow = github.com
+allow = pypi.org
+allow = files.pythonhosted.org
+
+# Log every request with its time
+log-file = logs/network.log
+
+# Claude Code in the guest; the key stays on the host and the guest never sees it
+addon = claude-code
+addon-config = claude-code:apiKey=${ANTHROPIC_API_KEY}
+```
+
+`./launcher --dry-run` shows the command line it would run (with the key hidden); every key is
+listed by `./launcher --help` and in the comments of the `launcher.conf` that ships with it.
+
+
+
+## 📐 Collabo IDE example
 
 ```
  Flutter app ── package:collabo_core ──stdio JSON──▶ collabo-core engine (Rust + wasmtime, 11 MB)
