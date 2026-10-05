@@ -1,0 +1,152 @@
+diff --git a/arch/wasm/include/asm/wasm_imports.h b/arch/wasm/include/asm/wasm_imports.h
+index 478a78561e58..da6d54b7fc2b 100644
+--- a/arch/wasm/include/asm/wasm_imports.h
++++ b/arch/wasm/include/asm/wasm_imports.h
+@@ -48,6 +48,16 @@ int wasm_import(kernel, spawn_worker)(void (*fn)(void *), void *arg,
+ 
+ void wasm_import(kernel, run_on_main)(void (*fn)(void *), void *arg);
+ 
++/*
++ * One execve of a wasm program, for the host's command history (only with
++ * collabo.execlog=1). record is "cwd\0file\0argv0\0argv1\0...", cut to len
++ * bytes; full_len is its size before the cut. error is 0, or the -errno the
++ * exec failed with (then record has no argv).
++ */
++void wasm_import(kernel, exec_log)(int pid, unsigned int uid, int error,
++				   const char *record, size_t len,
++				   size_t full_len);
++
+ int wasm_import(user, compile_begin)(u32 len);
+ int wasm_import(user, compile_write)(u8 *bytes, u32 offset, u32 len);
+ int wasm_import(user, compile_end)(u32 maximum_memory_pages);
+diff --git a/arch/wasm/kernel/binfmt_wasm.c b/arch/wasm/kernel/binfmt_wasm.c
+index 7bea8ba8ad9f..8f7ba03c9429 100644
+--- a/arch/wasm/kernel/binfmt_wasm.c
++++ b/arch/wasm/kernel/binfmt_wasm.c
+@@ -3,7 +3,10 @@
+ #include <linux/auxvec.h>
+ #include <linux/binfmts.h>
+ #include <linux/cred.h>
++#include <linux/dcache.h>
++#include <linux/fs_struct.h>
+ #include <linux/highmem.h>
++#include <linux/init.h>
+ #include <linux/jiffies.h>
+ #include <linux/mm.h>
+ #include <linux/overflow.h>
+@@ -29,6 +32,23 @@
+  */
+ #define WASM_AT_RANDOM_SIZE 16
+ 
++/*
++ * collabo.execlog=1 on the command line reports every exec of a wasm program
++ * to the host (kernel.exec_log), for its command history. Off by default, and
++ * then nothing is copied. A record is cut at WASM_EXEC_LOG_MAX bytes: argv may
++ * be up to WASM_ARG_LIMIT, and the host only keeps a line of it.
++ */
++#define WASM_EXEC_LOG_MAX SZ_4K
++static bool exec_log __ro_after_init;
++
++static int __init exec_log_setup(char *value)
++{
++	if (kstrtobool(value, &exec_log))
++		pr_warn("collabo.execlog=%s: expected 0 or 1\n", value);
++	return 1;
++}
++__setup("collabo.execlog=", exec_log_setup);
++
+ /*
+  * The process_args member is the userspace ABI. Everything before it is
+  * kernel-private exec state, and process_size is the exact byte range copied
+@@ -263,6 +283,58 @@ static void relocate_args(struct wasm_exec_args *exec,
+ 			       process_offset(exec, template->envp));
+ }
+ 
++static size_t exec_log_put(char *record, size_t at, const char *bytes,
++			   size_t len)
++{
++	len = min(len, WASM_EXEC_LOG_MAX - at);
++	if (len)
++		memcpy(record + at, bytes, len);
++	return at + len;
++}
++
++/*
++ * Tells the host about an exec of bprm: done (error 0, with exec's argv) or
++ * failed with error after the file was found to be a wasm program (no argv;
++ * an E2BIG argv is what failed). Best effort: no memory, no record.
++ */
++static void report_exec(struct linux_binprm *bprm,
++			struct wasm_exec_args *exec, int error)
++{
++	const char *argv = NULL, *cwd = "?";
++	size_t argv_len = 0, cwd_len, file_len, len;
++	char *record, *path;
++	struct path pwd;
++
++	if (!exec_log)
++		return;
++	record = kmalloc(WASM_EXEC_LOG_MAX, GFP_KERNEL);
++	path = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!record || !path)
++		goto out;
++
++	get_fs_pwd(current->fs, &pwd);
++	cwd = d_path(&pwd, path, PATH_MAX);
++	path_put(&pwd);
++	if (IS_ERR(cwd))
++		cwd = "?";
++	if (exec) {
++		argv = (const char *)&exec->process + exec->arg_start;
++		argv_len = exec->arg_end - exec->arg_start;
++	}
++	cwd_len = strlen(cwd) + 1;
++	file_len = strlen(bprm->filename) + 1;
++
++	len = exec_log_put(record, 0, cwd, cwd_len);
++	len = exec_log_put(record, len, bprm->filename, file_len);
++	len = exec_log_put(record, len, argv, argv_len);
++	wasm_kernel_exec_log(task_tgid_vnr(current),
++			     from_kuid_munged(current_user_ns(), current_uid()),
++			     error, record, len, cwd_len + file_len + argv_len);
++out:
++	kfree(path);
++	kfree(record);
++}
++
+ SYSCALL_DEFINE2(wasm_get_args, void __user *, buf, size_t, len)
+ {
+ 	struct mm_struct *mm = current->mm;
+@@ -318,6 +390,7 @@ SYSCALL_DEFINE2(wasm_get_args, void __user *, buf, size_t, len)
+ 
+ static int load_wasm_binary(struct linux_binprm *bprm)
+ {
++	struct wasm_exec_args *exec;
+ 	loff_t offset = 0;
+ 	u8 *chunk = NULL;
+ 	int ret;
+@@ -373,6 +446,8 @@ static int load_wasm_binary(struct linux_binprm *bprm)
+ 	ret = copy_args(bprm);
+ 	if (ret)
+ 		goto err;
++	/* Freed by wasm_get_args, after the new program starts. */
++	exec = bprm->mm->context.exec_args;
+ 
+ 	ret = begin_new_exec(bprm);
+ 	if (ret)
+@@ -385,6 +460,7 @@ static int load_wasm_binary(struct linux_binprm *bprm)
+ 	set_binfmt(&wasm_format);
+ 
+ 	finalize_exec(bprm);
++	report_exec(bprm, exec, 0);
+ 
+ 	wasm_user_instantiate(true);
+ 	/*
+@@ -399,6 +475,7 @@ static int load_wasm_binary(struct linux_binprm *bprm)
+ 	if (compiling)
+ 		wasm_user_compile_abort();
+ 	kfree(chunk);
++	report_exec(bprm, NULL, ret);
+ 	return ret;
+ }
+ 

@@ -10,6 +10,7 @@ mod hostfn;
 mod http;
 mod icmp;
 mod intercept;
+mod log;
 mod machine;
 mod protocol;
 mod sshagent;
@@ -61,9 +62,22 @@ Network (the guest's sockets and its request API go through the same policy):
   --secret HOST:HEADER=VALUE
                             a header the host adds to https requests to HOST (repeatable);
                             the guest never sees it, and it is never logged
-  --log-requests            print every request the guest makes, to stderr
-  --log-file FILE           append those lines to FILE instead, each with its UTC time
-                            (implies --log-requests)
+
+Logs (none by default; FILE is appended to, each line after its UTC time; - is stderr):
+  --log-network FILE        the network log: every request the guest makes ([network])
+  --log-exec FILE           the exec log, a history of what ran: [run] for the command exec
+                            runs (when it starts, how it ended), [exec] for every program the
+                            guest starts, from any shell or script (pid, uid, folder, argv, or
+                            why it failed)
+  --log-file FILE           both logs in one file (unless --log-network or --log-exec names
+                            another place for one of them)
+  --log-requests            the same as --log-network - (when no file is named)
+  --log-exec-kinds KINDS    which lines the exec log keeps: run, exec or run,exec (default)
+  --log-max-size SIZE       a log file grows to at most SIZE bytes (K, M, G: KiB, MiB, GiB);
+                            default: no limit. A line longer than 4 KiB is cut, saying how much
+  --log-rotate N            when a file reaches that size, move it to FILE.1 (FILE.1 to
+                            FILE.2, ...) keeping N old files; default 0: the file is kept and
+                            later lines are dropped
 
 Add-ons (optional overlays; addons/README.md):
   --addon NAME              boot with that add-on (repeatable)
@@ -90,44 +104,72 @@ Examples (in a runtime folder):
 const TAKES_VALUE: &[&str] = &[
     "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--kernel",
     "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--cwd", "--arg",
-    "--log-file",
+    "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate",
 ];
 
-/// Where --log-requests lines go: one line each, from any thread.
-type RequestLog = Arc<dyn Fn(&str) + Send + Sync>;
+/// Bytes of a URL a network log line keeps.
+const URL_LIMIT: usize = 2048;
 
-/// A request log appending to `path` (made when missing, its folder too), each line after its UTC time. A write
-/// that fails is dropped: the guest's requests go on.
-fn request_log_to(path: &str) -> Result<RequestLog> {
-    if let Some(folder) = std::path::Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(folder).with_context(|| format!("making the folder of the log file {path}"))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening the log file {path}"))?;
-    let file = Mutex::new(file);
-    Ok(Arc::new(move |line: &str| {
-        let line = format!("{} {line}\n", utc_now());
-        if let Ok(mut file) = file.lock() {
-            let _ = file.write_all(line.as_bytes());
-        }
-    }))
+/// Which lines --log-exec keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandKinds {
+    /// The command `exec` runs, when it starts and when it ends.
+    run: bool,
+    /// Every program the guest starts (the kernel reports them).
+    exec: bool,
 }
 
-/// This moment as 2026-09-30T12:34:56Z.
-fn utc_now() -> String {
-    let now = time::OffsetDateTime::now_utc();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    )
+impl Default for CommandKinds {
+    fn default() -> Self {
+        CommandKinds { run: true, exec: true }
+    }
+}
+
+fn parse_command_kinds(text: &str) -> Result<CommandKinds> {
+    let mut kinds = CommandKinds { run: false, exec: false };
+    for word in text.split(',').map(str::trim) {
+        match word {
+            "run" => kinds.run = true,
+            "exec" => kinds.exec = true,
+            "all" => kinds = CommandKinds { run: true, exec: true },
+            _ => anyhow::bail!("--log-exec-kinds {text}: the kinds are run, exec (or run,exec)"),
+        }
+    }
+    Ok(kinds)
+}
+
+/// One program the guest started, as a command log line.
+fn exec_line(event: &machine::ExecEvent) -> String {
+    let mut line = format!(
+        "[exec] pid={} uid={} cwd={} file={}",
+        event.pid,
+        event.uid,
+        log::quote(&event.cwd),
+        log::quote(&event.file)
+    );
+    if event.errno != 0 {
+        line += &format!(" failed: {}", linux_errno(event.errno));
+    } else {
+        line += &format!(": {}", log::quote_all(&event.argv));
+    }
+    log::clean_cut(&line, event.cut)
+}
+
+/// A guest errno by its Linux name (the host's own numbers differ on Windows and macOS): the ones
+/// an exec can fail with once the file is a wasm program.
+fn linux_errno(errno: i32) -> String {
+    let name = match errno {
+        5 => "EIO (I/O error)",
+        7 => "E2BIG (argument list too long)",
+        8 => "ENOEXEC (not a program this kernel runs)",
+        12 => "ENOMEM (out of memory)",
+        13 => "EACCES (permission denied)",
+        14 => "EFAULT (bad address)",
+        22 => "EINVAL (invalid argument)",
+        27 => "EFBIG (file too large)",
+        _ => return format!("errno {errno}"),
+    };
+    name.to_string()
 }
 
 /// Whether the command line asks for help: `-h`, `--help` or `help` as an option (not as an
@@ -424,7 +466,11 @@ fn main() -> Result<()> {
     let mut allow: Vec<String> = Vec::new();
     let mut network = true;
     let mut log_requests = false;
+    let mut log_network: Option<String> = None;
+    let mut log_exec: Option<String> = None;
     let mut log_file: Option<String> = None;
+    let mut command_kinds = CommandKinds::default();
+    let mut log_limits = log::Limits::default();
     let mut raw = true;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -468,7 +514,15 @@ fn main() -> Result<()> {
                 policy.secrets.push(http::parse_secret(&spec)?);
             }
             "--log-requests" => log_requests = true,
-            "--log-file" => log_file = Some(argv.next().context("--log-file needs a file")?),
+            "--log-network" => log_network = Some(argv.next().context("--log-network needs a file (- for stderr)")?),
+            "--log-exec" => log_exec = Some(argv.next().context("--log-exec needs a file (- for stderr)")?),
+            "--log-file" => log_file = Some(argv.next().context("--log-file needs a file (- for stderr)")?),
+            "--log-exec-kinds" => command_kinds = parse_command_kinds(&argv.next().context("--log-exec-kinds needs run, exec or run,exec")?)?,
+            "--log-max-size" => log_limits.max_size = Some(log::parse_size(&argv.next().context("--log-max-size needs a size")?)?),
+            "--log-rotate" => {
+                let count = argv.next().context("--log-rotate needs a number")?;
+                log_limits.rotate = count.parse().with_context(|| format!("--log-rotate {count}: a number of files"))?;
+            }
             "--no-raw" => raw = false,
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
@@ -529,11 +583,25 @@ fn main() -> Result<()> {
         policy.allow.clear();
     }
 
-    let request_log = match (log_requests, &log_file) {
-        (_, Some(path)) => Some(request_log_to(path)?),
-        (true, None) => Some(Arc::new(|line: &str| eprintln!("{line}")) as RequestLog),
-        (false, None) => None,
+    // Each log goes where its own option says, else to --log-file; one place is opened once, so
+    // two logs in one file share its size limit.
+    let network_to = log_network.or(log_file.clone()).or(log_requests.then(|| "-".to_string()));
+    let exec_to = log_exec.or(log_file);
+    let mut opened: Vec<(String, log::Log)> = Vec::new();
+    let mut open = |to: &String| -> Result<log::Log> {
+        if let Some((_, log)) = opened.iter().find(|(place, _)| place == to) {
+            return Ok(log.clone());
+        }
+        let log = if to == "-" { log::to_stderr() } else { log::to_file(to, log_limits)? };
+        opened.push((to.clone(), log.clone()));
+        Ok(log)
     };
+    let request_log = network_to.as_ref().map(&mut open).transpose()?;
+    let command_log = exec_to.as_ref().map(&mut open).transpose()?;
+    let exec_log = command_log.clone().filter(|_| command_kinds.exec).map(|log| -> machine::ExecObserver {
+        Arc::new(move |event: machine::ExecEvent| log(&exec_line(&event)))
+    });
+    let run_log = command_log.filter(|_| command_kinds.run);
 
     let vsock = vsock::Vsock::new(3);
     let policy = std::sync::Arc::new(std::sync::RwLock::new(policy));
@@ -542,11 +610,15 @@ fn main() -> Result<()> {
         http::DEFAULT_PORT,
         policy.clone(),
         request_log.clone().map(|log| -> std::sync::Arc<dyn Fn(http::Event) + Send + Sync> {
-            std::sync::Arc::new(move |event: http::Event| match (event.status, event.error) {
-                (Some(status), _) => log(&format!("[network] {} {} -> {status}", event.method, event.url)),
-                (None, Some(error)) if event.blocked => log(&format!("[network] blocked {} {}: {error}", event.method, event.url)),
-                (None, Some(error)) => log(&format!("[network] {} {}: {error}", event.method, event.url)),
-                _ => {}
+            std::sync::Arc::new(move |event: http::Event| {
+                // The status or the error after it stays on the line however long the URL is.
+                let url = log::shorten(&event.url, URL_LIMIT);
+                match (event.status, event.error) {
+                    (Some(status), _) => log(&format!("[network] {} {url} -> {status}", event.method)),
+                    (None, Some(error)) if event.blocked => log(&format!("[network] blocked {} {url}: {error}", event.method)),
+                    (None, Some(error)) => log(&format!("[network] {} {url}: {error}", event.method)),
+                    _ => {}
+                }
             })
         }),
         None,
@@ -601,6 +673,7 @@ fn main() -> Result<()> {
         cpus,
         initcpio,
         boot_console: writer(console_to_stderr),
+        exec_log,
     })
     .context("booting the kernel")?;
 
@@ -642,10 +715,22 @@ fn main() -> Result<()> {
         let (vsock, stopper, result) = (vsock.clone(), machine.stopper(), result.clone());
         let command = agent::Command { argv: command, env: Vec::new(), cwd, stdin: Vec::new() };
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            if let Some(log) = &run_log {
+                let cwd = command.cwd.as_deref().map(|cwd| format!(" cwd={}", log::quote(cwd))).unwrap_or_default();
+                log(&format!("[run]{cwd}: {}", log::quote_all(&command.argv)));
+            }
             let outcome = agent::connect(&vsock, Duration::from_secs(30)).and_then(|stream| {
                 let (mut out, mut err) = (writer(false), writer(true));
                 agent::run(&stream, &command, None, |bytes| out(bytes), |bytes| err(bytes))
             });
+            if let Some(log) = &run_log {
+                let seconds = started.elapsed().as_secs_f64();
+                match &outcome {
+                    Ok((status, _)) => log(&format!("[run] exit={} after {seconds:.1}s", status.status())),
+                    Err(error) => log(&format!("[run] failed after {seconds:.1}s: {error:#}")),
+                }
+            }
             *result.lock().unwrap() = Some(outcome);
             stopper.stop();
         });
@@ -676,6 +761,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_records_become_command_lines() {
+        let event = machine::ExecEvent::parse(42, 0, 0, b"/work/a b\0/bin/ls\0ls\0-la\0it's\0", 26);
+        assert_eq!(exec_line(&event), "[exec] pid=42 uid=0 cwd='/work/a b' file=/bin/ls: ls -la 'it'\\''s'");
+        // Cut by the kernel: the last argument is partial, and the line says how much is missing.
+        let event = machine::ExecEvent::parse(7, 1000, 0, b"/\0/bin/echo\0echo\0aaa", 5000);
+        assert_eq!(event.argv, ["echo", "aaa"]);
+        assert_eq!(exec_line(&event), "[exec] pid=7 uid=1000 cwd=/ file=/bin/echo: echo aaa …[+4980 bytes]");
+        let event = machine::ExecEvent::parse(9, 0, -7, b"/\0/bin/big\0", 13);
+        assert!(exec_line(&event).starts_with("[exec] pid=9 uid=0 cwd=/ file=/bin/big failed: E2BIG (argument list too long)"));
+        assert_eq!(parse_command_kinds("run, exec").unwrap(), CommandKinds::default());
+        assert_eq!(parse_command_kinds("exec").unwrap(), CommandKinds { run: false, exec: true });
+        assert!(parse_command_kinds("shell").is_err());
+    }
 
     #[test]
     fn help_is_an_option_not_a_value_or_the_command() {

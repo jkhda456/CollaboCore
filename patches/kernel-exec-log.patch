@@ -1,0 +1,22 @@
+diff --git a/packages/kernel/src/wasm.ts b/packages/kernel/src/wasm.ts
+index 926176a..949f84e 100644
+--- a/packages/kernel/src/wasm.ts
++++ b/packages/kernel/src/wasm.ts
+@@ -145,6 +145,8 @@ export interface Imports {
+       user_memory: number,
+     ): number;
+     run_on_main(fn: number, arg: number): void;
++    /** One exec of a guest program, reported only with `collabo.execlog=1` on the command line. */
++    exec_log(pid: number, uid: number, error: number, record: number, len: number, full_len: number): void;
+   };
+   user: {
+     compile_begin(size: number): number;
+@@ -224,6 +226,8 @@ export function kernel_imports({
+     breakpoint: () => {
+       debugger;
+     },
++    // This host keeps no command history and never sets collabo.execlog.
++    exec_log: () => {},
+     halt_worker: () => {
+       if (!is_worker) throw new Error("Halt called in main thread");
+       // Messages posted after platform.quit() are not guaranteed to arrive.

@@ -10,15 +10,18 @@
   </sub>
 </p>
 
-<h1 align="center">collaboCore</h1>
+<h1 align="center">CollaboCore</h1>
 
 <p align="center"><a href="readme.md">English</a> | <b>한국어</b></p>
 
 관리자도 편안하고 / 에이전트도 편안한 - 올인원 샌드박스 머신 
 
  * 📦 **다운로드:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
+
+더 많은 기능이 필요하다면
  * 📦 **다운로드:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
  * 📦 **다운로드:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
+
 
 
 
@@ -30,6 +33,8 @@
   <img src="screenshot.png" width="600">
 
 <br>
+
+사용이 끝나면 그냥 닫으세요! shutdown / poweroff 도 좋습니다. 이건 컴퓨터거든요!
 
 ## 🌀 편안함
 
@@ -67,7 +72,7 @@ addon-config = claude-code:apiKey=${ANTHROPIC_API_KEY}
 
 
 
-## 📐 Collabo IDE 예시
+## 📐 Collabo IDE 구조
 
 ```
  Flutter 앱 ── package:collabo_core ──stdio JSON──▶ collabo-core 엔진 (Rust + wasmtime, 11 MB)
@@ -187,5 +192,6 @@ bin/collabo-core-engine --kernel app/images/vmlinux.wasm \
 
 [readme.detail.md](readme.detail.md) — 구현·검증 현황, Flutter 통합과 번들링, 전체 설정, 게스트 도구,
 보안 모델, 제어 프로토콜.
+
 [docs/note.md](docs/note.md) — 작업 기록.
 

@@ -572,6 +572,7 @@ impl Server {
                 fields.insert("dataBase64".into(), json!(base64(bytes)));
                 boot_out.event("console", fields);
             }),
+            exec_log: None,
         })
         .context("booting the kernel")?;
 

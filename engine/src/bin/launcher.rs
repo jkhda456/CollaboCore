@@ -20,12 +20,14 @@ use std::process::Command;
 /// Engine options that take a value, by the name launcher.conf uses.
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
-    "arg", "allow", "deny", "secret", "addon", "addon-config", "log-file",
+    "arg", "allow", "deny", "secret", "addon", "addon-config", "log-network", "log-exec", "log-file",
+    "log-exec-kinds", "log-max-size", "log-rotate",
 ];
 /// Engine options that are flags.
 const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "log-requests", "no-raw"];
 /// The keys whose value is a host path, relative to the runtime folder.
-const PATH_KEYS: &[&str] = &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-file"];
+const PATH_KEYS: &[&str] =
+    &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-network", "log-exec", "log-file"];
 /// The add-on folder when the manifest names none, relative to the runtime folder.
 const DEFAULT_ADDON_DIR: &str = "app/images/addons";
 
@@ -84,6 +86,8 @@ fn parse_conf(text: &str, base: &Path, env: &dyn Fn(&str) -> Option<String>) -> 
                 conf.mount_dirs.push(host.clone());
                 conf.args.extend(["--mount".into(), format!("{}:{rest}", host.display())]);
             }
+            // A log's - is stderr, not a file here.
+            log if log.starts_with("log-") && value == "-" => conf.args.extend([format!("--{log}"), value]),
             path if PATH_KEYS.contains(&path) => {
                 conf.args.extend([format!("--{path}"), resolve(&value, base).display().to_string()]);
             }
@@ -379,7 +383,10 @@ mod tests {
              cpus = 4\n\
              no-network = yes\n\
              log-requests = no\n\
-             log-file = logs/network.log\n\
+             log-network = logs/network.log\n\
+             log-exec = -\n\
+             log-file = logs/all.log\n\
+             log-max-size = 10M\n\
              python = off\n\
              addon-config = claude-code:apiKey=${KEY}\n\
              command = sh -c 'echo # not a comment'\n",
@@ -391,7 +398,8 @@ mod tests {
             conf.args,
             [
                 "--mount", "/rt/work:/work", "--mount", "/home/me/proj:/proj:ro", "--cpus", "4",
-                "--no-network", "--log-file", "/rt/logs/network.log", "--addon-config",
+                "--no-network", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
+                "--log-file", "/rt/logs/all.log", "--log-max-size", "10M", "--addon-config",
                 "claude-code:apiKey=sk-1",
             ]
         );

@@ -75,6 +75,46 @@ pub struct Shared {
     requests: Mutex<Sender<Request>>,
     /// Where the guest's early kernel messages go (before its console device exists).
     boot_console: Mutex<Box<dyn FnMut(&[u8]) + Send>>,
+    exec_log: Option<ExecObserver>,
+}
+
+/// One program the guest started (`kernel.exec_log`, with `collabo.execlog=1`): what binfmt_wasm
+/// saw once the file was a wasm program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecEvent {
+    pub pid: u32,
+    pub uid: u32,
+    /// The working directory, as the kernel names it.
+    pub cwd: String,
+    /// The path execve was given.
+    pub file: String,
+    /// Empty when it failed.
+    pub argv: Vec<String>,
+    /// Bytes of the record the kernel left out (it keeps 4 KiB); the last part shown is cut.
+    pub cut: usize,
+    /// 0, or the errno the exec failed with.
+    pub errno: i32,
+}
+
+pub type ExecObserver = Arc<dyn Fn(ExecEvent) + Send + Sync>;
+
+impl ExecEvent {
+    /// The kernel's record: "cwd\0file\0argv0\0argv1\0...", cut to its first bytes.
+    pub(crate) fn parse(pid: i32, uid: i32, error: i32, record: &[u8], full_len: usize) -> ExecEvent {
+        let mut parts = record.strip_suffix(b"\0").unwrap_or(record).split(|&b| b == 0);
+        let mut text = || parts.next().map(|part| String::from_utf8_lossy(part).into_owned());
+        let (cwd, file) = (text().unwrap_or_default(), text().unwrap_or_default());
+        let argv = std::iter::from_fn(text).collect();
+        ExecEvent {
+            pid: pid as u32,
+            uid: uid as u32,
+            cwd,
+            file,
+            argv,
+            cut: full_len.saturating_sub(record.len()),
+            errno: -error.min(0),
+        }
+    }
 }
 
 /// Lets a device tell the machine, from any thread, that it has work for the guest. Devices
@@ -178,6 +218,17 @@ fn link_kernel(linker: &mut Linker<HostState>) -> Result<()> {
             let termination = if reason == 0 { Termination::PowerOff } else { Termination::Panic };
             caller.data().shared.send(Request::Terminate(termination));
             Err(anyhow!(Halt))
+        },
+    )?;
+    linker.func_wrap(
+        "kernel",
+        "exec_log",
+        |caller: Caller<'_, HostState>, pid: i32, uid: i32, error: i32, record: i32, len: i32, full_len: i32| {
+            let state = caller.data();
+            let Some(observer) = &state.shared.exec_log else { return };
+            if let Some(record) = guest_bytes(&state.shared.memory, record as u32, len as u32) {
+                observer(ExecEvent::parse(pid, uid, error, &record, full_len as u32 as usize));
+            }
         },
     )?;
     linker.func_wrap("kernel", "halt_worker", |caller: Caller<'_, HostState>| -> Result<()> {
@@ -466,6 +517,8 @@ pub struct BootOptions {
     pub initcpio: Vec<u8>,
     /// Receives the guest's early kernel messages.
     pub boot_console: Box<dyn FnMut(&[u8]) + Send>,
+    /// Receives every program the guest starts (the kernel reports them only when this is set).
+    pub exec_log: Option<ExecObserver>,
 }
 
 /// Native stack a guest thread's WebAssembly may use (wasmtime's `max_wasm_stack`).
@@ -536,6 +589,7 @@ impl Machine {
             memory,
             requests: Mutex::new(sender),
             boot_console: Mutex::new(options.boot_console),
+            exec_log: options.exec_log.clone(),
         });
 
         // The initramfs the caller supplies is copied straight after the kernel image, and the
@@ -682,7 +736,9 @@ fn build_devicetree(
         chosen.prop("rng-seed", Value::Bytes(seed.to_vec()));
         let args = if options.args.is_empty() { String::new() } else { format!(" {}", options.args.join(" ")) };
         // collabo.wasmstack: how deep guest programs may recurse (bytes of native wasm stack).
-        chosen.prop("bootargs", Value::Str(format!("console=hvc0 collabo.wasmstack={MAX_WASM_STACK}{args}")));
+        // collabo.execlog: the kernel reports every exec (kernel.exec_log).
+        let exec_log = if options.exec_log.is_some() { " collabo.execlog=1" } else { "" };
+        chosen.prop("bootargs", Value::Str(format!("console=hvc0 collabo.wasmstack={MAX_WASM_STACK}{exec_log}{args}")));
         chosen.prop("ncpus", Value::U32(options.cpus));
         if !options.initcpio.is_empty() {
             chosen.prop("linux,initrd-start", Value::U32(initcpio_address as u32));

@@ -5,6 +5,9 @@
 # The build is in-tree (arch/wasm/Makefile references arch/wasm/scripts/sections.pl
 # relative to the source root, so O= is not usable).
 #
+# Our changes to the clone are kernel/patches/*.patch, applied before a build (idempotent: a
+# patch that is already applied is skipped).
+#
 # Usage:
 #   bash build.sh deps      # print missing tools + the apt command to fix it
 #   bash build.sh           # defconfig (if no .config) + vmlinux.wasm
@@ -55,6 +58,15 @@ case "$cmd" in
   clean)     "${MAKE[@]}" clean ;;
   distclean) "${MAKE[@]}" distclean ;;
   build)
+    for patch in "$ROOT"/patches/*.patch; do
+      [[ -f "$patch" ]] || continue
+      if git apply --reverse --check "$patch" 2>/dev/null; then
+        echo "== patch already applied: $(basename "$patch")"
+      else
+        echo "== apply patch: $(basename "$patch")"
+        git apply "$patch"
+      fi
+    done
     [[ -f .config ]] || "${MAKE[@]}" defconfig
     "${MAKE[@]}" vmlinux.wasm
     ls -lh vmlinux.wasm

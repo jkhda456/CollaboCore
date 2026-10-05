@@ -67,6 +67,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
     { grep -E "^futex-" <<<"$out"; echo "FAIL: a futex wake reached another process (addons/mod/0008)"; exit 1; }
   echo "futex wake stays in its process"
 
+  echo "== engine logs: network log, command log (every exec in the guest), line limit, size limit, rotation"
+  python3 "$T/test_logs.py" >"$progs/logs.txt" 2>&1 || { grep -A2 "^FAIL" "$progs/logs.txt"; echo "FAIL: engine logs"; exit 1; }
+  tail -1 "$progs/logs.txt"
+
   echo "== guest boot: /work (virtiofs) exported as a zip, checked with Python's zipfile"
   zip="$(mktemp -d)/work.zip"
   WORK=1 WORK_OUT="$zip" bash "$ROOT/userspace/test-boot.sh" "$ROOT/userspace/out/initramfs.cpio" \
