@@ -7,7 +7,7 @@ character drawn in the wrong column or cut in half shows up as a wrong line.
 """
 import json, os, re, sys, tempfile, time
 T = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, T)
-sys.path.insert(0, os.path.join(os.path.dirname(T), "nettools", "tests"))
+sys.path.insert(0, os.path.join(os.path.dirname(T), "tools", "tests"))
 import ptydrive, vtscreen
 from ptydrive import plain
 

@@ -2,7 +2,7 @@
 uses it. Every step that forks in upstream screen is here: the backend (screen, screen -dm),
 window shells (screen, C-a c), the backtick pipe and an `exec` filter.
 
-    COLLABO_RUNTIME=dist/runtime/collabo-core-linux-x64 python3 nettools/tests/test_screen.py
+    COLLABO_RUNTIME=dist/runtime/collabo-core-linux-x64 python3 tools/tests/test_screen.py
 """
 import fcntl, json, os, re, signal, struct, sys, termios, time
 S = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, S)

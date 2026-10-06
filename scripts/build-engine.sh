@@ -8,7 +8,7 @@
 #   dist/engine/guest/*.js           host side of guest networking and the NodeFS disk backend
 #   dist/engine/images/initramfs.cpio  busybox + /init + tools        (userspace/build.sh)
 #   dist/engine/images/python.cpio     CPython 3.13 overlay, optional (python/build.sh)
-#   dist/engine/images/tools.cpio      curl, ssh, git, screen overlay, optional (nettools/build.sh)
+#   dist/engine/images/tools.cpio      curl, ssh, git, screen, gui overlay, optional (tools/build.sh)
 #   dist/engine/images/addons/<name>.cpio + <name>.json   the bundled add-ons (addons/build.sh)
 #
 #   ADDONS="claude-code codex" scripts/build-engine.sh   bundle these add-ons instead of the ones
@@ -61,10 +61,10 @@ if [[ -f "$ROOT/python/out/python.cpio" ]]; then
 else
   echo "note: python/out/python.cpio missing; the sandbox will have no python3 (python3 build.py python)" >&2
 fi
-if [[ -f "$ROOT/nettools/out/tools.cpio" ]]; then
-  cp "$ROOT/nettools/out/tools.cpio" "$OUT/images/tools.cpio"
+if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
+  cp "$ROOT/tools/out/tools.cpio" "$OUT/images/tools.cpio"
 else
-  echo "note: nettools/out/tools.cpio missing; the sandbox will have no curl/ssh/git (python3 build.py nettools)" >&2
+  echo "note: tools/out/tools.cpio missing; the sandbox will have no curl/ssh/git (python3 build.py tools-image)" >&2
 fi
 
 # The add-ons that ship (addons/README.md): the ones ADDONS names, else those whose addon.json says
@@ -130,13 +130,14 @@ LICENSES
     > "$OUT/licenses/ca-certificates.MPL-2.0.txt"
 fi
 
-# What tools.cpio carries (nettools/build.sh); OpenSSL and zlib are the ones listed above.
-if [[ -f "$ROOT/nettools/out/tools.cpio" ]]; then
-  B="$ROOT/nettools/build"
+# What tools.cpio carries (tools/build.sh); OpenSSL and zlib are the ones listed above.
+if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
+  B="$ROOT/tools/build"
   cp "$B/curl-8.21.0/COPYING" "$OUT/licenses/curl.curl.txt"
   cp "$B/dropbear-2026.92/LICENSE" "$OUT/licenses/dropbear.MIT.txt"
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
   cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
+  for file in "$B"/gui/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
 fi
 
 # What each bundled add-on carries, as its build.sh left it in out/licenses.

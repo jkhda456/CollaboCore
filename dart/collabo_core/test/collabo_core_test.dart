@@ -182,6 +182,73 @@ void main() {
     });
   });
 
+  group('gui tools', () {
+    late CollaboCore gs;
+    setUpAll(() async {
+      gs = await CollaboCore.start(CollaboConfig(
+        cpus: 2,
+        quiet: true,
+        python: false,
+        networkEnabled: false,
+        gui: const GuiSettings(maxSize: '800x600'),
+      ));
+    });
+    tearDownAll(() => gs.stop());
+
+    int pngWidth(Map<String, Object?> block) {
+      final png = base64.decode((block['source'] as Map)['data'] as String);
+      expect(png.sublist(1, 4), 'PNG'.codeUnits);
+      return ByteData.sublistView(png, 16, 20).getUint32(0);
+    }
+
+    test('start a program, look at it, click and type, clipboard, resize, close', () async {
+      final gui = GuiTools(gs, workdir: '/', maxImageWidth: 320);
+      expect(gui.definitions.map((t) => t['name']), ['gui_run', 'gui_list', 'gui_screenshot', 'gui_input', 'gui_clipboard', 'gui_window']);
+      expect(gui.handles('gui_run'), isTrue);
+      expect(gui.handles('run_command'), isFalse);
+      expect(await gui.call('gui_run', {'command': 'gui-demo --title Dart', 'name': 'demo', 'size': '640x400'}), contains('demo is up'));
+      expect(await gui.call('gui_list', {}), contains('demo:1'));
+
+      final shot = await gui.callContent('gui_screenshot', {'target': 'demo'});
+      expect(shot.first['type'], 'image');
+      expect(pngWidth(shot.first), 320, reason: 'scaled to maxImageWidth');
+      expect(shot.last['text'], allOf(contains('640x400'), contains('shown at 320x200'), contains('title: Dart')));
+
+      // The button is at (100, 60) on the canvas: (50, 30) in the half-size screenshot.
+      final after = await gui.callContent('gui_input', {'target': 'demo', 'action': 'click', 'x': 50, 'y': 30});
+      expect(after.first['type'], 'image');
+      final logs = await gui.call('gui_window', {'target': 'demo', 'action': 'logs'});
+      expect(logs, allOf(contains('button 1 down 100,60'), contains('clicked 1')));
+
+      // ctrl+click (the demo counts it as ten), keys held across calls, letting go of them.
+      await gui.call('gui_input', {'target': 'demo', 'action': 'click', 'x': 50, 'y': 30, 'modifiers': 'ctrl', 'screenshot': false});
+      await gui.call('gui_input', {'target': 'demo', 'action': 'key_down', 'keys': 'shift', 'screenshot': false});
+      await gui.call('gui_input', {'target': 'demo', 'action': 'mouse_down', 'x': 40, 'y': 150, 'screenshot': false});
+      expect(await gui.call('gui_window', {'target': 'demo', 'action': 'logs'}), allOf(contains('clicked 11'), contains('button 1 down 80,300 mods=0x1')));
+      await gui.call('gui_input', {'target': 'demo', 'action': 'release', 'screenshot': false});
+      final info = (await gs.exec(['gui', 'info', 'demo'])).stdoutText;
+      expect(info, contains('"buttons":0,"modifiers":0'));
+      // Hangul through a Korean input method's composition.
+      await gui.call('gui_input', {'target': 'demo', 'action': 'type', 'text': '한', 'ime': true, 'screenshot': false});
+      expect(await gui.call('gui_window', {'target': 'demo', 'action': 'logs'}), contains('preedit "하" 3 3\ntext "한"'));
+      await gui.call('gui_input', {'target': 'demo', 'action': 'key', 'keys': 'ctrl+l', 'screenshot': false});
+      expect(await gui.call('gui_input', {'target': 'demo', 'action': 'type', 'text': 'hi 안녕', 'screenshot': false}), 'done');
+      await gui.call('gui_input', {'target': 'demo', 'action': 'key', 'keys': 'ctrl+c', 'screenshot': false});
+      expect(await gui.call('gui_clipboard', {'action': 'get'}), 'hi 안녕');
+      expect(await gui.call('gui_clipboard', {'action': 'set', 'text': 'from dart'}), 'clipboard set');
+      // Pasting asks the clipboard and the answer comes later, as in any toolkit: Return after.
+      await gui.call('gui_input', {'target': 'demo', 'action': 'key', 'keys': 'ctrl+l ctrl+v', 'screenshot': false});
+      await gui.call('gui_input', {'target': 'demo', 'action': 'key', 'keys': 'Return', 'screenshot': false});
+      expect(await gui.call('gui_window', {'target': 'demo', 'action': 'logs'}), contains('enter "from dart"'));
+
+      expect(await gui.call('gui_window', {'target': 'demo', 'action': 'resize', 'size': '9999x9999'}), '800x600', reason: 'held to maxSize');
+      expect(await gui.call('gui_screenshot', {'target': 'nosuch'}), startsWith('Error: no program named nosuch'));
+      expect(await gui.call('gui_input', {'target': 'demo', 'action': 'drag', 'x': 1}), startsWith('Error: y is needed'));
+      await gui.call('gui_window', {'target': 'demo', 'action': 'close'});
+      expect((await gs.exec(['gui', 'wait', 'demo', '--exit'])).stdoutText.trim(), 'exited(0)');
+    });
+  });
+
   group('console and shutdown', () {
     test('console is the guest shell', () async {
       final text = StringBuffer();

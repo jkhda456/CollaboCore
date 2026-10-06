@@ -1,4 +1,4 @@
-# GNU screen's settings for every user (nettools/etc/screenrc); ~/.screenrc comes after it.
+# GNU screen's settings for every user (tools/etc/screenrc); ~/.screenrc comes after it.
 
 # No copyright page to press Return through.
 startup_message off

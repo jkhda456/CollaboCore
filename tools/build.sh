@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Build the network tools for wasm32-linux and pack them as tools.cpio, an overlay like python.cpio:
+# Build the guest's tools for wasm32-linux and pack them as tools.cpio, an overlay like python.cpio
+# (`python3 build.py tools-image`):
 #
 #   curl      8.21  HTTP(S)/FTP client and libcurl (OpenSSL, zlib); git's http(s) transport uses it
 #   dropbear  2026  `ssh` (dbclient) and dropbearkey; keys can stay in the host's ssh-agent
 #   git       2.55  with the http(s) and ssh transports
-#   screen    5.0   GNU screen, the terminal multiplexer (not a network tool; it lives here
-#                   because this is the guest's image of extra programs)
+#   screen    5.0   GNU screen, the terminal multiplexer
+#   gui             the display for GUI programs: `gui` (server and command line, Rust),
+#                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
 #
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image.
 #
@@ -13,7 +15,8 @@
 # patches; distro has no screen, so its patch is ours (patches/screen-nofork.patch). OpenSSL,
 # zlib and ncurses are the static libraries python/build-deps.sh builds (python/deps), so the
 # python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen cpio
+# them.   stages: curl dropbear git screen gui cpio (gui always runs: cargo and the compiles are
+# incremental)
 set -euo pipefail
 
 N="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,6 +136,10 @@ if stage screen "$STAGE/usr/bin/screen"; then
   install -D "$S/screen" "$STAGE/usr/bin/screen"
 fi
 
+STEP=gui
+echo "== gui"
+STAGE="$STAGE" bash "$N/gui/build.sh"
+
 # The image: an overlay after initramfs.cpio (and python.cpio, if present). etc/ssl/cert.pem is the
 # same Mozilla bundle python.cpio carries, so either image alone has a trust store; likewise
 # usr/share/terminfo, which screen needs for the terminal in front of it.
@@ -149,6 +156,10 @@ echo "== cpio"   # always: packing takes a second
     --tree usr/libexec/git-core="$STAGE/usr/libexec/git-core" \
     --tree usr/share/git-core="$STAGE/usr/share/git-core" \
     --file usr/bin/screen="$STAGE/usr/bin/screen" \
+    --file usr/bin/gui="$STAGE/usr/bin/gui" \
+    --file usr/bin/gui-demo="$STAGE/usr/bin/gui-demo" \
+    --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \
+    --file usr/lib/libcollabo-gui.a="$STAGE/usr/lib/libcollabo-gui.a" \
     --tree usr/share/terminfo="$DEPS/share/terminfo" \
     --file etc/ssl/cert.pem="$CACERT" \
     --etc "$N/etc"

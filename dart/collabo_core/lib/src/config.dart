@@ -5,6 +5,7 @@ class CollaboConfig {
     this.cpus,
     this.python = true,
     this.tools = true,
+    this.gui,
     this.addons = const {},
     this.mounts = const [],
     this.network = const NetworkPolicy(),
@@ -23,9 +24,14 @@ class CollaboConfig {
   /// Boot with CPython 3.13 and pip (adds ~62 MB to what is loaded at start).
   final bool python;
 
-  /// Boot with the network tools: curl, ssh (dropbear) and git (adds ~14 MB). busybox's wget,
-  /// nc and telnet are always there.
+  /// Boot with the tools image: curl, ssh (dropbear), git, screen and the display for GUI programs
+  /// (`gui`; adds ~15 MB). busybox's wget, nc and telnet are always there.
   final bool tools;
+
+  /// The display for GUI programs (`gui`, in the tools image): its limits and what agents may do
+  /// with it. Null: the defaults (1024x768 windows, at most 1920x1080; screenshots, input and the
+  /// clipboard allowed). Headless either way, and nothing runs until a GUI program starts.
+  final GuiSettings? gui;
 
   /// Add-ons to boot with (addons/README.md), by name, each with its settings (`{}` for none).
   /// None by default. An `apiKey` setting never reaches the sandbox: the host adds it to the
@@ -67,6 +73,7 @@ class CollaboConfig {
         if (cpus != null) 'cpus': cpus,
         'python': python,
         'tools': tools,
+        if (gui != null) 'gui': gui!.toJson(),
         if (addons.isNotEmpty) 'addons': addons,
         'mounts': [for (final m in mounts) m.toJson()],
         'network': networkEnabled ? network.toJson() : false,
@@ -139,6 +146,46 @@ class ClaudeCodeSettings {
   @override
   String toString() => 'ClaudeCodeSettings($provider, ${baseUrl ?? 'default URL'}, ${model ?? 'default model'}'
       '${apiKey != null ? ', key ***' : ''})';
+}
+
+/// Settings of the sandbox's display for GUI programs ([CollaboConfig.gui]): headless, each window
+/// a whole canvas of its own (no positions, no overlap), driven by the `gui` command there and by
+/// [GuiTools] here. Written to /etc/collabo/gui.json in the sandbox; `gui status` shows them.
+///
+///   CollaboConfig(gui: const GuiSettings(maxSize: '1280x800', clipboard: false), ...)
+class GuiSettings {
+  const GuiSettings({this.defaultSize, this.maxSize, this.maxCanvases, this.maxMemoryMB, this.capture, this.input, this.clipboard});
+
+  /// A canvas's size when its program does not ask for one, e.g. `1024x768` (the default).
+  final String? defaultSize;
+
+  /// No canvas grows beyond this (`1920x1080` by default; at most 8192x8192).
+  final String? maxSize;
+
+  /// Canvases one program may hold at once (8).
+  final int? maxCanvases;
+
+  /// All canvases' pixels together, in MiB (256).
+  final int? maxMemoryMB;
+
+  /// May screenshots be taken (true)? Off, `gui screenshot` and `gui view` are refused.
+  final bool? capture;
+
+  /// May input be sent (true)? Off, `gui click`, `key`, `type`, ... are refused.
+  final bool? input;
+
+  /// May the clipboard be read and set from the command line (true)? Programs share it either way.
+  final bool? clipboard;
+
+  Map<String, Object?> toJson() => {
+        if (defaultSize != null) 'defaultSize': defaultSize,
+        if (maxSize != null) 'maxSize': maxSize,
+        if (maxCanvases != null) 'maxCanvases': maxCanvases,
+        if (maxMemoryMB != null) 'maxMemoryMB': maxMemoryMB,
+        if (capture != null) 'capture': capture,
+        if (input != null) 'input': input,
+        if (clipboard != null) 'clipboard': clipboard,
+      };
 }
 
 /// A local folder shared with the sandbox (virtio-fs). Changes are live in both directions.

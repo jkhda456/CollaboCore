@@ -44,7 +44,7 @@ Images:
   --kernel FILE             the kernel image, vmlinux.wasm (required)
   --initramfs FILE          a cpio archive to unpack at boot (repeatable, in order)
   --python-image FILE       the CPython overlay (with --stdio: added unless the app turns it off)
-  --tools-image FILE        the network tools overlay: curl, ssh, git (likewise)
+  --tools-image FILE        the tools overlay: curl, ssh, git, screen, gui (likewise)
   --addon-dir DIR           where the add-ons are: <name>.cpio + <name>.json
 
 Machine:
@@ -79,6 +79,12 @@ Logs (none by default; FILE is appended to, each line after its UTC time; - is s
                             FILE.2, ...) keeping N old files; default 0: the file is kept and
                             later lines are dropped
 
+GUI programs (the `gui` command in the tools image; headless until asked):
+  --gui-config KEY=VALUE    a setting of the display, written to /etc/collabo/gui.json
+                            (repeatable): defaultSize=1024x768, maxSize=1920x1080,
+                            maxCanvases=8, maxMemoryMB=256, capture=false, input=false,
+                            clipboard=false
+
 Add-ons (optional overlays; addons/README.md):
   --addon NAME              boot with that add-on (repeatable)
   --addon-config NAME:KEY=VALUE
@@ -102,7 +108,7 @@ Examples (in a runtime folder):
 
 /// The options that take a value, so `--help` can be told from an option's value.
 const TAKES_VALUE: &[&str] = &[
-    "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--kernel",
+    "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--gui-config", "--kernel",
     "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--cwd", "--arg",
     "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate",
 ];
@@ -461,6 +467,7 @@ fn main() -> Result<()> {
     let mut tools_image: Option<String> = None;
     let mut addon_dir: Option<String> = None;
     let mut addon_settings = serde_json::Map::new();
+    let mut gui_settings = serde_json::Map::new();
     let mut mounts: Vec<fs::Share> = Vec::new();
     let mut policy = http::Policy::default();
     let mut allow: Vec<String> = Vec::new();
@@ -497,6 +504,14 @@ fn main() -> Result<()> {
             "--addon-config" => {
                 let spec = argv.next().context("--addon-config needs NAME:KEY=VALUE")?;
                 addons::parse_setting(&spec, &mut addon_settings).map_err(anyhow::Error::msg)?;
+            }
+            "--gui-config" => {
+                let spec = argv.next().context("--gui-config needs KEY=VALUE")?;
+                if !spec.contains('=') {
+                    anyhow::bail!("--gui-config needs KEY=VALUE");
+                }
+                // The add-on settings' parser, for the same typing of numbers and true/false.
+                addons::parse_setting(&format!("gui:{spec}"), &mut gui_settings).map_err(anyhow::Error::msg)?;
             }
             "--kernel" => kernel_path = argv.next(),
             "--initramfs" => initramfs_paths.extend(argv.next()),
@@ -565,6 +580,9 @@ fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)?,
     };
     initcpio.extend_from_slice(&addons.initcpio);
+    if let Some(serde_json::Value::Object(settings)) = gui_settings.get("gui") {
+        initcpio.extend(protocol::gui_settings(settings));
+    }
     policy.addon_headers = addons.headers;
     policy.addon_secrets = addons.secrets;
 

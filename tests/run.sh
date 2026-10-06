@@ -2,7 +2,8 @@
 # All automated checks, no browser needed.
 #   tests/run.sh           unit tests (host modules, web panels) + web import graph
 #   tests/run.sh --boot    + guest boots: networking, workspace, Python (a few minutes)
-#   tests/run.sh --all     + the desktop runtime (stdio protocol, screen and vi in a terminal) and the
+#   tests/run.sh --all     + the desktop runtime (stdio protocol, screen and vi in a terminal, GUI
+#                            programs) and the
 #                            Dart package
 # Needs a built tree (python3 build.py). Run through it: python3 build.py test [--boot|--all].
 set -euo pipefail
@@ -126,7 +127,7 @@ if [[ "$MODE" == "--all" ]]; then
 
   echo "== screen in a terminal (dist/runtime in a pseudo-terminal, as a person types)"
   runtime="$(ls -d "$ROOT"/dist/runtime/collabo-core-*/ | head -1)"
-  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/nettools/tests/test_screen.py" >"$log" 2>&1; then
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_screen.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: screen"; exit 1
   fi
   tail -1 "$log"
@@ -134,6 +135,12 @@ if [[ "$MODE" == "--all" ]]; then
   echo "== vi with Korean (UTF-8) text in a terminal (busybox vi, patches/busybox-vi-utf8.patch)"
   if ! COLLABO_RUNTIME="$runtime" python3 "$T/test_vi_utf8.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: vi"; exit 1
+  fi
+  tail -1 "$log"
+
+  echo "== GUI programs: the display, input, screenshots (tools/gui, in the guest)"
+  if ! python3 "$ROOT/tools/gui/tests/test_gui.py" guest "$runtime" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: gui"; exit 1
   fi
   tail -1 "$log"
 

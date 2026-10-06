@@ -1,4 +1,4 @@
-# System git configuration of the collaboCore guest (/etc/gitconfig, from nettools/etc).
+# System git configuration of the collaboCore guest (/etc/gitconfig, from tools/etc).
 [ssh]
 	# `ssh` is dropbear's dbclient: OpenSSH's command line for what git passes (-p, -o), and it
 	# ignores the -o options it does not know.

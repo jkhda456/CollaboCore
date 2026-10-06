@@ -1,0 +1,22 @@
+[package]
+name = "collabo-gui"
+version = "0.1.0"
+edition = "2021"
+description = "gui: headless per-app canvases for GUI programs in the collaboCore guest, and the command line that drives them"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "gui"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+miniz_oxide = "0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

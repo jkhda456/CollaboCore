@@ -20,7 +20,7 @@ use std::process::Command;
 /// Engine options that take a value, by the name launcher.conf uses.
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
-    "arg", "allow", "deny", "secret", "addon", "addon-config", "log-network", "log-exec", "log-file",
+    "arg", "allow", "deny", "secret", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
     "log-exec-kinds", "log-max-size", "log-rotate",
 ];
 /// Engine options that are flags.

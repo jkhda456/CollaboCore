@@ -11,7 +11,8 @@
 //! reply, exportZip, stop. Events: ready, console, network, execOutput, hostCall, permission,
 //! sshAgent, exit.
 //!
-//! start.config: cpus, python, tools, addons {name: settings} (addons.rs), mounts, network {allow,
+//! start.config: cpus, python, tools, gui {settings of the display in tools.cpio}, addons {name:
+//! settings} (addons.rs), mounts, network {allow,
 //! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
 //! "ask", "allow"), sshAgentSocket, quiet, consoleSize. policy.update takes network, hostExec,
 //! hostFunctions, sshAgent and sshAgentSocket.
@@ -76,7 +77,7 @@ pub struct Images {
     pub initramfs: Vec<PathBuf>,
     /// The CPython overlay, added unless the app asks for `python: false`.
     pub python: Option<PathBuf>,
-    /// The network tools overlay (curl, ssh, git), added unless the app asks for `tools: false`.
+    /// The tools overlay (curl, ssh, git, screen, gui), added unless the app asks for `tools: false`.
     pub tools: Option<PathBuf>,
     /// Where the add-on images are (`<name>.cpio` + `<name>.json`), added only when asked for.
     pub addon_dir: Option<PathBuf>,
@@ -235,6 +236,11 @@ impl Server {
         let cpus = config.get("cpus").and_then(Value::as_u64).unwrap_or(2).clamp(1, 32) as u32;
         let python = config.get("python").and_then(Value::as_bool).unwrap_or(true);
         let tools = config.get("tools").and_then(Value::as_bool).unwrap_or(true);
+        let gui_config = match config.get("gui") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(settings)) => Some(settings.clone()),
+            Some(_) => return failed("bad-request", "gui: an object of settings (defaultSize, maxSize, capture, ...)"),
+        };
         let quiet = config.get("quiet").and_then(Value::as_bool).unwrap_or(false);
 
         if let Some(mode) = config.get("hostExec").and_then(Value::as_str) {
@@ -550,10 +556,13 @@ impl Server {
         if tools {
             match &self.images.tools {
                 Some(path) => initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
-                None => return failed("bad-request", "this runtime has no network tools image; start with tools: false"),
+                None => return failed("bad-request", "this runtime has no tools image; start with tools: false"),
             }
         }
         initcpio.extend_from_slice(&addons.initcpio);
+        if let Some(settings) = &gui_config {
+            initcpio.extend(gui_settings(settings));
+        }
         if let Some(pem) = &session_ca {
             initcpio.extend(cpio_overlay(&[("etc", None), ("etc/ssl", None), ("etc/ssl/collabo-ca.pem", Some(pem.as_bytes()))]));
         }
@@ -864,6 +873,12 @@ fn safe_guest_path(path: &str) -> bool {
     }
     let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
     !SYSTEM.contains(&first)
+}
+
+/// The display's settings (the `gui` command in tools.cpio) as an overlay: /etc/collabo/gui.json.
+pub fn gui_settings(settings: &Map<String, Value>) -> Vec<u8> {
+    let text = serde_json::to_vec_pretty(&Value::Object(settings.clone())).expect("settings serialize");
+    cpio_overlay(&[("etc", None), ("etc/collabo", None), ("etc/collabo/gui.json", Some(&text))])
 }
 
 /// A newc cpio archive of a few directories and files (root-owned, 755 / 644), to append after
