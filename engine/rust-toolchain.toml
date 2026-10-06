@@ -1,5 +1,6 @@
 # The Rust the engine is built and tested with. rustup installs it on first use (CI, Windows);
-# scripts/package-runtime-windows.ps1 installs it for the x64 host itself. Dependencies need at
+# scripts/package-runtime-windows.ps1 installs it for each Windows platform it builds (x64 under
+# emulation on ARM64, with --force-non-host; ARM64 cross-compiled on x64). Dependencies need at
 # least 1.88 (wasmtime 37, rcgen), and Cargo.lock is version 4 (Cargo >= 1.78).
 [toolchain]
 channel = "1.98.1"

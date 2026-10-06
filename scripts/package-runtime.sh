@@ -23,7 +23,9 @@
 #   ARCHIVE=1 ...                              also write .tar.gz (.zip for Windows) next to each
 #
 # Cross-building needs the Rust target and a linker for it (rustup target add …), so a release
-# for every platform is built on each platform, as .github/workflows does.
+# for every platform is built on each platform, as .github/workflows does. On Windows (Git Bash,
+# MSYS2) this hands over to scripts/package-runtime-windows.ps1, which picks the toolchain for
+# each of win-x64 and win-arm64 on either machine (PLATFORMS, default: this machine's).
 set -euo pipefail
 PYTHON="${PYTHON:-python3}"   # build.py passes its own interpreter
 
@@ -43,7 +45,12 @@ case "$(uname -s)-$(uname -m)" in
   Linux-aarch64) HERE=linux-arm64 ;;
   Darwin-x86_64) HERE=darwin-x64 ;;
   Darwin-arm64) HERE=darwin-arm64 ;;
-  MINGW*|MSYS*|CYGWIN*) HERE=win-x64 ;;
+  MINGW*|MSYS*|CYGWIN*)
+    # The PowerShell script knows the machine (an x64 bash under emulation on ARM64 says x86_64
+    # here) and the toolchains each platform needs.
+    args=(-Platform "$(echo "${PLATFORMS:-host}" | tr ' ' ',')")
+    [[ -n "${ARCHIVE:-}" ]] && args+=(-Archive)
+    exec powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/package-runtime-windows.ps1")" "${args[@]}" ;;
   *) HERE="" ;;
 esac
 PLATFORMS="${PLATFORMS:-$HERE}"
