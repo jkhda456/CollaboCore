@@ -126,6 +126,26 @@ function Build-Platform([string] $P) {
         if ($LASTEXITCODE) { throw "rustup could not add $Target to $Toolchain ($LASTEXITCODE)" }
     }
 
+    # ring (rustls, rcgen) builds its ARM64 assembly only with clang, which cc-rs looks for on
+    # PATH. Build Tools' "C++ Clang Compiler for Windows" (Microsoft.VisualStudio.Component.VC.Llvm.Clang)
+    # has one, but outside a Developer prompt it is not on PATH: put it there.
+    if ($P -eq "win-arm64" -and -not (Get-Command clang -ErrorAction SilentlyContinue)) {
+        $Vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        $LlvmArch = if ($Machine -eq "win-arm64") { "ARM64" } else { "x64" }
+        $ClangBin = $null
+        if (Test-Path $Vswhere) {
+            $ClangBin = & $Vswhere -all -products * -property installationPath | ForEach-Object {
+                Join-Path $_ "VC\Tools\Llvm\$LlvmArch\bin"
+            } | Where-Object { Test-Path (Join-Path $_ "clang.exe") } | Select-Object -First 1
+        }
+        if (-not $ClangBin -and (Test-Path "$env:ProgramFiles\LLVM\bin\clang.exe")) { $ClangBin = "$env:ProgramFiles\LLVM\bin" }
+        if (-not $ClangBin) {
+            throw "win-arm64 needs clang (for ring): add Build Tools' C++ Clang Compiler for Windows (Microsoft.VisualStudio.Component.VC.Llvm.Clang) or install LLVM"
+        }
+        Write-Host "== clang from $ClangBin"
+        $env:PATH = "$ClangBin;$env:PATH"
+    }
+
     Write-Host "== build $P ($Target with $Toolchain, on $Machine)"
     Push-Location (Join-Path $Root "engine")
     try {
