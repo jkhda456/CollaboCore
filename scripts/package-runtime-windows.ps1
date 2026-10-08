@@ -84,6 +84,19 @@ if (-not $Platforms.Count) { throw "no platform given" }
 $RustupHost = (& rustup show 2>$null | Select-String -Pattern "^Default host:\s*(\S+)" | Select-Object -First 1)
 $RustupHost = if ($RustupHost) { $RustupHost.Matches[0].Groups[1].Value } else { $Triples[$Machine] }
 
+# Cargo's output folder: CARGO_TARGET_DIR if set, else engine\target. A source tree on a network
+# share (a VM's shared folder such as \\Mac\...) gets a local one instead: rustc cannot remove its
+# temporary archive folders there ("failed to build archive ... os error 87").
+if (-not $env:CARGO_TARGET_DIR) {
+    $RootUri = [System.Uri]$Root
+    $Drive = if (-not $RootUri.IsUnc) { [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Root)) }
+    if ($RootUri.IsUnc -or ($Drive -and $Drive.DriveType -eq "Network")) {
+        $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "collabo-core\target"
+        Write-Host "== $Root is on a network share; cargo builds in $env:CARGO_TARGET_DIR"
+    }
+}
+$TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root "engine\target" }
+
 $Pinned = Select-String -Path (Join-Path $Root "engine\rust-toolchain.toml") -Pattern '^channel\s*=\s*"([^"]+)"'
 if (-not $Pinned) { throw "no channel in engine\rust-toolchain.toml" }
 $Version = $Pinned.Matches[0].Groups[1].Value
@@ -123,7 +136,7 @@ function Build-Platform([string] $P) {
             throw "cargo build for $P failed ($LASTEXITCODE); a link error usually means Visual Studio Build Tools lack the MSVC $Component"
         }
     } finally { Pop-Location }
-    $Release = Join-Path $Root "engine\target\$Target\release"
+    $Release = Join-Path $TargetDir "$Target\release"
     $Built = Join-Path $Release "collabo-core-engine.exe"
     if (-not (Test-Path $Built)) { throw "the engine was not built for $P" }
 
