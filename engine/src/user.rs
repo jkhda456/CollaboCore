@@ -62,6 +62,69 @@ impl std::fmt::Display for HaltUser {
 }
 impl std::error::Error for HaltUser {}
 
+/// A trap in a guest program's own code (an out-of-bounds access, `unreachable` — abort paths
+/// such as a failed assertion —, a stack overflow): that program ends, the machine goes on.
+/// Raised from the signal handler calls, which run the program's code inside a system call, so
+/// that the error passes the kernel's frames up to [`call`] as the program's own.
+#[derive(Debug)]
+pub struct UserTrapped;
+impl std::fmt::Display for UserTrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the guest program trapped in a signal handler")
+    }
+}
+impl std::error::Error for UserTrapped {}
+
+/// The kernel failed inside a guest program's system call: not the program's fault, and the
+/// machine cannot go on.
+#[derive(Debug)]
+pub struct KernelFailed;
+impl std::fmt::Display for KernelFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the kernel failed in a system call")
+    }
+}
+impl std::error::Error for KernelFailed {}
+
+/// Whether an error out of a guest program's code is that program's own trap.
+fn is_user_trap(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| cause.is::<KernelFailed>()) {
+        return false;
+    }
+    error.chain().any(|cause| cause.is::<UserTrapped>()) || error.downcast_ref::<wasmtime::Trap>().is_some()
+}
+
+/// Says on the host's stderr why a guest program ended (the guest itself sees SIGSEGV): the
+/// trap, then the innermost frames of the program, repeats (a runaway recursion) collapsed.
+fn report_user_trap(error: &anyhow::Error) {
+    let causes: Vec<String> = error.chain().skip(1).map(|cause| cause.to_string()).collect();
+    let mut text = format!("[collabo-core] a guest program trapped and was ended (SIGSEGV): {}", causes.join(": "));
+    if let Some(trace) = error.downcast_ref::<wasmtime::WasmBacktrace>() {
+        let frames: Vec<String> = trace
+            .frames()
+            .iter()
+            .map(|frame| match frame.func_name() {
+                Some(name) => format!("{name}"),
+                None => format!("<wasm function {}>", frame.func_index()),
+            })
+            .collect();
+        let (mut shown, mut index) = (0, 0);
+        while index < frames.len() && shown < 16 {
+            let mut repeats = 1;
+            while index + repeats < frames.len() && frames[index + repeats] == frames[index] {
+                repeats += 1;
+            }
+            text.push_str(&format!("\n    {}{}", frames[index], if repeats > 1 { format!(" (x{repeats})") } else { String::new() }));
+            index += repeats;
+            shown += 1;
+        }
+        if index < frames.len() {
+            text.push_str("\n    ...");
+        }
+    }
+    eprintln!("{text}");
+}
+
 fn copy_bytes(to: &SharedMemory, to_at: u32, from: &SharedMemory, from_at: u32, length: u32) -> i32 {
     let (Some(source), Some(_)) = (guest_bytes(from, from_at, length), guest_bytes(to, to_at, length)) else {
         return length as i32;
@@ -126,7 +189,8 @@ pub fn compile_end(state: &mut HostState, rlimit_pages: u32) -> i32 {
         return ENOEXEC;
     }
     // The same program is spawned over and over (every shell command is busybox again), and
-    // compiling it costs about a second, so keep what has been compiled.
+    // compiling it costs about a second, so keep what has been compiled (a large program also on
+    // disk, for later machines: program_cache.rs).
     let key = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -137,7 +201,7 @@ pub fn compile_end(state: &mut HostState, rlimit_pages: u32) -> i32 {
     let cached = state.shared.programs.lock().unwrap().get(&key).cloned();
     let module = match cached {
         Some(module) => module,
-        None => match Module::new(&engine, &bytes) {
+        None => match crate::program_cache::load_or_compile(&engine, &bytes) {
             Ok(module) => {
                 state.shared.programs.lock().unwrap().insert(key, module.clone());
                 module
@@ -215,7 +279,15 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
         "syscall",
         move |mut caller: Caller<'_, HostState>, nr: i32, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32| -> Result<i32> {
             let before = caller.data().user.generation;
-            let result = syscall.call(&mut caller, (nr, a0, a1, a2, a3, a4, a5))?;
+            // A trap of the program's own signal handler (UserTrapped) or an exec (HaltUser) passes
+            // through; anything else failed in the kernel.
+            let result = syscall.call(&mut caller, (nr, a0, a1, a2, a3, a4, a5)).map_err(|error| {
+                if error.chain().any(|cause| cause.is::<HaltUser>() || cause.is::<UserTrapped>()) {
+                    error
+                } else {
+                    error.context(KernelFailed)
+                }
+            })?;
             // execve replaced the program under us: leave the old instance's frames.
             if caller.data().user.generation != before {
                 caller.data_mut().user.entry = Entry::Start;
@@ -281,6 +353,12 @@ pub fn call(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
             // A program that returns instead of exiting is a bug in the program, not the host.
             Ok(()) => return Ok(()),
             Err(error) if error.chain().any(|cause| cause.is::<HaltUser>()) => continue,
+            // The program's own fault: back to the kernel, which ends it with SIGSEGV (as the
+            // browser host does), instead of taking the whole machine down.
+            Err(error) if is_user_trap(&error) => {
+                report_user_trap(&error);
+                return Ok(());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -372,14 +450,24 @@ pub fn link(linker: &mut Linker<HostState>) -> Result<()> {
 pub fn call_signal_handler(mut store: impl AsContextMut<Data = HostState>, function: u32, signal: i32) -> Result<()> {
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let handler = table_function(store.as_context_mut(), &instance, function)?;
-    call_dynamic(store.as_context_mut(), handler, &[Val::I32(signal)])
+    call_dynamic(store.as_context_mut(), handler, &[Val::I32(signal)]).map_err(mark_user_trap)
+}
+
+/// A trap of the program's code called from inside the kernel (a signal handler) is still the
+/// program's: marked so that it unwinds to [`call`] instead of failing the kernel.
+fn mark_user_trap(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<wasmtime::Trap>().is_some() && !error.chain().any(|cause| cause.is::<KernelFailed>()) {
+        error.context(UserTrapped)
+    } else {
+        error
+    }
 }
 
 pub fn call_siginfo_handler(mut store: impl AsContextMut<Data = HostState>, trampoline: u32, function: i32, signal: i32) -> Result<i32> {
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let entry = table_function(store.as_context_mut(), &instance, trampoline)?;
     store.as_context_mut().data_mut().user.siginfo_results.push(None);
-    let called = call_dynamic(store.as_context_mut(), entry, &[Val::I32(function), Val::I32(signal)]);
+    let called = call_dynamic(store.as_context_mut(), entry, &[Val::I32(function), Val::I32(signal)]).map_err(mark_user_trap);
     let result = store.as_context().data().user.siginfo_results.last().copied().flatten().unwrap_or(EINVAL);
     // The kernel's own cleanup must run even if the handler unwound.
     let kernel = store.as_context().data().kernel_instance.context("the kernel instance is gone")?;

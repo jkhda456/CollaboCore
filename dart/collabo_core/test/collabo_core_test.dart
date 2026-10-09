@@ -280,4 +280,41 @@ void main() {
       expect((await sandbox.run('echo still-alive')).stdoutText, 'still-alive\n');
     });
   });
+
+  // The wpe add-on is not bundled: these run with a runtime that has it in app/images/addons
+  // (addons/wpe/README.md), and are skipped otherwise.
+  group('web tools', () {
+    final hasWpe = File('${CollaboRuntime.locate().directory}/app/images/addons/wpe.cpio').existsSync();
+    late CollaboCore ws;
+    setUpAll(() async {
+      if (!hasWpe) return;
+      ws = await CollaboCore.start(const CollaboConfig(cpus: 2, quiet: true, python: false, networkEnabled: false, addons: {'wpe': {}}));
+      await ws.writeText('/tmp/web/index.html', '<!doctype html><meta charset="utf-8"><title>Dart 시험</title>'
+          '<h1>Web tools</h1><input id="name" placeholder="name"> '
+          '<button onclick="out.textContent = \'hi \' + document.getElementById(\'name\').value">Greet</button>'
+          '<p id="out"></p><a href="second.html">Second page</a>');
+      await ws.writeText('/tmp/web/second.html', '<!doctype html><title>Second</title><p>second page</p>');
+    });
+    tearDownAll(() async {
+      if (hasWpe) await ws.stop();
+    });
+
+    test('open, read, act, eval, info, screenshot', () async {
+      final web = WebTools(ws, maxImageWidth: 512);
+      expect(web.definitions.map((t) => t['name']), ['web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info']);
+      expect(web.handles('web_act'), isTrue);
+      final opened = await web.call('web_open', {'url': '/tmp/web/index.html', 'timeout_seconds': 120});
+      expect(opened, allOf(contains('Dart 시험'), contains('# Web tools'), contains('button: Greet'), contains('Second page')));
+      expect(await web.call('web_act', {'action': 'type', 'text': 'Claude 한글', 'target': '#name'}), contains('typed 9 characters'));
+      expect(await web.call('web_act', {'action': 'click', 'target': 'Greet'}), contains('clicked'));
+      expect(await web.call('web_eval', {'script': 'document.getElementById("out").textContent'}), contains('hi Claude 한글'));
+      expect(await web.call('web_act', {'action': 'click', 'target': 'Second page'}), contains('second.html'));
+      expect(await web.call('web_info', {}), allOf(contains('title: Second'), contains('back: yes')));
+      final shot = await web.callContent('web_screenshot', {});
+      expect(shot.first['type'], 'image');
+      final png = base64.decode((shot.first['source'] as Map)['data'] as String);
+      expect(png.sublist(1, 4), 'PNG'.codeUnits);
+      expect(await web.call('web_act', {'action': 'fly'}), startsWith('Error:'));
+    }, skip: hasWpe ? false : 'the runtime has no wpe add-on', timeout: const Timeout(Duration(minutes: 5)));
+  });
 }

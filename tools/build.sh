@@ -6,17 +6,21 @@
 #   dropbear  2026  `ssh` (dbclient) and dropbearkey; keys can stay in the host's ssh-agent
 #   git       2.55  with the http(s) and ssh transports
 #   screen    5.0   GNU screen, the terminal multiplexer
+#   openssl   3.5   the openssl command (keys, certificates, s_client, enc, dgst, ...)
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
+#   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, 7z (one
+#                   binary, collabo-archive, under each name), jq, git-lfs
 #
-# telnet, wget, nc, ftpget and ssl_client come with busybox in the base image.
+# telnet, wget, nc, ftpget and ssl_client come with busybox in the base image; so do xz, unxz,
+# xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
 #
 # Mirrors third_party/distro/distro/{curl,dropbear,git}/package.nix without Nix, with distro's
 # patches; distro has no screen, so its patch is ours (patches/screen-nofork.patch). OpenSSL,
 # zlib and ncurses are the static libraries python/build-deps.sh builds (python/deps), so the
 # python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen gui cpio (gui always runs: cargo and the compiles are
-# incremental)
+# them.   stages: curl dropbear git screen openssl gui rust cpio (gui and rust always run: cargo
+# and the compiles are incremental)
 set -euo pipefail
 
 N="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,9 +140,30 @@ if stage screen "$STAGE/usr/bin/screen"; then
   install -D "$S/screen" "$STAGE/usr/bin/screen"
 fi
 
+STEP=openssl  # the openssl command, from the release python's libssl/libcrypto come from and with
+              # the same Configure (python/build-deps.sh explains each flag); the libraries are
+              # built again here, as the apps link the tree's own. -DHAVE_FORK=0 leaves out the two
+              # parts that fork: `speed -multi` and the forking HTTP server of `ocsp -port`/`-multi`;
+              # patches/openssl-wasm.patch the one that needs mmap's family (`speed -mlock`).
+              # openssl.cnf is upstream's default config, read from /etc/ssl (the OPENSSLDIR).
+if stage openssl "$STAGE/usr/bin/openssl"; then
+  S="$(unpack openssl)"
+  (cd "$S" && patch -p1 --quiet < "$N/patches/openssl-wasm.patch")
+  (cd "$S" && log perl ./Configure linux-generic32 CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
+     -DHAVE_FORK=0 $LINK_FLAGS --prefix=/usr --libdir=lib --openssldir=/etc/ssl \
+     no-shared no-dso no-dynamic-engine no-async no-afalgeng no-secure-memory no-tests no-docs)
+  log make -C "$S" -j"$JOBS" build_programs
+  install -D "$S/apps/openssl" "$STAGE/usr/bin/openssl"
+  install -D -m644 "$S/apps/openssl.cnf" "$STAGE/etc/ssl/openssl.cnf"
+fi
+
 STEP=gui
 echo "== gui"
 STAGE="$STAGE" bash "$N/gui/build.sh"
+
+STEP=rust
+echo "== rust"
+STAGE="$STAGE" bash "$N/rust/build.sh"
 
 # The image: an overlay after initramfs.cpio (and python.cpio, if present). etc/ssl/cert.pem is the
 # same Mozilla bundle python.cpio carries, so either image alone has a trust store; likewise
@@ -156,10 +181,16 @@ echo "== cpio"   # always: packing takes a second
     --tree usr/libexec/git-core="$STAGE/usr/libexec/git-core" \
     --tree usr/share/git-core="$STAGE/usr/share/git-core" \
     --file usr/bin/screen="$STAGE/usr/bin/screen" \
+    --file usr/bin/openssl="$STAGE/usr/bin/openssl" \
+    --file etc/ssl/openssl.cnf="$STAGE/etc/ssl/openssl.cnf" \
     --file usr/bin/gui="$STAGE/usr/bin/gui" \
     --file usr/bin/gui-demo="$STAGE/usr/bin/gui-demo" \
     --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \
     --file usr/lib/libcollabo-gui.a="$STAGE/usr/lib/libcollabo-gui.a" \
+    --file usr/bin/collabo-archive="$STAGE/usr/bin/collabo-archive" \
+    $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt 7z 7za 7zr; do echo "--link usr/bin/$n=collabo-archive"; done) \
+    --file usr/bin/jq="$STAGE/usr/bin/jq" \
+    --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
     --tree usr/share/terminfo="$DEPS/share/terminfo" \
     --file etc/ssl/cert.pem="$CACERT" \
     --etc "$N/etc"

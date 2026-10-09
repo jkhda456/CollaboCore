@@ -3,7 +3,7 @@
 #   tests/run.sh           unit tests (host modules, web panels) + web import graph
 #   tests/run.sh --boot    + guest boots: networking, workspace, Python (a few minutes)
 #   tests/run.sh --all     + the desktop runtime (stdio protocol, screen and vi in a terminal, GUI
-#                            programs) and the
+#                            programs, the Rust tools of tools.cpio in the guest) and the
 #                            Dart package
 # Needs a built tree (python3 build.py). Run through it: python3 build.py test [--boot|--all].
 set -euo pipefail
@@ -141,6 +141,12 @@ if [[ "$MODE" == "--all" ]]; then
   echo "== GUI programs: the display, input, screenshots (tools/gui, in the guest)"
   if ! python3 "$ROOT/tools/gui/tests/test_gui.py" guest "$runtime" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: gui"; exit 1
+  fi
+  tail -1 "$log"
+
+  echo "== tools.cpio's Rust tools and openssl in the guest (xz, zstd, 7z, jq, git-lfs)"
+  if ! bash "$ROOT/tools/rust/tests/test_guest.sh" "$runtime" >"$log" 2>&1; then
+    grep -A12 "^FAIL" "$log" | head -40; echo "FAIL: rust tools in the guest"; exit 1
   fi
   tail -1 "$log"
 

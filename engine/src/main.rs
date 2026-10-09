@@ -16,6 +16,7 @@ mod protocol;
 mod sshagent;
 mod module_info;
 mod net;
+mod program_cache;
 mod user;
 mod virtio;
 mod vsock;

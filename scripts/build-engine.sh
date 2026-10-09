@@ -138,6 +138,8 @@ if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
   cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
   for file in "$B"/gui/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
+  # The openssl command is OpenSSL's (listed above); the Rust tools list their crates.
+  for file in "$B"/rust/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
 fi
 
 # What each bundled add-on carries, as its build.sh left it in out/licenses.

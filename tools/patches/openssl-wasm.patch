@@ -1,0 +1,114 @@
+--- a/apps/speed.c
++++ b/apps/speed.c
+@@ -62,7 +62,9 @@
+         _In_ SIZE_T dwSize);
+ #endif
+ 
+-#if defined(OPENSSL_SYS_LINUX)
++/* The wasm guest's musl has no mmap family (sys/mman.h declares none of it), mlock included. */
++#if defined(OPENSSL_SYS_LINUX) && !defined(__wasm__)
++#define HAVE_MLOCK
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -117,7 +119,12 @@
+ static volatile int run = 0;
+ 
+ static int mr = 0; /* machine-readeable output format to merge fork results */
++#ifdef __wasm__
++/* The guest's kernel does not count a wasm process's user CPU time: measure elapsed time. */
++static int usertime = 0;
++#else
+ static int usertime = 1;
++#endif
+ 
+ static double Time_F(int s);
+ static void print_message(const char *s, int length, int tm);
+@@ -146,7 +153,68 @@
+ #define START 0
+ #define STOP 1
+ 
+-#ifdef SIGALRM
++#if defined(SIGALRM) && defined(__wasm__)
++
++/*
++ * The wasm guest hands a process its signals when it enters the kernel, which the benchmark
++ * loops never do: SIGALRM would not end them. As on Windows, a thread ends them instead, by
++ * clearing run (memory is shared) when the lapse is over.
++ */
++#include <pthread.h>
++
++static unsigned int lapse;
++static volatile int stopped;
++static pthread_t sleeper;
++
++static void alarmed(ossl_unused int sig)
++{
++    run = 0;
++}
++
++static void alarm_wasm(unsigned int secs)
++{
++    lapse = secs;
++}
++
++#define alarm alarm_wasm
++
++static void *sleepy(ossl_unused void *arg)
++{
++    struct timespec end, now, step = { 0, 10 * 1000 * 1000 };
++
++    clock_gettime(CLOCK_MONOTONIC, &end);
++    end.tv_sec += lapse;
++    while (!stopped) {
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        if (now.tv_sec > end.tv_sec
++            || (now.tv_sec == end.tv_sec && now.tv_nsec >= end.tv_nsec)) {
++            run = 0;
++            break;
++        }
++        nanosleep(&step, NULL);
++    }
++    return NULL;
++}
++
++static double Time_F(int s)
++{
++    double ret;
++
++    if (s == START) {
++        stopped = 0;
++        if (pthread_create(&sleeper, NULL, sleepy, NULL) != 0) {
++            BIO_printf(bio_err, "unable to start the timer thread\n");
++            exit(1);
++        }
++        return app_tminterval(s, usertime);
++    }
++    ret = app_tminterval(s, usertime);
++    stopped = 1;
++    pthread_join(sleeper, NULL);
++    return ret;
++}
++
++#elif defined(SIGALRM)
+ 
+ static void alarmed(ossl_unused int sig)
+ {
+@@ -2265,7 +2333,7 @@
+             break;
+         case OPT_MLOCK:
+             domlock = 1;
+-#if !defined(_WIN32) && !defined(OPENSSL_SYS_LINUX)
++#if !defined(_WIN32) && !defined(HAVE_MLOCK)
+             BIO_printf(bio_err,
+                 "%s: -mlock not supported on this platform\n",
+                 prog);
+@@ -2609,7 +2677,7 @@
+ #if defined(_WIN32)
+             (void)VirtualLock(loopargs[i].buf_malloc, buflen);
+             (void)VirtualLock(loopargs[i].buf2_malloc, buflen);
+-#elif defined(OPENSSL_SYS_LINUX)
++#elif defined(HAVE_MLOCK)
+             (void)mlock(loopargs[i].buf_malloc, buflen);
+             (void)mlock(loopargs[i].buf_malloc, buflen);
+ #endif

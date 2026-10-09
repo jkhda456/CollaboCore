@@ -1,0 +1,23 @@
+# The guest's tools written in Rust, one workspace (tools/rust/build.sh builds it for the guest):
+#
+#   archive   xz, zstd and 7z (with their unxz/xzcat/lzma/... and unzstd/zstdcat names), one binary
+#   jq        the JSON processor
+#   git-lfs   Git Large File Storage
+#
+# The codecs are pure Rust crates; nothing here compiles C, so the guest build needs only the
+# Rust toolchain python/build-rust-toolchain.sh makes.
+[workspace]
+resolver = "2"
+members = ["archive", "jq", "git-lfs"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

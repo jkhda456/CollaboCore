@@ -1,0 +1,16 @@
+[package]
+name = "collabo-jq"
+version = "1.8.2"
+description = "jq, the JSON processor, written again in Rust for the guest"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jq"
+path = "src/main.rs"
+
+[dependencies]
+indexmap = "2"
+fancy-regex = "0.19"
+libc = "0.2"

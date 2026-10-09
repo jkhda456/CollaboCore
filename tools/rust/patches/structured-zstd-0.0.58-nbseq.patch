@@ -1,0 +1,39 @@
+structured-zstd 0.0.58: the encoder wrote Number_of_Sequences wrong from 0x7F00 sequences in a
+block on (RFC 8878 3.1.1.3.2.1): the two-byte form reached 0x7FFF, whose first byte, 255, the
+decoder reads as the long form; and the long form's 16-bit value went out big-endian. Blocks
+with that many sequences come from the optimal parser (levels 16+, three-byte matches) on
+repetitive input, e.g. seq 1 300000 | zstd -19: the frame did not decode (C zstd: Data
+corruption detected).
+
+--- a/src/encoding/blocks/compressed.rs
++++ b/src/encoding/blocks/compressed.rs
+@@ -2902,23 +2902,26 @@
+     }
+ }
+ 
++/// Number_of_Sequences (RFC 8878 3.1.1.3.2.1): one byte below 128; two bytes, the first
++/// 128 + (n >> 8), up to 0x7EFF (a first byte of 255 means the long form); else 255 and
++/// n - 0x7F00 as a little-endian 16-bit value.
+ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
+     const UPPER_LIMIT: usize = 0xFFFF + 0x7F00;
+     match seqnum {
+         1..=127 => writer.write_bits(seqnum as u32, 8),
+-        128..=0x7FFF => {
++        128..=0x7EFF => {
+             let upper = ((seqnum >> 8) | 0x80) as u8;
+             let lower = seqnum as u8;
+             writer.write_bits(upper, 8);
+             writer.write_bits(lower, 8);
+         }
+-        0x8000..=UPPER_LIMIT => {
++        0x7F00..=UPPER_LIMIT => {
+             let encode = seqnum - 0x7F00;
+             let upper = (encode >> 8) as u8;
+             let lower = encode as u8;
+             writer.write_bits(255u8, 8);
+-            writer.write_bits(upper, 8);
+             writer.write_bits(lower, 8);
++            writer.write_bits(upper, 8);
+         }
+         _ => unreachable!(),
+     }

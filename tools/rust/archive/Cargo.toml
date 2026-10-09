@@ -1,0 +1,28 @@
+[package]
+name = "collabo-archive"
+version = "0.1.0"
+description = "xz, zstd and 7z for the collaboCore guest: one binary, picked by the name it runs as"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "collabo-archive"
+path = "src/main.rs"
+
+[dependencies]
+crc32fast = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
+lzma-rust2 = "0.21"
+structured-zstd = { version = "0.0.58", default-features = false, features = ["std", "hash", "ldm", "kernel-scalar", "kernel-simd128"] }
+tar = { version = "0.4", default-features = false }
+zip = { version = "8.6", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "ppmd", "xz"] }
+bzip2 = "0.6"
+sha1 = "0.11"
+sha2 = "0.11"
+md-5 = "0.11"
+sha3 = "0.11"
+blake2s_simd = "1"
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["aes256", "bzip2", "compress", "ppmd", "util", "deflate"] }

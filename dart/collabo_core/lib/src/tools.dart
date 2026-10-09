@@ -411,3 +411,190 @@ class _GuiError implements Exception {
   _GuiError(this.message);
   final String message;
 }
+
+/// Tools for browsing the web from the sandbox with the wpe add-on (WPE WebKit; turn it on with
+/// `addons: {'wpe': {}}` and keep [CollaboConfig.tools] on for its display): the `web` command
+/// there, as LLM tools. A browser starts by itself on the first call (the first start in a
+/// sandbox takes about a minute: the engine compiles it). Pages come back as text with every
+/// link, button and field numbered, which the other tools take as targets; screenshots come back
+/// as image blocks.
+///
+/// ```dart
+/// final web = WebTools(sandbox);
+/// // request body: {"tools": [...web.definitions, ...]}
+/// // for each tool_use block whose name web.handles(name):
+/// final content = await web.callContent(block['name'], block['input']);  // tool_result content blocks
+/// ```
+class WebTools {
+  WebTools(this.sandbox, {this.browser = 'web', this.maxPageChars = 30000, this.maxImageWidth = 1280});
+
+  final CollaboCore sandbox;
+
+  /// The browser's name (`web -n NAME`; the program in `gui list`). Each name is a browser of its
+  /// own, with its own cookies.
+  final String browser;
+
+  /// Pages longer than this (as text) are cut; `web_read` with `max` asks for more.
+  final int maxPageChars;
+  final int maxImageWidth;
+
+  static const _names = {'web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info'};
+
+  bool handles(String name) => _names.contains(name);
+
+  static const _target = {
+    'type': 'string',
+    'description': 'What to act on: the number [N] web_read gave it, a CSS selector, or the visible text of a link or '
+        'button.',
+  };
+
+  List<Map<String, Object?>> get definitions => [
+        {
+          'name': 'web_open',
+          'description': 'Open a web page in the sandbox\'s browser and wait until it has loaded, then return it as text '
+              '(web_read). A URL, or words to search for.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'url': {'type': 'string', 'description': 'The address (https:// is assumed), or search words.'},
+              'timeout_seconds': {'type': 'integer', 'description': 'Give up waiting after this long (default 60).'},
+            },
+            'required': ['url'],
+          },
+        },
+        {
+          'name': 'web_read',
+          'description': 'The current page as text, in reading order, with every visible link, button and form field '
+              'numbered [N] (targets for web_act). Links show their address.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'max': {'type': 'integer', 'description': 'At most this many characters (default $maxPageChars).'},
+              'all': {'type': 'boolean', 'description': 'Include hidden parts of the page too.'},
+            },
+          },
+        },
+        {
+          'name': 'web_act',
+          'description': 'Act on the page as a user would (real pointer and key events), then return what happened; '
+              'actions that load another page wait for it. Afterwards web_read shows the new state.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'action': {
+                'type': 'string',
+                'enum': ['click', 'double_click', 'right_click', 'hover', 'type', 'key', 'select', 'scroll', 'back', 'forward', 'reload', 'wait'],
+              },
+              'target': _target,
+              'text': {'type': 'string', 'description': 'type: the text to type (into target, else where the focus is); '
+                  'wait: text to wait for on the page'},
+              'keys': {'type': 'string', 'description': 'key: keys in order, separated by spaces, e.g. "Enter", "ctrl+a Backspace", "Tab"'},
+              'value': {'type': 'string', 'description': 'select: the option (its text or value)'},
+              'direction': {'type': 'string', 'enum': ['down', 'up', 'left', 'right', 'top', 'bottom'], 'description': 'scroll'},
+              'amount': {'type': 'integer', 'description': 'scroll: wheel notches (default 3)'},
+              'x': {'type': 'integer', 'description': 'click/hover at page coordinates instead of a target'},
+              'y': {'type': 'integer'},
+            },
+            'required': ['action'],
+          },
+        },
+        {
+          'name': 'web_eval',
+          'description': 'Run JavaScript in the page and return its result (JSON). For reading what web_read does not '
+              'show, or checking state; prefer web_act for acting.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {'script': {'type': 'string', 'description': 'An expression or statements; the last value is returned.'}},
+            'required': ['script'],
+          },
+        },
+        {
+          'name': 'web_screenshot',
+          'description': 'Look at the page: an image of what the browser shows.',
+          'input_schema': {'type': 'object', 'properties': <String, Object?>{}},
+        },
+        {
+          'name': 'web_info',
+          'description': 'The browser\'s state: address, title, loading, history, size, the last error or dialog.',
+          'input_schema': {'type': 'object', 'properties': <String, Object?>{}},
+        },
+      ];
+
+  /// Runs one tool call; returns the tool_result content blocks. Failures come back as text
+  /// starting with "Error:".
+  Future<List<Map<String, Object?>>> callContent(String name, Map<String, Object?> input) async {
+    try {
+      switch (name) {
+        case 'web_open':
+          final opened = await _web(['open', input['url'] as String, if (input['timeout_seconds'] != null) '${input['timeout_seconds']}'],
+              timeout: Duration(seconds: ((input['timeout_seconds'] as int?) ?? 60) + 600), allowFailure: true);
+          final page = await _web(['read', '$maxPageChars'], allowFailure: true);
+          return [_text('${opened.trim()}\n\n$page')];
+        case 'web_read':
+          final all = input['all'] == true;
+          return [_text(await _web(['read', '${(input['max'] as int?) ?? maxPageChars}', if (all) '--all']))];
+        case 'web_act':
+          return [_text(await _web(_actArgs(input), timeout: const Duration(seconds: 120), allowFailure: true))];
+        case 'web_eval':
+          return [_text(await _web(['eval', input['script'] as String], allowFailure: true))];
+        case 'web_info':
+          return [_text(await _web(['info']))];
+        case 'web_screenshot':
+          await _web(['info']); // a browser must be there
+          final r = await sandbox.exec(['gui', 'screenshot', browser, '--idle', '300', '-o', '-', '--max-width', '$maxImageWidth']);
+          if (!r.ok) return [_text('Error: ${r.stderrText.trim().replaceFirst('gui: ', '')}')];
+          return [
+            {
+              'type': 'image',
+              'source': {'type': 'base64', 'media_type': 'image/png', 'data': base64.encode(r.stdout)},
+            },
+            _text(r.stderrText.trim()),
+          ];
+        default:
+          return [_text('Error: unknown tool "$name"')];
+      }
+    } on _GuiError catch (e) {
+      return [_text('Error: ${e.message}')];
+    } catch (e) {
+      return [_text('Error: $e')];
+    }
+  }
+
+  /// [callContent] as text only (an image becomes a line saying it was taken).
+  Future<String> call(String name, Map<String, Object?> input) async {
+    final blocks = await callContent(name, input);
+    return blocks.map((b) => b['type'] == 'text' ? b['text'] as String : '[screenshot image]').join('\n');
+  }
+
+  List<String> _actArgs(Map<String, Object?> input) {
+    final action = input['action'] as String;
+    final target = input['target'] as String?;
+    final at = input['x'] != null && input['y'] != null ? ['${input['x']}', '${input['y']}'] : null;
+    String need(String? v, String what) => v ?? (throw _GuiError('$action needs $what'));
+    return switch (action) {
+      'click' || 'double_click' || 'right_click' || 'hover' => [
+          {'double_click': 'dblclick', 'right_click': 'rightclick'}[action] ?? action,
+          ...(at ?? [need(target, 'a target (or x and y)')]),
+        ],
+      'type' => ['type', need(input['text'] as String?, 'text'), if (target != null) target],
+      'key' => ['key', ...need(input['keys'] as String?, 'keys').trim().split(RegExp(r'\s+'))],
+      'select' => ['select', need(target, 'a target'), need(input['value'] as String?, 'a value')],
+      'scroll' => ['scroll', (input['direction'] as String?) ?? 'down', if (input['amount'] != null) '${input['amount']}'],
+      'back' || 'forward' || 'reload' => [action],
+      'wait' => input['text'] != null ? ['wait', 'text', input['text'] as String] : ['wait', 'load'],
+      _ => throw _GuiError('unknown action $action'),
+    };
+  }
+
+  Map<String, Object?> _text(String t) => {'type': 'text', 'text': t.isEmpty ? '(no output)' : t};
+
+  Future<String> _web(List<String> args, {Duration timeout = const Duration(minutes: 11), bool allowFailure = false}) async {
+    final r = await sandbox.exec(['web', '-n', browser, ...args], timeout: timeout);
+    if (!r.ok && !allowFailure) {
+      final err = r.stderrText.trim();
+      throw _GuiError(err.startsWith('web: ') ? err.substring(5) : (err.isEmpty ? 'web ${args.first} failed (${r.exitCode})' : err));
+    }
+    final out = '${r.stdoutText}${r.stderrText}'.trimRight();
+    return r.ok ? out : 'Error (exit ${r.exitCode}): $out';
+  }
+}
