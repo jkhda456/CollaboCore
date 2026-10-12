@@ -10,6 +10,7 @@
 #   collabo.agent=1                start collabo-agentd, through which the host runs commands
 #   collabo.sshagent=1             the host lends its ssh-agent: SSH_AUTH_SOCK (collabo-sshagent)
 #   collabo.quiet=1                no banner
+#   collabo.version=V              the engine's version (the `version` command)
 # The engine's session CA, when it came with the boot images: the sandbox's own HTTPS clients
 # (curl, git, python) then get the app's API keys for the hosts that have them, added on the host
 # (engine/src/intercept.rs). Everything else keeps Mozilla's roots alone.

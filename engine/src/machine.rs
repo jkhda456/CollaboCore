@@ -736,9 +736,14 @@ fn build_devicetree(
         chosen.prop("rng-seed", Value::Bytes(seed.to_vec()));
         let args = if options.args.is_empty() { String::new() } else { format!(" {}", options.args.join(" ")) };
         // collabo.wasmstack: how deep guest programs may recurse (bytes of native wasm stack).
+        // collabo.version: this engine's version, for the guest's `version` command.
         // collabo.execlog: the kernel reports every exec (kernel.exec_log).
         let exec_log = if options.exec_log.is_some() { " collabo.execlog=1" } else { "" };
-        chosen.prop("bootargs", Value::Str(format!("console=hvc0 collabo.wasmstack={MAX_WASM_STACK}{exec_log}{args}")));
+        let version = env!("CARGO_PKG_VERSION");
+        chosen.prop(
+            "bootargs",
+            Value::Str(format!("console=hvc0 collabo.wasmstack={MAX_WASM_STACK} collabo.version={version}{exec_log}{args}")),
+        );
         chosen.prop("ncpus", Value::U32(options.cpus));
         if !options.initcpio.is_empty() {
             chosen.prop("linux,initrd-start", Value::U32(initcpio_address as u32));

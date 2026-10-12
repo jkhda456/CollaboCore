@@ -160,7 +160,9 @@ int main(void)
 			if (stop_signal)
 				shut_down(stop_signal);
 			if (w == pid) {
-				fprintf(stderr, "init: shell exited (status %d), restarting\n", status);
+				// Leaving the shell does not end the machine, which is easy to miss from inside it.
+				fprintf(stderr, "init: shell exited (status %d), restarting\n"
+						"init: Call 'shutdown' to turn off the VM\n", status);
 				break;
 			}
 			if (w < 0 && errno != EINTR) {

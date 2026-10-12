@@ -160,4 +160,5 @@ python3 "$U/mkinitramfs.py" --init "$U/out/init.wasm" --busybox "$U/out/busybox"
   --file usr/sbin/collabo-agentd="$U/out/collabo-agentd.wasm" \
   --file usr/sbin/collabo-sshagent="$U/out/collabo-sshagent.wasm" \
   --file usr/sbin/shutdown="$U/rootfs/shutdown" \
+  --file usr/bin/version="$U/rootfs/version" \
   --etc "$U/rootfs/etc" -o "$U/out/initramfs.cpio"

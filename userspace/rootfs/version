@@ -1,0 +1,34 @@
+#!/bin/sh
+# version: what this sandbox is: the collaboCore engine's version (collabo.version on the kernel
+# command line), the kernel, busybox and the add-ons the machine was started with.
+#
+#   version          all of it
+#   version -s       the collaboCore version alone
+case $1 in
+-s|--short) ;;
+"") ;;
+-h|--help) echo "usage: version [-s]   collaboCore, kernel, busybox and add-on versions"; exit 0 ;;
+*) echo "usage: version [-s]" >&2; exit 2 ;;
+esac
+
+v=
+for a in $(cat /proc/cmdline 2>/dev/null); do
+	case $a in collabo.version=*) v=${a#*=} ;; esac
+done
+if [ -n "$1" ]; then
+	echo "${v:-unknown}"
+	exit 0
+fi
+
+echo "collaboCore ${v:-(unknown: an engine older than collabo.version)}"
+echo "kernel      $(uname -sr) ($(uname -m))"
+echo "busybox     $(busybox 2>&1 | sed -n '1s/^BusyBox \(v[^ ]*\).*/\1/p')"
+addons=
+for f in /etc/collabo/addons/*.json; do
+	[ -f "$f" ] || continue
+	n=${f##*/}
+	addons="$addons ${n%.json}"
+done
+echo "add-ons    ${addons:- none}"
+echo
+echo "Inside the collaboCore VM. Call 'shutdown' to turn it off."
