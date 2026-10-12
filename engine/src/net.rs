@@ -531,8 +531,13 @@ impl Stack {
 
         let mut connections = self.connections.lock().unwrap();
         let Some(connection) = connections.get_mut(&key) else {
-            // Nothing here: tell the guest so it fails at once instead of waiting.
-            if flags & RST == 0 {
+            // Nothing here. The gateway is this computer: tell the guest so it fails at once
+            // instead of waiting. Whether any other address has a host at all is not known here,
+            // so a segment that opens nothing (a port scanner's ACK, FIN or null probe) goes
+            // unanswered, as behind a firewall, instead of with a reset that says a host is up
+            // (`nmap -sn` found every address up). The guest's own connections never get here:
+            // the stack forgets one only after it has told the guest (a reset, or both FINs).
+            if flags & RST == 0 && destination == GATEWAY {
                 let reply = tcp_segment(destination, source_port, destination_port, acknowledged, 0, RST, 0, &[]);
                 drop(connections);
                 self.send(reply);
@@ -570,11 +575,10 @@ impl Stack {
         if flags & FIN != 0 && sequence.wrapping_add(data.len() as u32) == connection.receive_next {
             connection.receive_next = connection.receive_next.wrapping_add(1);
             connection.guest_finished = true;
-            // The guest will send nothing more: let the host peer see the end of the stream.
+            // The guest will send nothing more: let the host peer see the end of the stream. The
+            // writer thread shuts the socket's sending side once it has written what is queued;
+            // shutting it here would overtake that data (`printf 'GET ...' | nc` got no answer).
             connection.to_host = None;
-            if let Some(socket) = &connection.socket {
-                let _ = socket.shutdown(Shutdown::Write);
-            }
         }
         let acknowledge = !data.is_empty() || flags & FIN != 0;
         drop(connections);
