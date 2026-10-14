@@ -138,6 +138,12 @@ if [[ "$MODE" == "--all" ]]; then
   fi
   tail -1 "$log"
 
+  echo "== SQLite: the sqlite3 shell (also in a terminal) and Python's sqlite3, in the guest"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_sqlite.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: sqlite"; exit 1
+  fi
+  tail -1 "$log"
+
   echo "== GUI programs: the display, input, screenshots (tools/gui, in the guest)"
   if ! python3 "$ROOT/tools/gui/tests/test_gui.py" guest "$runtime" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: gui"; exit 1

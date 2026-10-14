@@ -1,0 +1,16 @@
+[package]
+name = "collabo-yq"
+version = "4.54.1"
+description = "yq, the YAML/JSON/XML/... processor, written again in Rust for the guest"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "yq"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+libc = "0.2"
+unicode-normalization = "0.1"

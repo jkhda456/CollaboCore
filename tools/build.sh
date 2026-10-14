@@ -7,6 +7,7 @@
 #   git       2.55  with the http(s) and ssh transports
 #   screen    5.0   GNU screen, the terminal multiplexer
 #   openssl   3.5   the openssl command (keys, certificates, s_client, enc, dgst, ...)
+#   sqlite    3.51  the sqlite3 shell, the same SQLite (and options) as Python's sqlite3 module
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
 #   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, 7z (one
@@ -19,7 +20,7 @@
 # patches; distro has no screen, so its patch is ours (patches/screen-nofork.patch). OpenSSL,
 # zlib and ncurses are the static libraries python/build-deps.sh builds (python/deps), so the
 # python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen openssl gui rust cpio (gui and rust always run: cargo
+# them.   stages: curl dropbear git screen openssl sqlite gui rust cpio (gui and rust always run: cargo
 # and the compiles are incremental)
 set -euo pipefail
 
@@ -157,6 +158,22 @@ if stage openssl "$STAGE/usr/bin/openssl"; then
   install -D -m644 "$S/apps/openssl.cnf" "$STAGE/etc/ssl/openssl.cnf"
 fi
 
+STEP=sqlite  # the shell (shell.c) over the amalgamation compiled as python/build-deps.sh does for
+             # _sqlite3 (no WAL and no mmap I/O, which need shared mappings; FTS4/5, R*Tree, math,
+             # dbstat), so both see the same SQLite. Line editing from libedit, as for Python's
+             # readline. `.system`, `.shell` and `.once |cmd` go through system()/popen(), which
+             # musl does with posix_spawn.
+if stage sqlite "$STAGE/usr/bin/sqlite3"; then
+  S="$(unpack sqlite)"
+  (cd "$S" && log "$CC" -O2 -o sqlite3 shell.c sqlite3.c -I"$DEPS/include" \
+     -DSQLITE_OMIT_WAL=1 -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION=1 \
+     -DSQLITE_ENABLE_FTS4=1 -DSQLITE_ENABLE_FTS5=1 -DSQLITE_ENABLE_RTREE=1 -DSQLITE_ENABLE_MATH_FUNCTIONS=1 \
+     -DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT=1 \
+     -DHAVE_EDITLINE=1 -L"$DEPS/lib" -ledit -lncursesw $LINK_FLAGS)
+  install -D "$S/sqlite3" "$STAGE/usr/bin/sqlite3"
+  install -D -m644 "$S/sqlite3.1" "$STAGE/usr/share/man/man1/sqlite3.1"
+fi
+
 STEP=gui
 echo "== gui"
 STAGE="$STAGE" bash "$N/gui/build.sh"
@@ -183,6 +200,7 @@ echo "== cpio"   # always: packing takes a second
     --file usr/bin/screen="$STAGE/usr/bin/screen" \
     --file usr/bin/openssl="$STAGE/usr/bin/openssl" \
     --file etc/ssl/openssl.cnf="$STAGE/etc/ssl/openssl.cnf" \
+    --file usr/bin/sqlite3="$STAGE/usr/bin/sqlite3" \
     --file usr/bin/gui="$STAGE/usr/bin/gui" \
     --file usr/bin/gui-demo="$STAGE/usr/bin/gui-demo" \
     --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \

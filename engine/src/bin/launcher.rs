@@ -13,6 +13,12 @@
 //! runs one command (`exec -- ...`) instead of the shell. In a value `~` is the home folder and
 //! `${NAME}` an environment variable; relative host paths are relative to the runtime folder, and
 //! a mount's host folder there is made when it is missing.
+//!
+//! `launcher --config FILE` reads FILE instead (it must exist); relative paths in it are then
+//! relative to FILE's folder, and a missing mount folder is made only there. Two keys move the
+//! runtime's parts: `bin = DIR` is where `collabo-core-engine` is (default `bin`), `app = DIR`
+//! the folder the manifest's `app/...` paths (images, add-ons) are in (default `app`). The
+//! manifest stays beside the launcher, and the engine still runs in the launcher's folder.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,6 +36,8 @@ const PATH_KEYS: &[&str] =
     &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-network", "log-exec", "log-file"];
 /// The add-on folder when the manifest names none, relative to the runtime folder.
 const DEFAULT_ADDON_DIR: &str = "app/images/addons";
+/// The config file beside the launcher, read when no --config names one.
+const DEFAULT_CONF: &str = "launcher.conf";
 
 const USAGE: &str = "\
 launcher: starts this runtime's sandbox as launcher.conf describes
@@ -38,6 +46,8 @@ Usage:
   launcher [ENGINE OPTIONS] [-- CMD...]   the arguments go after launcher.conf's; with `--`
                                           they replace its `command`
   launcher --dry-run                      print the engine command line instead (secrets hidden)
+  launcher --config FILE                  read FILE instead of launcher.conf (with --dry-run too;
+                                          both go before the engine options)
   launcher --help                         this text; bin/collabo-core-engine --help has the options
 
 launcher.conf (beside this program): `key = value` per line, `#` for comments.
@@ -45,8 +55,10 @@ launcher.conf (beside this program): `key = value` per line, `#` for comments.
   <flag> = yes|no     no-network, allow-loopback, log-requests, no-raw
   python = off        leave out the CPython overlay; tools = off: curl, ssh, git
   command = CMD...    run one command in the guest instead of the shell
+  bin = DIR           the folder collabo-core-engine is in (default: bin beside this program)
+  app = DIR           the folder images/ and the add-ons are in (default: app beside it)
   ~ is the home folder, ${NAME} an environment variable; relative host paths are relative to
-  this folder, and a mount's missing host folder here is made.
+  the config file's folder, and a mount's missing host folder there is made.
 ";
 
 /// What launcher.conf says, as engine arguments.
@@ -58,12 +70,16 @@ struct Conf {
     tools: bool,
     /// Host folders of the mounts, to make when missing.
     mount_dirs: Vec<PathBuf>,
+    /// `app = DIR`: where the manifest's `app/...` paths are, when not beside the launcher.
+    app: Option<PathBuf>,
+    /// `bin = DIR`: where the engine is, when not in `bin` beside the launcher.
+    bin: Option<PathBuf>,
 }
 
 fn parse_conf(text: &str, base: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf, String> {
     let mut conf = Conf { python: true, tools: true, ..Conf::default() };
     for (index, line) in text.lines().enumerate() {
-        let at = |message: String| format!("launcher.conf line {}: {message}", index + 1);
+        let at = |message: String| format!("line {}: {message}", index + 1);
         let line = strip_comment(line).trim();
         if line.is_empty() {
             continue;
@@ -75,6 +91,8 @@ fn parse_conf(text: &str, base: &Path, env: &dyn Fn(&str) -> Option<String>) -> 
             "python" => conf.python = yes(&value).map_err(at)?,
             "tools" => conf.tools = yes(&value).map_err(at)?,
             "command" => conf.command = split_words(&value).map_err(at)?,
+            "app" => conf.app = Some(resolve(&value, base)),
+            "bin" => conf.bin = Some(resolve(&value, base)),
             flag if FLAG_KEYS.contains(&flag) => {
                 if yes(&value).map_err(at)? {
                     conf.args.push(format!("--{flag}"));
@@ -179,8 +197,9 @@ fn split_words(text: &str) -> Result<Vec<String>, String> {
 }
 
 /// The manifest's `entry` without the program, less the overlays launcher.conf turns off, with
-/// the default add-on folder when it names none (a later `--addon-dir` still wins).
-fn entry_args(manifest: &str, python: bool, tools: bool) -> Result<Vec<String>, String> {
+/// the default add-on folder when it names none (a later `--addon-dir` still wins). With `app`,
+/// the paths in `app/` are in that folder instead.
+fn entry_args(manifest: &str, python: bool, tools: bool, app: Option<&Path>) -> Result<Vec<String>, String> {
     let manifest: serde_json::Value = serde_json::from_str(manifest).map_err(|e| format!("manifest.json: {e}"))?;
     let entry: Vec<String> = manifest["entry"]
         .as_array()
@@ -200,6 +219,14 @@ fn entry_args(manifest: &str, python: bool, tools: bool) -> Result<Vec<String>, 
     }
     if !args.iter().any(|a| a == "--addon-dir") {
         args.extend(["--addon-dir".into(), DEFAULT_ADDON_DIR.into()]);
+    }
+    if let Some(app) = app {
+        for i in 1..args.len() {
+            let path_value = PATH_KEYS.iter().any(|key| args[i - 1].strip_prefix("--") == Some(key));
+            if let Some(rest) = args[i].strip_prefix("app/").filter(|_| path_value) {
+                args[i] = app.join(rest).display().to_string();
+            }
+        }
     }
     Ok(args)
 }
@@ -238,10 +265,28 @@ fn shown(args: &[String]) -> String {
     out.join(" ")
 }
 
+/// The launcher's own options, which come first: `--dry-run` and `--config FILE` (or
+/// `--config=FILE`), in either order. The rest are the engine's.
+fn launcher_options(mut args: &[String]) -> Result<(bool, Option<PathBuf>, &[String]), String> {
+    let (mut dry_run, mut config) = (false, None);
+    loop {
+        match args.first().map(String::as_str) {
+            Some("--dry-run") => (dry_run, args) = (true, &args[1..]),
+            Some("--config") => {
+                let file = args.get(1).ok_or("--config needs a file")?;
+                (config, args) = (Some(PathBuf::from(file)), &args[2..]);
+            }
+            Some(arg) if arg.starts_with("--config=") => {
+                (config, args) = (Some(PathBuf::from(&arg["--config=".len()..])), &args[1..]);
+            }
+            _ => return Ok((dry_run, config, args)),
+        }
+    }
+}
+
 fn run() -> Result<i32, String> {
-    let extra: Vec<String> = std::env::args().skip(1).collect();
-    let dry_run = extra.first().is_some_and(|a| a == "--dry-run");
-    let extra = if dry_run { extra[1..].to_vec() } else { extra };
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (dry_run, config, extra) = launcher_options(&argv)?;
     if matches!(extra.first().map(String::as_str), Some("-h" | "--help" | "help")) {
         print!("{USAGE}");
         return Ok(0);
@@ -253,23 +298,29 @@ fn run() -> Result<i32, String> {
     let manifest = std::fs::read_to_string(base.join("manifest.json"))
         .map_err(|e| format!("{}: {e} (the launcher belongs in a runtime folder)", base.join("manifest.json").display()))?;
 
-    let conf_path = base.join("launcher.conf");
+    // launcher.conf beside this program may be missing; a file --config names may not.
+    let named = config.is_some();
+    let conf_path = config.unwrap_or_else(|| base.join(DEFAULT_CONF));
+    let conf_path = conf_path.canonicalize().unwrap_or(conf_path);
+    let conf_dir = conf_path.parent().unwrap_or(&base).to_path_buf();
     let conf = match std::fs::read_to_string(&conf_path) {
-        Ok(text) => parse_conf(&text, &base, &|name| std::env::var(name).ok())?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Conf { python: true, tools: true, ..Conf::default() },
+        Ok(text) => parse_conf(&text, &conf_dir, &|name| std::env::var(name).ok())
+            .map_err(|e| format!("{} {e}", if named { conf_path.display().to_string() } else { DEFAULT_CONF.into() }))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !named => Conf { python: true, tools: true, ..Conf::default() },
         Err(e) => return Err(format!("{}: {e}", conf_path.display())),
     };
-    let args = engine_args(entry_args(&manifest, conf.python, conf.tools)?, &conf, &extra);
-    let engine = base.join("bin").join(if cfg!(windows) { "collabo-core-engine.exe" } else { "collabo-core-engine" });
+    let args = engine_args(entry_args(&manifest, conf.python, conf.tools, conf.app.as_deref())?, &conf, extra);
+    let bin = conf.bin.clone().unwrap_or_else(|| base.join("bin"));
+    let engine = bin.join(if cfg!(windows) { "collabo-core-engine.exe" } else { "collabo-core-engine" });
 
     if dry_run {
         println!("{} {}", engine.display(), shown(&args));
         return Ok(0);
     }
     // A mount inside the runtime folder (work/) may not have survived an archive that drops
-    // empty folders.
+    // empty folders; with --config, inside that file's folder.
     for dir in &conf.mount_dirs {
-        if dir.starts_with(&base) && !dir.exists() {
+        if dir.starts_with(&conf_dir) && !dir.exists() {
             std::fs::create_dir_all(dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
         }
     }
@@ -421,14 +472,48 @@ mod tests {
     #[test]
     fn entry_loses_the_overlays_turned_off() {
         let manifest = r#"{"entry": ["bin/e", "--kernel", "k", "--python-image", "p", "--tools-image", "t", "--addon-dir", "a"]}"#;
-        assert_eq!(entry_args(manifest, true, true).unwrap(), ["--kernel", "k", "--python-image", "p", "--tools-image", "t", "--addon-dir", "a"]);
-        assert_eq!(entry_args(manifest, false, false).unwrap(), ["--kernel", "k", "--addon-dir", "a"]);
+        assert_eq!(entry_args(manifest, true, true, None).unwrap(), ["--kernel", "k", "--python-image", "p", "--tools-image", "t", "--addon-dir", "a"]);
+        assert_eq!(entry_args(manifest, false, false, None).unwrap(), ["--kernel", "k", "--addon-dir", "a"]);
     }
 
     #[test]
     fn entry_without_an_addon_dir_gets_the_default() {
         let manifest = r#"{"entry": ["bin/e", "--kernel", "k"]}"#;
-        assert_eq!(entry_args(manifest, true, true).unwrap(), ["--kernel", "k", "--addon-dir", "app/images/addons"]);
+        assert_eq!(entry_args(manifest, true, true, None).unwrap(), ["--kernel", "k", "--addon-dir", "app/images/addons"]);
+    }
+
+    #[test]
+    fn app_moves_the_manifest_paths_in_app() {
+        let manifest = r#"{"entry": ["bin/e", "--kernel", "app/images/k", "--initramfs", "/abs/i", "--tools-image", "app/images/t"]}"#;
+        assert_eq!(
+            entry_args(manifest, true, true, Some(Path::new("/opt/cc"))).unwrap(),
+            ["--kernel", "/opt/cc/images/k", "--initramfs", "/abs/i", "--tools-image", "/opt/cc/images/t", "--addon-dir", "/opt/cc/images/addons"]
+        );
+    }
+
+    #[test]
+    fn app_and_bin_are_folders_relative_to_the_conf() {
+        let conf = parse_conf("app = shared/app\nbin = ~/cc/bin\n", Path::new("/etc/cc"), &env).unwrap();
+        assert_eq!(conf.app, Some(PathBuf::from("/etc/cc/shared/app")));
+        assert_eq!(conf.bin, Some(PathBuf::from("/home/me/cc/bin")));
+        assert!(conf.args.is_empty());
+        let none = parse_conf("cpus = 1\n", Path::new("/rt"), &env).unwrap();
+        assert_eq!((none.app, none.bin), (None, None));
+    }
+
+    #[test]
+    fn launcher_options_come_first() {
+        let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let all = args(&["--config", "my.conf", "--dry-run", "--cpus", "1", "--config", "x"]);
+        let (dry_run, config, rest) = launcher_options(&all).unwrap();
+        assert!(dry_run);
+        assert_eq!(config, Some(PathBuf::from("my.conf")));
+        assert_eq!(rest, &all[3..]);
+        let eq = args(&["--dry-run", "--config=/c/l.conf"]);
+        assert_eq!(launcher_options(&eq).unwrap(), (true, Some(PathBuf::from("/c/l.conf")), &[][..]));
+        let plain = args(&["--addon", "x"]);
+        assert_eq!(launcher_options(&plain).unwrap(), (false, None, &plain[..]));
+        assert!(launcher_options(&args(&["--config"])).unwrap_err().contains("needs a file"));
     }
 
     #[test]

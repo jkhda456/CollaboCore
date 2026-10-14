@@ -30,5 +30,3 @@ for f in /etc/collabo/addons/*.json; do
 	addons="$addons ${n%.json}"
 done
 echo "add-ons    ${addons:- none}"
-echo
-echo "Inside the collaboCore VM. Call 'shutdown' to turn it off."

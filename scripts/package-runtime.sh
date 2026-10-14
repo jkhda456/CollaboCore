@@ -4,6 +4,8 @@
 #   dist/runtime/collabo-core-<platform>/
 #     bin/collabo-core-engine[.exe]   the native engine (engine/, Rust + wasmtime)
 #     launcher[.exe], launcher.conf   starts the engine as launcher.conf says, with no arguments
+#                                     (launcher --config FILE reads another; its bin/app keys
+#                                     point at an engine and images kept elsewhere)
 #     work/                           the folder launcher.conf shares with the guest as /work
 #     app/images/vmlinux.wasm         the kernel
 #     app/images/initramfs.cpio       guest root (busybox, /init, the agent)

@@ -8,7 +8,7 @@
 # Rust toolchain python/build-rust-toolchain.sh makes.
 [workspace]
 resolver = "2"
-members = ["archive", "jq", "git-lfs"]
+members = ["archive", "jq", "git-lfs", "yq"]
 
 [workspace.package]
 edition = "2021"
