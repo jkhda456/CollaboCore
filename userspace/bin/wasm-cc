@@ -3,6 +3,17 @@
 # cannot build here. Reproduces what that driver does for the linux target:
 #   compile: __linux__/__unix__ macros, sysroot include, atomics/bulk-memory/sjlj flags
 #   link   : crt1.o first, --table-base=3 (fn ptr 1,2 = SIG_IGN/SIG_HOLD), -lc, compiler-rt
+# and shared libraries, which the C library's dlopen loads (the engine links them in):
+#   -fPIC     objects for a shared library: with default visibility (WebAssembly's is hidden),
+#             as a library on Linux exports what it does not hide
+#   -shared   a library: a WebAssembly side module (wasm-ld --experimental-pic -shared), its own
+#             symbols bound to itself (-Bsymbolic), what it does not define imported from the
+#             program or the libraries loaded before it, its constructors in __wasm_call_ctors
+#             (which wasm-ld does not export by itself: the loader calls it), its thread-local
+#             storage set up by __wasm_init_tls for each thread; compiler-rt in it, not the C library
+#   -rdynamic a program that loads libraries: the whole C library in it and exported
+#             (sysroot/lib/libc.exports), everything else not hidden exported, and a function
+#             table that can grow
 U="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYS="$U/sysroot"
 RT="$U/out/rt/lib/wasm32-unknown-unknown/libclang_rt.builtins.a"
@@ -18,8 +29,11 @@ COMMON=(--target=wasm32 -matomics -mbulk-memory -mllvm -wasm-enable-sjlj
 link=1
 for a in "$@"; do case "$a" in -c|-S|-E|-M|-MM|-###) link=0;; esac; done
 
+pic=()
+for a in "$@"; do case "$a" in -fPIC|-fpic) pic=(-fvisibility=default) ;; esac; done
+
 if [[ $link == 0 ]]; then
-  exec "$CC_BIN" "${COMMON[@]}" -isystem "$SYS/include" "$@"
+  exec "$CC_BIN" "${COMMON[@]}" "${pic[@]}" -isystem "$SYS/include" "$@"
 fi
 # Probing the compiler (e.g. `-print-*`, `--version`) is not a link either.
 for a in "$@"; do case "$a" in -print-*|--version|-v|-dumpmachine) exec "$CC_BIN" "${COMMON[@]}" "$@";; esac; done
@@ -27,8 +41,33 @@ for a in "$@"; do case "$a" in -print-*|--version|-v|-dumpmachine) exec "$CC_BIN
 # Partial links (`-r`) must not get executable-shaping flags, crt1 or libc.
 for a in "$@"; do case "$a" in -r|-Wl,-r|-Wl,--relocatable) exec "$CC_BIN" "${COMMON[@]}" -nostdlib -fuse-ld="$LD_BIN" "$@";; esac; done
 
-"$CC_BIN" "${COMMON[@]}" -isystem "$SYS/include" -nostdlib -fuse-ld="$LD_BIN" \
-  -Wl,--table-base=3 -L"$SYS/lib" "$SYS/lib/crt1.o" "$@" -lc "$RT" || exit
+shared=0 dynamic=()
+for a in "$@"; do
+  case "$a" in
+    -shared) shared=1 ;;
+    -rdynamic) dynamic=(-Wl,--export-dynamic -Wl,--growable-table "-Wl,@$SYS/lib/libc.exports") ;;
+  esac
+done
+args=(); for a in "$@"; do [[ "$a" == -rdynamic ]] || args+=("$a"); done; set -- "${args[@]}"
+
+if [[ $shared == 1 ]]; then
+  # compiler-rt without its __c_longjmp: a library must import the program's tag (the one the C
+  # library's longjmp throws), not define one of its own its setjmp would then wait for in vain
+  RT_SHARED="${RT%.a}-shared.a"
+  if [[ ! -f "$RT_SHARED" || "$RT" -nt "$RT_SHARED" ]]; then
+    tmp="$(mktemp "$RT_SHARED.XXXXXX")"
+    cp "$RT" "$tmp" && llvm-ar-19 d "$tmp" __c_longjmp.S.o && mv -f "$tmp" "$RT_SHARED" || { rm -f "$tmp"; exit 1; }
+  fi
+  RT="$RT_SHARED"
+  "$CC_BIN" "${COMMON[@]}" "${pic[@]}" -isystem "$SYS/include" -nostdlib -fuse-ld="$LD_BIN" \
+    -Wl,--experimental-pic -Wl,--shared-memory -Wl,--import-memory -Wl,-Bsymbolic -Wl,--export-dynamic -Wl,--no-entry \
+    -Wl,--unresolved-symbols=import-dynamic -Wl,--export-if-defined=__wasm_call_ctors -Wl,--export-if-defined=__wasm_init_tls \
+    -Wl,--export-if-defined=__tls_size -Wl,--export-if-defined=__tls_align -Wl,--export-if-defined=__tls_base \
+    "$@" "$RT" || exit
+else
+  "$CC_BIN" "${COMMON[@]}" -isystem "$SYS/include" -nostdlib -fuse-ld="$LD_BIN" \
+    -Wl,--table-base=3 -L"$SYS/lib" "$SYS/lib/crt1.o" "${dynamic[@]}" "$@" -lc "$RT" || exit
+fi
 
 # setjmp/longjmp becomes exception instructions (-wasm-enable-sjlj), and clang-19 still writes
 # them in the withdrawn "phase 3" encoding (`try`/`catch`). Browsers and V8 accept both, but

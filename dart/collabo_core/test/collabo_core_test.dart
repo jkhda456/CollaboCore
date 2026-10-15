@@ -294,14 +294,16 @@ void main() {
           '<button onclick="out.textContent = \'hi \' + document.getElementById(\'name\').value">Greet</button>'
           '<p id="out"></p><a href="second.html">Second page</a>');
       await ws.writeText('/tmp/web/second.html', '<!doctype html><title>Second</title><p>second page</p>');
+      await ws.writeText('/tmp/web/probe.js', 'await null;\nreturn args.join("+") + " " + document.title;');
     });
     tearDownAll(() async {
       if (hasWpe) await ws.stop();
     });
 
-    test('open, read, act, eval, info, screenshot', () async {
-      final web = WebTools(ws, maxImageWidth: 512);
-      expect(web.definitions.map((t) => t['name']), ['web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info']);
+    test('open, read, act, eval, info, screenshot, history, configure', () async {
+      final web = WebTools(ws, maxImageWidth: 512, userAgent: 'safari', languages: ['ko-KR', 'en']);
+      expect(web.definitions.map((t) => t['name']),
+          ['web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info', 'web_history', 'web_configure']);
       expect(web.handles('web_act'), isTrue);
       final opened = await web.call('web_open', {'url': '/tmp/web/index.html', 'timeout_seconds': 120});
       expect(opened, allOf(contains('Dart 시험'), contains('# Web tools'), contains('button: Greet'), contains('Second page')));
@@ -315,6 +317,23 @@ void main() {
       final png = base64.decode((shot.first['source'] as Map)['data'] as String);
       expect(png.sublist(1, 4), 'PNG'.codeUnits);
       expect(await web.call('web_act', {'action': 'fly'}), startsWith('Error:'));
+      // a JavaScript file, the history, the settings it started with and changes to them
+      expect(await web.call('web_eval', {'file': '/tmp/web/probe.js', 'args': ['a', 'b']}), contains('a+b Second'));
+      expect(await web.call('web_eval', {}), startsWith('Error:'));
+      expect(await web.call('web_history', {}), allOf(contains('Dart 시험'), contains('<file:///tmp/web/second.html>')));
+      expect(await web.call('web_history', {'filter': 'second'}), isNot(contains('index.html')));
+      expect(await web.call('web_eval', {'script': 'navigator.userAgent + " " + navigator.language'}),
+          allOf(contains('Macintosh'), contains('ko-KR')));
+      final settings = await web.call('web_configure', {
+        'user_agent': 'chrome',
+        'headers': {'X-Probe': '1'},
+        'cookies': ['flavor=choco; Domain=example.com'],
+        'reload': true,
+      });
+      expect(settings, allOf(contains('user agent: chrome'), contains('X-Probe: 1'), contains('set 1 cookie'), contains('ko-KR')));
+      expect(await web.call('web_eval', {'script': 'navigator.userAgent + " " + navigator.platform'}),
+          allOf(contains('Chrome/'), contains('Win32')));
+      expect(await web.call('web_configure', {'user_agent': 'nonsense\nua'}), contains('Error'));
     }, skip: hasWpe ? false : 'the runtime has no wpe add-on', timeout: const Timeout(Duration(minutes: 5)));
   });
 }

@@ -68,6 +68,14 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
     { grep -E "^futex-" <<<"$out"; echo "FAIL: a futex wake reached another process (addons/mod/0008)"; exit 1; }
   echo "futex wake stays in its process"
 
+  echo "== guest boot: a program's trap ends it with SIGSEGV, a thread's ends its whole process; the machine goes on"
+  python3 "$T/test_traps.py" >"$progs/traps.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/traps.txt" | head -40; echo "FAIL: guest traps (addons/mod/0009, 0010)"; exit 1; }
+  tail -1 "$progs/traps.txt"
+
+  echo "== guest boot: dlopen of a shared library (functions, data, TLS, threads, setjmp)"
+  python3 "$T/test_dlopen.py" >"$progs/dlopen.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/dlopen.txt" | head -40; echo "FAIL: dlopen (addons/mod/0019, 0020)"; exit 1; }
+  tail -1 "$progs/dlopen.txt"
+
   echo "== engine logs: network log, command log (every exec in the guest), line limit, size limit, rotation"
   python3 "$T/test_logs.py" >"$progs/logs.txt" 2>&1 || { grep -A2 "^FAIL" "$progs/logs.txt"; echo "FAIL: engine logs"; exit 1; }
   tail -1 "$progs/logs.txt"

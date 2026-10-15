@@ -19,12 +19,14 @@ const EINVAL: i32 = -22;
 const ENOSYS: i32 = -38;
 const ENOEXEC: i32 = -8;
 
-/// The program a thread is running: its module and its memory.
+/// The program a thread is running: its module and its memory, and the libraries it loaded
+/// (dlopen: dylink.rs), shared by the threads of the process.
 #[derive(Clone)]
 pub struct UserContext {
     pub module: Module,
     pub memory: SharedMemory,
     pub maximum_pages: u64,
+    pub dylink: std::sync::Arc<crate::dylink::Process>,
 }
 
 /// Per-thread userspace state.
@@ -40,6 +42,8 @@ pub struct User {
     generation: u64,
     /// One slot per nested SA_SIGINFO handler; the trampoline's `copy_siginfo` result.
     siginfo_results: Vec<Option<i32>>,
+    /// This thread's instances of the process's libraries (dlopen).
+    pub dylink: crate::dylink::Thread,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -75,6 +79,29 @@ impl std::fmt::Display for UserTrapped {
 }
 impl std::error::Error for UserTrapped {}
 
+/// An exception the program threw and nothing caught (a C++ `throw` with no handler left — on
+/// WebAssembly no search phase calls std::terminate first —, or a longjmp to no setjmp): it
+/// leaves the program's code as wasmtime's `ThrownException`, which ends the program as a trap
+/// does. [`uncaught`] makes it this error and takes the exception off the store.
+#[derive(Debug)]
+pub struct UncaughtException;
+impl std::fmt::Display for UncaughtException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "an exception nothing caught")
+    }
+}
+impl std::error::Error for UncaughtException {}
+
+/// A `ThrownException` out of the program's code as [`UncaughtException`], its exception taken
+/// off the store (the next call must not find it pending); other errors as they are.
+fn uncaught(mut store: impl AsContextMut<Data = HostState>, error: anyhow::Error) -> anyhow::Error {
+    if !error.is::<wasmtime::ThrownException>() {
+        return error;
+    }
+    store.as_context_mut().take_pending_exception();
+    anyhow!(UncaughtException)
+}
+
 /// The kernel failed inside a guest program's system call: not the program's fault, and the
 /// machine cannot go on.
 #[derive(Debug)]
@@ -91,12 +118,17 @@ fn is_user_trap(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| cause.is::<KernelFailed>()) {
         return false;
     }
-    error.chain().any(|cause| cause.is::<UserTrapped>()) || error.downcast_ref::<wasmtime::Trap>().is_some()
+    error.chain().any(|cause| cause.is::<UserTrapped>() || cause.is::<UncaughtException>())
+        || error.downcast_ref::<wasmtime::Trap>().is_some()
 }
 
 /// Says on the host's stderr why a guest program ended (the guest itself sees SIGSEGV): the
 /// trap, then the innermost frames of the program, repeats (a runaway recursion) collapsed.
 fn report_user_trap(error: &anyhow::Error) {
+    if error.chain().any(|cause| cause.is::<UncaughtException>()) {
+        eprintln!("[collabo-core] a guest program threw an exception nothing caught and was ended (SIGSEGV)");
+        return;
+    }
     let causes: Vec<String> = error.chain().skip(1).map(|cause| cause.to_string()).collect();
     let mut text = format!("[collabo-core] a guest program trapped and was ended (SIGSEGV): {}", causes.join(": "));
     if let Some(trace) = error.downcast_ref::<wasmtime::WasmBacktrace>() {
@@ -227,7 +259,7 @@ pub fn compile_end(state: &mut HostState, rlimit_pages: u32) -> i32 {
             return ENOMEM;
         }
     };
-    state.user.pending_context = Some(UserContext { module, memory, maximum_pages: maximum });
+    state.user.pending_context = Some(UserContext { module, memory, maximum_pages: maximum, dylink: crate::dylink::Process::new() });
     0
 }
 
@@ -278,6 +310,10 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
         "linux",
         "syscall",
         move |mut caller: Caller<'_, HostState>, nr: i32, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32| -> Result<i32> {
+            // dlopen's calls, which the engine answers itself (dylink.rs)
+            if let Some(result) = crate::dylink::syscall(&mut caller, nr, [a0, a1, a2, a3, a4]) {
+                return result;
+            }
             let before = caller.data().user.generation;
             // A trap of the program's own signal handler (UserTrapped) or an exec (HaltUser) passes
             // through; anything else failed in the kernel.
@@ -314,6 +350,8 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
     let state = context.data_mut();
     state.user.instance = Some(instance);
     state.user.generation += 1;
+    // a new instance has none of the process's libraries yet: it catches up when it first syncs
+    state.user.dylink = crate::dylink::Thread::default();
     Ok(())
 }
 
@@ -349,7 +387,7 @@ pub fn call(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
             Entry::Function { function, arg } => table_function(store.as_context_mut(), &instance, function)
                 .and_then(|function| call_dynamic(store.as_context_mut(), function, &[Val::I32(arg as i32)])),
         };
-        match outcome {
+        match outcome.map_err(|error| uncaught(store.as_context_mut(), error)) {
             // A program that returns instead of exiting is a bug in the program, not the host.
             Ok(()) => return Ok(()),
             Err(error) if error.chain().any(|cause| cause.is::<HaltUser>()) => continue,
@@ -450,13 +488,18 @@ pub fn link(linker: &mut Linker<HostState>) -> Result<()> {
 pub fn call_signal_handler(mut store: impl AsContextMut<Data = HostState>, function: u32, signal: i32) -> Result<()> {
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let handler = table_function(store.as_context_mut(), &instance, function)?;
-    call_dynamic(store.as_context_mut(), handler, &[Val::I32(signal)]).map_err(mark_user_trap)
+    let called = call_dynamic(store.as_context_mut(), handler, &[Val::I32(signal)]);
+    called.map_err(|error| mark_user_trap(uncaught(store.as_context_mut(), error)))
 }
 
 /// A trap of the program's code called from inside the kernel (a signal handler) is still the
-/// program's: marked so that it unwinds to [`call`] instead of failing the kernel.
+/// program's: marked so that it unwinds to [`call`] instead of failing the kernel. So is an
+/// exception the handler did not catch: as a plain error (not wasmtime's `ThrownException`) it
+/// unwinds the kernel's frames like a trap, rather than land in code the signal interrupted with
+/// the kernel half way through delivering it.
 fn mark_user_trap(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<wasmtime::Trap>().is_some() && !error.chain().any(|cause| cause.is::<KernelFailed>()) {
+    let own = error.downcast_ref::<wasmtime::Trap>().is_some() || error.is::<UncaughtException>();
+    if own && !error.chain().any(|cause| cause.is::<KernelFailed>()) {
         error.context(UserTrapped)
     } else {
         error
@@ -467,7 +510,8 @@ pub fn call_siginfo_handler(mut store: impl AsContextMut<Data = HostState>, tram
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let entry = table_function(store.as_context_mut(), &instance, trampoline)?;
     store.as_context_mut().data_mut().user.siginfo_results.push(None);
-    let called = call_dynamic(store.as_context_mut(), entry, &[Val::I32(function), Val::I32(signal)]).map_err(mark_user_trap);
+    let called = call_dynamic(store.as_context_mut(), entry, &[Val::I32(function), Val::I32(signal)]);
+    let called = called.map_err(|error| mark_user_trap(uncaught(store.as_context_mut(), error)));
     let result = store.as_context().data().user.siginfo_results.last().copied().flatten().unwrap_or(EINVAL);
     // The kernel's own cleanup must run even if the handler unwound.
     let kernel = store.as_context().data().kernel_instance.context("the kernel instance is gone")?;
@@ -489,5 +533,10 @@ pub fn copy_context(engine: &wasmtime::Engine, context: &UserContext) -> Result<
     for (index, cell) in source.iter().enumerate() {
         unsafe { *destination[index].get() = *cell.get() };
     }
-    Ok(UserContext { module: context.module.clone(), memory: copy, maximum_pages: context.maximum_pages })
+    Ok(UserContext {
+        module: context.module.clone(),
+        memory: copy,
+        maximum_pages: context.maximum_pages,
+        dylink: context.dylink.fork(),
+    })
 }

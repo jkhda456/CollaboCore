@@ -417,7 +417,9 @@ class _GuiError implements Exception {
 /// there, as LLM tools. A browser starts by itself on the first call (the first start in a
 /// sandbox takes about a minute: the engine compiles it). Pages come back as text with every
 /// link, button and field numbered, which the other tools take as targets; screenshots come back
-/// as image blocks.
+/// as image blocks. [userAgent], [headers] and [languages] are what the browser starts with; the
+/// agent changes them with `web_configure` (for sites that turn the browser away or want a header,
+/// a language, a cookie).
 ///
 /// ```dart
 /// final web = WebTools(sandbox);
@@ -426,7 +428,13 @@ class _GuiError implements Exception {
 /// final content = await web.callContent(block['name'], block['input']);  // tool_result content blocks
 /// ```
 class WebTools {
-  WebTools(this.sandbox, {this.browser = 'web', this.maxPageChars = 30000, this.maxImageWidth = 1280});
+  WebTools(this.sandbox,
+      {this.browser = 'web',
+      this.maxPageChars = 30000,
+      this.maxImageWidth = 1280,
+      this.userAgent,
+      this.headers = const {},
+      this.languages = const []});
 
   final CollaboCore sandbox;
 
@@ -438,7 +446,20 @@ class WebTools {
   final int maxPageChars;
   final int maxImageWidth;
 
-  static const _names = {'web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info'};
+  /// What the browser says it is when it starts: a profile (`safari`, `chrome`, `edge`, `firefox`,
+  /// `iphone`, `android`, `default`) or a User-Agent string. Null: its own (WebKit on Linux).
+  final String? userAgent;
+
+  /// Headers the browser starts putting on every request it makes (name → value).
+  final Map<String, String> headers;
+
+  /// The browser's first preferred languages, e.g. `['ko-KR', 'en']` (Accept-Language,
+  /// navigator.languages).
+  final List<String> languages;
+
+  static const _names = {
+    'web_open', 'web_read', 'web_act', 'web_eval', 'web_screenshot', 'web_info', 'web_history', 'web_configure' //
+  };
 
   bool handles(String name) => _names.contains(name);
 
@@ -500,12 +521,19 @@ class WebTools {
         },
         {
           'name': 'web_eval',
-          'description': 'Run JavaScript in the page and return its result (JSON). For reading what web_read does not '
-              'show, or checking state; prefer web_act for acting.',
+          'description': 'Run JavaScript in the page and return its result (JSON): a script, or a JavaScript file in the '
+              'sandbox. For reading what web_read does not show, or checking state; prefer web_act for acting.',
           'input_schema': {
             'type': 'object',
-            'properties': {'script': {'type': 'string', 'description': 'An expression or statements; the last value is returned.'}},
-            'required': ['script'],
+            'properties': {
+              'script': {'type': 'string', 'description': 'An expression or statements; the last value is returned.'},
+              'file': {
+                'type': 'string',
+                'description': 'Instead of script: a .js file in the sandbox, run as the body of an async function: '
+                    '`return` gives the result, `await` works, `args` holds the arguments.',
+              },
+              'args': {'type': 'array', 'items': {'type': 'string'}, 'description': 'file: its arguments (strings)'},
+            },
           },
         },
         {
@@ -517,6 +545,50 @@ class WebTools {
           'name': 'web_info',
           'description': 'The browser\'s state: address, title, loading, history, size, the last error or dialog.',
           'input_schema': {'type': 'object', 'properties': <String, Object?>{}},
+        },
+        {
+          'name': 'web_history',
+          'description': 'The pages the browser visited, oldest first: time, title and address. To find a page seen '
+              'before (web_open its address).',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'max': {'type': 'integer', 'description': 'The last this many (default 30).'},
+              'filter': {'type': 'string', 'description': 'Only those whose address or title has this text.'},
+            },
+          },
+        },
+        {
+          'name': 'web_configure',
+          'description': 'Change how the browser presents itself, for sites that turn it away (an unsupported browser, a '
+              'mobile or desktop only site) or want a header, a language or a cookie. Applies from the next request '
+              '(reload: the current page again with it). Returns the browser\'s settings.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'user_agent': {
+                'type': 'string',
+                'description': 'A profile: safari (the same engine: the closest match), chrome, edge, firefox, iphone, '
+                    'android, default (WebKit on Linux); or a whole User-Agent string. The page\'s navigator follows it.',
+              },
+              'headers': {
+                'type': 'object',
+                'additionalProperties': {'type': 'string'},
+                'description': 'Headers to put on every request (name → value; an empty value takes that header off).',
+              },
+              'header_host': {'type': 'string', 'description': 'headers and remove_headers: only for this host and its subdomains'},
+              'remove_headers': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Headers set before to stop adding.'},
+              'languages': {'type': 'string', 'description': 'Preferred languages, e.g. "ko-KR,en" (Accept-Language, navigator.languages).'},
+              'cookies': {
+                'type': 'array',
+                'items': {'type': 'string'},
+                'description': 'Cookies to set: "name=value; Domain=example.com; Path=/; Secure" or "a=1; b=2"; for the '
+                    'current page\'s site unless cookie_url says.',
+              },
+              'cookie_url': {'type': 'string', 'description': 'The site the cookies are for.'},
+              'reload': {'type': 'boolean', 'description': 'Reload the current page afterwards.'},
+            },
+          },
         },
       ];
 
@@ -536,9 +608,23 @@ class WebTools {
         case 'web_act':
           return [_text(await _web(_actArgs(input), timeout: const Duration(seconds: 120), allowFailure: true))];
         case 'web_eval':
-          return [_text(await _web(['eval', input['script'] as String], allowFailure: true))];
+          final file = input['file'] as String?;
+          if (file != null) {
+            final args = [for (final a in (input['args'] as List?) ?? const []) '$a'];
+            return [_text(await _web(['run', file, ...args], timeout: const Duration(minutes: 3), allowFailure: true))];
+          }
+          final script = input['script'] as String? ?? (throw _GuiError('web_eval needs a script or a file'));
+          return [_text(await _web(['eval', script], allowFailure: true))];
         case 'web_info':
           return [_text(await _web(['info']))];
+        case 'web_history':
+          final filter = input['filter'] as String?;
+          return [
+            _text(await _web(['history', '${(input['max'] as int?) ?? 30}', if (filter != null && filter.isNotEmpty) filter],
+                allowFailure: true))
+          ];
+        case 'web_configure':
+          return [_text(await _configure(input))];
         case 'web_screenshot':
           await _web(['info']); // a browser must be there
           final r = await sandbox.exec(['gui', 'screenshot', browser, '--idle', '300', '-o', '-', '--max-width', '$maxImageWidth']);
@@ -586,10 +672,43 @@ class WebTools {
     };
   }
 
+  /// web_configure: each change, then the settings (and failures as they come)
+  Future<String> _configure(Map<String, Object?> input) async {
+    final out = <String>[];
+    Future<void> step(List<String> args, {bool always = false, Duration? timeout}) async {
+      final r = await _web(args, allowFailure: true, timeout: timeout ?? const Duration(minutes: 1));
+      if (always || r.startsWith('Error')) out.add(r);
+    }
+
+    final host = input['header_host'] as String?;
+    final scope = [if (host != null && host.isNotEmpty) ...['--host', host]];
+    if (input['user_agent'] != null) await step(['ua', input['user_agent'] as String]);
+    for (final e in ((input['headers'] as Map?) ?? const {}).entries) {
+      await step(['header', 'set', '${e.key}', '${e.value}', ...scope]);
+    }
+    for (final name in (input['remove_headers'] as List?) ?? const []) {
+      await step(['header', 'unset', '$name', ...scope]);
+    }
+    if (input['languages'] != null) await step(['lang', input['languages'] as String]);
+    final cookies = [for (final c in (input['cookies'] as List?) ?? const []) '$c'];
+    final url = input['cookie_url'] as String?;
+    if (cookies.isNotEmpty) await step(['cookie', 'set', ...cookies, if (url != null) ...['--url', url]], always: true);
+    if (input['reload'] == true) await step(['reload'], always: true, timeout: const Duration(minutes: 11));
+    out.add(await _web(['settings']));
+    return out.join('\n');
+  }
+
   Map<String, Object?> _text(String t) => {'type': 'text', 'text': t.isEmpty ? '(no output)' : t};
 
+  /// what the browser starts with (`web` passes its environment on to a browser it starts)
+  Map<String, String> get _env => {
+        if (userAgent != null) 'WEB_USER_AGENT': userAgent!,
+        if (headers.isNotEmpty) 'WEB_HEADERS': headers.entries.map((e) => '${e.key}: ${e.value}').join('\n'),
+        if (languages.isNotEmpty) 'WEB_LANG': languages.join(','),
+      };
+
   Future<String> _web(List<String> args, {Duration timeout = const Duration(minutes: 11), bool allowFailure = false}) async {
-    final r = await sandbox.exec(['web', '-n', browser, ...args], timeout: timeout);
+    final r = await sandbox.exec(['web', '-n', browser, ...args], env: _env, timeout: timeout);
     if (!r.ok && !allowFailure) {
       final err = r.stderrText.trim();
       throw _GuiError(err.startsWith('web: ') ? err.substring(5) : (err.isEmpty ? 'web ${args.first} failed (${r.exitCode})' : err));

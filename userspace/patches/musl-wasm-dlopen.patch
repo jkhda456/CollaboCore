@@ -1,0 +1,589 @@
+wasm32: dlopen through the collaboCore engine (side modules), and floating-point flags in software
+
+dlopen, dlsym and the rest for WebAssembly side modules (wasm-ld -shared --experimental-pic):
+src/ldso/wasm32/dlopen.c reads the library, allocates its memory and asks the engine to
+compile, link and instantiate it (dylink calls: syscalls 0x7d000000 and up, which the engine
+answers and a host without them leaves to the kernel's ENOSYS); every other thread instantiates
+it too before it runs any of its code (__dl_sync: at thread start, and when it takes a mutex). And
+fenv: WebAssembly has no exception flags, so feraiseexcept/fetestexcept keep them per thread
+in software (what a program raises itself, it sees again). And the library built with default
+visibility, which musl's own hidden attributes narrow to its interface: what -rdynamic exports.
+
+
+diff --git a/arch/wasm32/arch.mak b/arch/wasm32/arch.mak
+index 52e2267..03aea5a 100644
+--- a/arch/wasm32/arch.mak
++++ b/arch/wasm32/arch.mak
+@@ -1,5 +1,9 @@
+ CC = clang
+ CFLAGS += --target=wasm32 -matomics -mbulk-memory
++# clang's WebAssembly target makes symbols hidden by default; musl marks its internals hidden
++# itself, so with default visibility a program linked to load libraries (-rdynamic, which exports
++# what is not hidden) exports the C library's interface and nothing else.
++CFLAGS += -fvisibility=default
+ LDFLAGS =
+ CROSS_COMPILE = llvm-
+ LIBCC =
+diff --git a/arch/wasm32/bits/fenv.h b/arch/wasm32/bits/fenv.h
+new file mode 100644
+index 0000000..526e7da
+--- /dev/null
++++ b/arch/wasm32/bits/fenv.h
+@@ -0,0 +1,21 @@
++/* WebAssembly has no floating-point exception flags, and rounds to nearest only. The flags
++ * here are kept in software (src/fenv/wasm32/fenv.c), per thread: what feraiseexcept raises,
++ * fetestexcept sees (a library's own checks: numpy's singular matrices, its integer division
++ * by zero); the operations themselves raise none. */
++#define FE_INVALID    1
++#define FE_DIVBYZERO  4
++#define FE_OVERFLOW   8
++#define FE_UNDERFLOW  16
++#define FE_INEXACT    32
++
++#define FE_ALL_EXCEPT 61
++
++#define FE_TONEAREST  0
++
++typedef unsigned short fexcept_t;
++
++typedef struct {
++	unsigned short __flags;
++} fenv_t;
++
++#define FE_DFL_ENV      ((const fenv_t *) -1)
+diff --git a/src/fenv/wasm32/fenv.c b/src/fenv/wasm32/fenv.c
+new file mode 100644
+index 0000000..5cf565a
+--- /dev/null
++++ b/src/fenv/wasm32/fenv.c
+@@ -0,0 +1,45 @@
++#include <fenv.h>
++
++/* The exception flags in software (arch/wasm32/bits/fenv.h): WebAssembly's operations raise
++ * none, so these are what feraiseexcept raised, kept per thread as C has them. One copy for
++ * the whole program, the dynamically loaded modules included: they all call these. */
++static _Thread_local unsigned short flags;
++
++int feclearexcept(int mask)
++{
++	flags &= ~(mask & FE_ALL_EXCEPT);
++	return 0;
++}
++
++int feraiseexcept(int mask)
++{
++	flags |= mask & FE_ALL_EXCEPT;
++	return 0;
++}
++
++int fetestexcept(int mask)
++{
++	return flags & mask & FE_ALL_EXCEPT;
++}
++
++int fegetround(void)
++{
++	return FE_TONEAREST;
++}
++
++int __fesetround(int r)
++{
++	return 0;
++}
++
++int fegetenv(fenv_t *envp)
++{
++	envp->__flags = flags;
++	return 0;
++}
++
++int fesetenv(const fenv_t *envp)
++{
++	flags = envp == FE_DFL_ENV ? 0 : envp->__flags;
++	return 0;
++}
+diff --git a/src/internal/pthread_impl.h b/src/internal/pthread_impl.h
+index de2b9d8..54e3605 100644
+--- a/src/internal/pthread_impl.h
++++ b/src/internal/pthread_impl.h
+@@ -145,6 +145,11 @@ hidden void __reset_tls();
+ 
+ hidden void __membarrier_init(void);
+ hidden void __dl_thread_cleanup(void);
++#ifdef __wasm__
++/* dlopen.c: the libraries other threads loaded, instantiated in this one (a no-op without dlopen) */
++hidden void __dl_sync(void);
++extern hidden volatile unsigned __dl_gen;
++#endif
+ hidden void __testcancel();
+ hidden void __do_cleanup_push(struct __ptcb *);
+ hidden void __do_cleanup_pop(struct __ptcb *);
+diff --git a/src/ldso/wasm32/__dlsym.c b/src/ldso/wasm32/__dlsym.c
+new file mode 100644
+index 0000000..44394e0
+--- /dev/null
++++ b/src/ldso/wasm32/__dlsym.c
+@@ -0,0 +1,10 @@
++#include <dlfcn.h>
++#include "dynlink.h"
++
++hidden void *__dl_wasm_sym(void *restrict, const char *restrict);
++
++/* dlsym through the host, which knows every library's exports (dlopen.c) */
++void *__dlsym(void *restrict p, const char *restrict s, void *restrict ra)
++{
++	return __dl_wasm_sym(p, s);
++}
+diff --git a/src/ldso/wasm32/dlopen.c b/src/ldso/wasm32/dlopen.c
+new file mode 100644
+index 0000000..d863ccd
+--- /dev/null
++++ b/src/ldso/wasm32/dlopen.c
+@@ -0,0 +1,342 @@
++/* dlopen for WebAssembly guests of the collaboCore engine.
++ *
++ * A shared library is a WebAssembly module of its own (a "side module": wasm-ld -shared
++ * --experimental-pic, with a dylink.0 section), which only the host can compile and instantiate.
++ * So dlopen reads the file and gives its bytes to the host (the engine's dylink calls: below); the
++ * host links it against this program's exports (the functions, the data addresses, the C library
++ * — what a main program linked for dynamic loading exports) and the libraries loaded before
++ * it, in this program's memory, at the address dlopen allocates here, its functions appended to
++ * the program's function table.
++ *
++ * Every thread of a process is an instance of its own (with a table of its own), so every thread
++ * must instantiate every library too, at the same table positions, before it runs any of its
++ * code: __dl_sync, at the points a thread can come to code another thread loaded — when it
++ * starts (pthread_create.c), and when it takes a mutex (pthread_mutex_lock.c: the handoff of any
++ * data, a Python thread's GIL among them). It instantiates what this thread lacks, fills the table
++ * slots dlsym gave functions, and gives each library's thread-local storage its block for this
++ * thread.
++ *
++ * Libraries are never unloaded (dlclose only counts), as with musl's own dynamic linker. */
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include "dynlink.h"
++#include "pthread_impl.h"
++#include "atomic.h"
++#include "syscall.h"
++
++/* The host's dylink calls go through the syscall import, under numbers Linux has none of: the
++ * engine answers them itself, and a host that cannot load libraries passes them on to the kernel,
++ * which answers ENOSYS. (Not imports of their own: a program that has dlopen — the Python
++ * interpreter — would not run at all on such a host.) */
++#define DYLINK_SYSCALL 0x7d000000
++enum { DL_LOAD, DL_NEEDED, DL_INSTANTIATE, DL_INIT, DL_SYM, DL_SYNC, DL_INIT_TLS, DL_ERROR };
++
++struct dylink_info {
++	unsigned mem_size, mem_align, table_size, needed;
++};
++
++static int __dylink_load(const void *bytes, size_t len, struct dylink_info *info)
++{ return __syscall(DYLINK_SYSCALL + DL_LOAD, bytes, len, info); }
++static int __dylink_needed(int id, int i, char *buf, size_t cap)
++{ return __syscall(DYLINK_SYSCALL + DL_NEEDED, id, i, buf, cap); }
++static int __dylink_instantiate(int id, void *memory, const char *name, size_t len, int global)
++{ return __syscall(DYLINK_SYSCALL + DL_INSTANTIATE, id, memory, name, len, global); }
++static int __dylink_init(int handle)
++{ return __syscall(DYLINK_SYSCALL + DL_INIT, handle); }
++static int __dylink_sym(int handle, const char *name, size_t len, void **out)
++{ return __syscall(DYLINK_SYSCALL + DL_SYM, handle, name, len, out); }
++static int __dylink_sync(int *out, int cap)
++{ return __syscall(DYLINK_SYSCALL + DL_SYNC, out, cap); }
++static int __dylink_init_tls(int handle, void *block)
++{ return __syscall(DYLINK_SYSCALL + DL_INIT_TLS, handle, block); }
++static int __dylink_error(char *buf, size_t cap)
++{ return __syscall(DYLINK_SYSCALL + DL_ERROR, buf, cap); }
++
++struct lib {
++	struct lib *next;
++	char *name;
++	dev_t dev;
++	ino_t ino;
++	int handle;
++	int refs;
++};
++
++/* The program itself: dlopen(0, ...), and what RTLD_DEFAULT searches */
++static struct lib main_lib = { .name = "", .handle = 0, .refs = 1 };
++static struct lib *libs;
++
++/* Bumped by every library loaded; a thread whose own count differs has libraries to catch up on */
++hidden volatile unsigned __dl_gen;
++static _Thread_local unsigned seen;
++
++/* recursive: a library's constructors may dlopen */
++static pthread_mutex_t lock = { ._m_type = PTHREAD_MUTEX_RECURSIVE };
++
++static void host_error(const char *what)
++{
++	char buf[512];
++	int n = __dylink_error(buf, sizeof buf - 1);
++	if (n == -ENOSYS) {
++		__dl_seterr("%s: this host cannot load shared libraries", what);
++		return;
++	}
++	if (n < 0) n = 0;
++	if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
++	buf[n] = 0;
++	__dl_seterr("%s: %s", what, n ? buf : "the host could not load it");
++}
++
++/* ── thread-local storage of the libraries, per thread ─────────────────────────────────────── */
++
++struct tls_block {
++	struct tls_block *next;
++};
++
++static pthread_key_t tls_key;
++static pthread_once_t tls_once = PTHREAD_ONCE_INIT;
++
++static void free_blocks(void *p)
++{
++	for (struct tls_block *b = p, *next; b; b = next) {
++		next = b->next;
++		free(b);
++	}
++}
++
++static void make_key(void)
++{
++	pthread_key_create(&tls_key, free_blocks);
++}
++
++/* Instantiates in this thread what it lacks, and sets up those libraries' storage here */
++static void catch_up(void)
++{
++	int out[3*16], n;
++	do {
++		n = __dylink_sync(out, 16);
++		for (int i = 0; i < n; i++) {
++			size_t size = out[3*i+1], align = out[3*i+2];
++			if (align < sizeof(void *)) align = sizeof(void *);
++			/* the block's link to the thread's others first, then the storage, aligned */
++			size_t head = (sizeof(struct tls_block) + align - 1) & -align;
++			struct tls_block *b = aligned_alloc(align, head + size);
++			if (!b) a_crash();
++			memset(b, 0, head + size);
++			if (__dylink_init_tls(out[3*i], (char *)b + head) < 0) a_crash();
++			/* freed when the thread exits (the key's destructor) */
++			pthread_once(&tls_once, make_key);
++			b->next = pthread_getspecific(tls_key);
++			pthread_setspecific(tls_key, b);
++		}
++	} while (n == 16);
++}
++
++hidden void __dl_sync(void)
++{
++	unsigned gen = __dl_gen;
++	if (seen == gen) return;
++	seen = gen;
++	catch_up();
++}
++
++/* ── loading ─────────────────────────────────────────────────────────────────────────────────── */
++
++static int read_all(int fd, void *buf, size_t len)
++{
++	for (size_t done = 0; done < len; ) {
++		ssize_t n = read(fd, (char *)buf + done, len - done);
++		if (n < 0 && errno == EINTR) continue;
++		if (n <= 0) return -1;
++		done += n;
++	}
++	return 0;
++}
++
++static int search(const char *name, char *path, size_t cap)
++{
++	const char *dirs = getenv("LD_LIBRARY_PATH");
++	const char *defaults = "/lib:/usr/local/lib:/usr/lib";
++	for (const char *list = dirs ? dirs : defaults; list; list = list == dirs ? defaults : 0) {
++		for (const char *p = list; *p; ) {
++			size_t l = strcspn(p, ":");
++			if (l && l + 1 + strlen(name) < cap) {
++				memcpy(path, p, l);
++				path[l] = '/';
++				strcpy(path + l + 1, name);
++				int fd = open(path, O_RDONLY|O_CLOEXEC);
++				if (fd >= 0) return fd;
++			}
++			p += l;
++			if (*p == ':') p++;
++		}
++	}
++	return -1;
++}
++
++static struct lib *load(const char *file, int mode, const char *origin)
++{
++	char path[PATH_MAX];
++	int fd;
++	if (strchr(file, '/')) {
++		if (strlen(file) >= sizeof path) { __dl_seterr("%s: name too long", file); return 0; }
++		strcpy(path, file);
++		fd = open(path, O_RDONLY|O_CLOEXEC);
++	} else {
++		fd = -1;
++		/* a library a library needs: beside it first */
++		if (origin) {
++			const char *slash = strrchr(origin, '/');
++			if (slash && (size_t)(slash - origin) + 1 + strlen(file) < sizeof path) {
++				memcpy(path, origin, slash - origin + 1);
++				strcpy(path + (slash - origin) + 1, file);
++				fd = open(path, O_RDONLY|O_CLOEXEC);
++			}
++		}
++		if (fd < 0) fd = search(file, path, sizeof path);
++	}
++	if (fd < 0) {
++		__dl_seterr("%s: cannot open shared object file: %s", file, strerror(errno));
++		return 0;
++	}
++	struct stat st;
++	if (fstat(fd, &st) < 0) {
++		__dl_seterr("%s: %s", path, strerror(errno));
++		close(fd);
++		return 0;
++	}
++	for (struct lib *p = libs; p; p = p->next) {
++		if (p->dev == st.st_dev && p->ino == st.st_ino) {
++			close(fd);
++			p->refs++;
++			return p;
++		}
++	}
++	if (mode & RTLD_NOLOAD) {
++		close(fd);
++		return 0;
++	}
++	void *bytes = malloc(st.st_size ? st.st_size : 1);
++	if (!bytes || read_all(fd, bytes, st.st_size) < 0) {
++		__dl_seterr("%s: cannot read it: %s", path, bytes ? strerror(errno) : "out of memory");
++		free(bytes);
++		close(fd);
++		return 0;
++	}
++	close(fd);
++	struct dylink_info info;
++	int id = __dylink_load(bytes, st.st_size, &info);
++	free(bytes);
++	if (id < 0) {
++		host_error(path);
++		return 0;
++	}
++	/* what it needs, loaded first (and global: it links against them) */
++	for (unsigned i = 0; i < info.needed; i++) {
++		char name[NAME_MAX + 1];
++		int n = __dylink_needed(id, i, name, sizeof name - 1);
++		if (n < 0 || n >= (int)sizeof name) { host_error(path); return 0; }
++		name[n] = 0;
++		if (!load(name, (mode & ~RTLD_NOLOAD) | RTLD_GLOBAL, path)) return 0;
++	}
++	size_t align = info.mem_align < sizeof(void *) ? sizeof(void *) : info.mem_align;
++	size_t size = (info.mem_size + align - 1) & -align;
++	void *memory = 0;
++	if (size) {
++		memory = aligned_alloc(align, size);
++		if (!memory) { __dl_seterr("%s: out of memory", path); return 0; }
++		memset(memory, 0, size);
++	}
++	struct lib *p = calloc(1, sizeof *p);
++	char *name = strdup(path);
++	if (!p || !name) {
++		free(p);
++		__dl_seterr("%s: out of memory", path);
++		return 0;
++	}
++	int handle = __dylink_instantiate(id, memory, path, strlen(path), !!(mode & RTLD_GLOBAL));
++	if (handle < 0) {
++		host_error(path);
++		free(p);
++		free(name);
++		return 0;
++	}
++	/* this thread has it; the others catch up (__dl_sync). This one caught up too, on the
++	 * libraries other threads loaded since its last __dl_sync: their storage, here, now */
++	a_fetch_add((volatile int *)&__dl_gen, 1);
++	seen = __dl_gen;
++	catch_up();
++	p->name = name;
++	p->dev = st.st_dev;
++	p->ino = st.st_ino;
++	p->handle = handle;
++	p->refs = 1;
++	p->next = libs;
++	libs = p;
++	/* its constructors last: they may call into what it needs, or dlopen themselves */
++	if (__dylink_init(handle) < 0) {
++		host_error(path);
++		return 0;
++	}
++	return p;
++}
++
++void *dlopen(const char *file, int mode)
++{
++	if (!file) return &main_lib;
++	__dl_sync();
++	pthread_mutex_lock(&lock);
++	struct lib *p = load(file, mode, 0);
++	pthread_mutex_unlock(&lock);
++	return p;
++}
++
++static struct lib *find(void *h)
++{
++	if (h == &main_lib) return &main_lib;
++	for (struct lib *p = libs; p; p = p->next)
++		if (p == h) return p;
++	return 0;
++}
++
++hidden int __dl_invalid_handle(void *h)
++{
++	pthread_mutex_lock(&lock);
++	struct lib *p = find(h);
++	pthread_mutex_unlock(&lock);
++	if (p) return 0;
++	__dl_seterr("Invalid library handle %p", h);
++	return 1;
++}
++
++hidden void *__dl_wasm_sym(void *restrict h, const char *restrict s)
++{
++	int handle = 0;
++	if (h != RTLD_DEFAULT && h != RTLD_NEXT) {
++		if (__dl_invalid_handle(h)) return 0;
++		handle = ((struct lib *)h)->handle;
++	}
++	__dl_sync();
++	void *addr;
++	int r = __dylink_sym(handle, s, strlen(s), &addr);
++	if (r < 0) {
++		__dl_seterr("Symbol not found: %s", s);
++		return 0;
++	}
++	if (r > 0) {
++		/* a function given a table slot: the other threads must catch up before they can call
++		 * it (the pointer reaches them as any data does, through a mutex); this one has it */
++		a_fetch_add((volatile int *)&__dl_gen, 1);
++		seen = __dl_gen;
++		catch_up();
++	}
++	return addr;
++}
+diff --git a/src/thread/pthread_create.c b/src/thread/pthread_create.c
+index fba7265..b39e342 100644
+--- a/src/thread/pthread_create.c
++++ b/src/thread/pthread_create.c
+@@ -18,6 +18,9 @@ static void dummy_0()
+ weak_alias(dummy_0, __acquire_ptc);
+ weak_alias(dummy_0, __release_ptc);
+ weak_alias(dummy_0, __pthread_tsd_run_dtors);
++#ifdef __wasm__
++weak_alias(dummy_0, __dl_sync);
++#endif
+ weak_alias(dummy_0, __do_orphaned_stdio_locks);
+ weak_alias(dummy_0, __dl_thread_cleanup);
+ weak_alias(dummy_0, __membarrier_init);
+@@ -203,6 +206,8 @@ static int start(void *p)
+ 	struct start_args *args = p;
+ #ifdef __wasm__
+ 	__wasm_init_tls(args->wasm_tls);
++	/* the libraries loaded so far (dlopen.c), before this thread runs any of their code */
++	__dl_sync();
+ #endif
+ 	int state = args->control;
+ 	if (state) {
+@@ -223,6 +228,8 @@ static int start_c11(void *p)
+ 	struct start_args *args = p;
+ #ifdef __wasm__
+ 	__wasm_init_tls(args->wasm_tls);
++	/* the libraries loaded so far (dlopen.c), before this thread runs any of their code */
++	__dl_sync();
+ #endif
+ 	int (*start)(void*) = (int(*)(void*)) args->start_func;
+ 	__pthread_exit((void *)(uintptr_t)start(args->start_arg));
+diff --git a/src/thread/pthread_mutex_lock.c b/src/thread/pthread_mutex_lock.c
+index 638d4b8..a2eb399 100644
+--- a/src/thread/pthread_mutex_lock.c
++++ b/src/thread/pthread_mutex_lock.c
+@@ -1,7 +1,20 @@
+ #include "pthread_impl.h"
+ 
++
++#ifdef __wasm__
++static void dummy_dl_sync(void) {}
++weak_alias(dummy_dl_sync, __dl_sync);
++static volatile unsigned dummy_dl_gen;
++weak_alias(dummy_dl_gen, __dl_gen);
++#endif
++
+ int __pthread_mutex_lock(pthread_mutex_t *m)
+ {
++#ifdef __wasm__
++	/* taking a mutex is how a thread comes to what another made, code another thread
++	 * loaded included (dlopen.c) */
++	if (__dl_gen) __dl_sync();
++#endif
+ 	if ((m->_m_type&15) == PTHREAD_MUTEX_NORMAL
+ 	    && !a_cas(&m->_m_lock, 0, EBUSY))
+ 		return 0;
+diff --git a/src/thread/pthread_mutex_timedlock.c b/src/thread/pthread_mutex_timedlock.c
+index 9279fc5..33ca253 100644
+--- a/src/thread/pthread_mutex_timedlock.c
++++ b/src/thread/pthread_mutex_timedlock.c
+@@ -53,8 +53,19 @@ static int pthread_mutex_timedlock_pi(pthread_mutex_t *restrict m, const struct
+ 	return e;
+ }
+ 
++
++#ifdef __wasm__
++static void dummy_dl_sync(void) {}
++weak_alias(dummy_dl_sync, __dl_sync);
++static volatile unsigned dummy_dl_gen;
++weak_alias(dummy_dl_gen, __dl_gen);
++#endif
++
+ int __pthread_mutex_timedlock(pthread_mutex_t *restrict m, const struct timespec *restrict at)
+ {
++#ifdef __wasm__
++	if (__dl_gen) __dl_sync();
++#endif
+ 	if ((m->_m_type&15) == PTHREAD_MUTEX_NORMAL
+ 	    && !a_cas(&m->_m_lock, 0, EBUSY))
+ 		return 0;
+diff --git a/src/thread/pthread_mutex_trylock.c b/src/thread/pthread_mutex_trylock.c
+index a24e7c5..20470e6 100644
+--- a/src/thread/pthread_mutex_trylock.c
++++ b/src/thread/pthread_mutex_trylock.c
+@@ -64,8 +64,19 @@ success:
+ 	return 0;
+ }
+ 
++
++#ifdef __wasm__
++static void dummy_dl_sync(void) {}
++weak_alias(dummy_dl_sync, __dl_sync);
++static volatile unsigned dummy_dl_gen;
++weak_alias(dummy_dl_gen, __dl_gen);
++#endif
++
+ int __pthread_mutex_trylock(pthread_mutex_t *m)
+ {
++#ifdef __wasm__
++	if (__dl_gen) __dl_sync();
++#endif
+ 	if ((m->_m_type&15) == PTHREAD_MUTEX_NORMAL)
+ 		return a_cas(&m->_m_lock, 0, EBUSY) & EBUSY;
+ 	return __pthread_mutex_trylock_owner(m);

@@ -1,6 +1,6 @@
 [package]
 name = "collabo-core-engine"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "collaboCore sandbox engine: runs the WebAssembly Linux kernel with wasmtime"
 license = "MIT"
@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "threads", "parallel-compilation", "std", "gc", "gc-null"] }
 wasmparser = "0.239"
+# dylink.rs: a library's imports bound to its own definitions (the version wasmtime uses)
+wasm-encoder = { version = "0.239", features = ["wasmparser"] }
 anyhow = "1"
 rand = "0.9"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }

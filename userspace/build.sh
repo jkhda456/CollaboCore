@@ -72,12 +72,12 @@ fi
 # musl: arch/wasm32/arch.mak already adds --target=wasm32 -matomics -mbulk-memory.
 if stage musl "$U/out/musl/lib/libc.a" "$U"/patches/musl-*.patch; then
   cd "$U/src/musl"
-  # Our changes (patches/musl-*.patch), applied to the pinned source after putting the files
-  # they touch back, as for busybox.
-  mapfile -t patched < <(sed -n 's#^+++ b/##p' "$U"/patches/musl-*.patch | sort -u)
-  git checkout -q HEAD -- "${patched[@]}"
+  # Our changes (patches/musl-*.patch), applied to the pinned source put back as it was (the
+  # files they add removed too: git clean leaves the build's ignored output alone).
+  git checkout -q HEAD -- . && git clean -fdq
   for p in "$U"/patches/musl-*.patch; do git apply "$p"; done
-  printf 'ARCH=wasm32\nprefix=%s\nsyslibdir=%s\nCFLAGS=\n' "$U/out/musl" "$U/out/musl" > config.mak
+  # static only (the sysroot takes the .a files; a libc.so would be no WebAssembly program's)
+  printf 'ARCH=wasm32\nprefix=%s\nsyslibdir=%s\nCFLAGS=\nSHARED_LIBS=\n' "$U/out/musl" "$U/out/musl" > config.mak
   MK=(make CC=clang-19 AR=llvm-ar-19 RANLIB=llvm-ranlib-19 "-j$(nproc)")
   "${MK[@]}" clean >/dev/null
   "${MK[@]}" >/dev/null
@@ -91,6 +91,15 @@ if stage sysroot "$U/sysroot/lib/libc.a" "$U/out/musl/lib/libc.a"; then
   cp -r "$U/kheaders/include/." "$U/sysroot/include/"; chmod -R u+w "$U/sysroot/include"
   cp -r "$U/out/musl/include/." "$U/sysroot/include/"
   cp "$U/out/musl/lib/"*.a "$U/out/musl/lib/"*.o "$U/sysroot/lib/"
+  # The C library's interface, for a program linked to load shared libraries (wasm-cc
+  # -rdynamic): every function and object it does not hide goes into the program and is exported,
+  # since its libraries may call any of it. --export, not --export-dynamic alone: a hidden copy of
+  # the same name linked first (a Rust archive's memcpy, strlen, sqrt: compiler_builtins) must be
+  # exported too. (Not the __main_* entry stubs: they would want a main() of another type. Sorted
+  # in the C locale: in others, sort -u takes __environ and environ for one line.)
+  llvm-objdump-19 -t "$U/sysroot/lib/libc.a" \
+    | awk '$2 ~ /^[gw]$/ && ($3 == "F" || $3 == "O") && !/\*UND\*/ && !/\.hidden/ && $NF !~ /^__main_/ { print "--export=" $NF }' \
+    | LC_ALL=C sort -u > "$U/sysroot/lib/libc.exports"
 fi
 
 # compiler-rt builtins, built with atomics+bulk-memory: wasm-ld refuses --shared-memory

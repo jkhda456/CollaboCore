@@ -26,7 +26,13 @@ const BUDGET: u64 = 2 << 30;
 
 /// Compiles `bytes`, or maps what an earlier machine compiled from the same bytes.
 pub fn load_or_compile(engine: &Engine, bytes: &[u8]) -> Result<Module> {
-    if bytes.len() < LARGE {
+    load_or_compile_at(engine, bytes, LARGE)
+}
+
+/// [`load_or_compile`], kept on disk from `large` bytes on (shared libraries: from a megabyte,
+/// since a process loads them every time it starts, after the program itself).
+pub fn load_or_compile_at(engine: &Engine, bytes: &[u8], large: usize) -> Result<Module> {
+    if bytes.len() < large {
         return Module::new(engine, bytes);
     }
     let Some(dir) = cache_dir() else {

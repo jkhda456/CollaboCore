@@ -2,7 +2,7 @@
 # Build CPython 3.13 for wasm32-linux (static, no fork/mmap) and pack it as python.cpio.
 #
 # The goal is the standard library as python.org ships it, minus what this platform cannot have
-# (fork, dlopen, memory mappings, a display), with pip preinstalled as python.org does:
+# (fork, memory mappings, a display), with pip preinstalled as python.org does:
 #   * every extension module whose C library ports: zlib, bz2, lzma, ssl/hashlib (OpenSSL), sqlite3,
 #     readline (over libedit) and curses (ncurses) — python/build-deps.sh; the CA bundle as
 #     /etc/ssl/cert.pem
@@ -10,6 +10,9 @@
 #   * pip, and the openai SDK and its dependencies preinstalled (python/packages.lock), including the Rust
 #     extensions pydantic-core and jiter, compiled for the guest and linked in as built-in modules
 #     (python/build-rust-toolchain.sh, python/build-native.sh)
+#   * extension modules loaded from files, as on Linux (dlopen of WebAssembly side modules, which
+#     the C library's dlopen and the engine's dylink imports provide: `wasm-cc -fPIC -shared`
+#     builds one, named <module>.cpython-313.so); the standard library's own stay built in
 #
 # Mirrors distro/distro/python/package.nix, without Nix and without root: stock clang-19 via
 # userspace/bin/wasm-cc (see docs/note.md) and a host CPython of the same minor version for the
@@ -97,13 +100,20 @@ if stage host "$HOSTPY"; then bash "$P/build-host.sh"; fi
 # lib/mmap.py stands in), _posixshmem (shared memory), _ctypes (libffi has no port for this ABI),
 # _tkinter (no display). Not built for want of their library: _dbm/_gdbm (dbm.sqlite3 and
 # dbm.dumb work) and _uuid (the uuid module works without it).
+# dlopen: the C library has it (WebAssembly side modules, through the engine), which config.site
+# (shared with the tools' builds) still denies: left out here; LINKFORSHARED=-rdynamic makes the interpreter a
+# program libraries link against: it exports its symbols and the whole C library, and its
+# function table grows (wasm-cc). Modules stay built in (MODULE_BUILDTYPE is static on wasm32).
 # Each Rust archive carries its own copy of the Rust runtime from the same sysroot: identical
 # compiler_builtins objects plus two symbols of std (rust_eh_personality, EMPTY_PANIC), so the
 # link keeps the first definition of each (--allow-multiple-definition).
 if stage configure "$P/build-wasm/Makefile" "$P/build.sh"; then
   rm -rf "$P/build-wasm"; mkdir -p "$P/build-wasm"; cd "$P/build-wasm"
-  CONFIG_SITE="$P/config.site" \
+  # config.site without its "no dlopen" (a site file overrides configure's arguments)
+  grep -v dlopen "$P/config.site" > "$P/build-wasm/config.site"
+  CONFIG_SITE="$P/build-wasm/config.site" \
   CC="$U/bin/wasm-cc" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 READELF=llvm-readelf-19 \
+  LINKFORSHARED="-rdynamic" \
   OPT="-DNDEBUG -fwrapv -O2" \
   CFLAGS="-DHAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP=1" \
   LDFLAGS="$LINK_FLAGS -Wl,--allow-multiple-definition" \

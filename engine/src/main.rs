@@ -5,6 +5,7 @@ mod addons;
 mod agent;
 mod console;
 mod devicetree;
+mod dylink;
 mod fs;
 mod hostfn;
 mod http;
