@@ -99,6 +99,8 @@ class ClaudeCodeSettings {
     this.permissionMode,
     this.appendSystemPrompt,
     this.maxTurns,
+    this.apiSkipTlsVerify,
+    this.mcpSkipTlsVerify,
   });
 
   /// Anthropic's API (or a gateway that speaks it).
@@ -129,7 +131,24 @@ class ClaudeCodeSettings {
   /// refused unless the mode or the permission rules allow it.
   final String? permissionMode;
   final String? appendSystemPrompt;
+
+  /// Model calls in one prompt before `claude` stops; 300 when null.
   final int? maxTurns;
+
+  /// true: the model's API ([baseUrl]) over https is reached without checking its certificate
+  /// (a local server's self-signed one), apart from [mcpSkipTlsVerify]. This computer then does
+  /// not add [apiKey] (a [Secret]) to those requests and refuses them: with a key, give it in the
+  /// sandbox's own settings, or turn checks off for the whole sandbox
+  /// (`NetworkPolicy.skipTlsVerify`).
+  /// `claude --api-skip-tls-verify` does the same for one run.
+  final bool? apiSkipTlsVerify;
+
+  /// true: MCP servers over https are reached without checking their certificate (a local
+  /// server's self-signed one), as `NODE_TLS_REJECT_UNAUTHORIZED=0` does for the Node CLI. This
+  /// computer makes the request and skips the check, and refuses it for a host with a [Secret]
+  /// (for a private CA, give the engine `COLLABO_CORE_CA_FILE` instead).
+  /// `claude --mcp-skip-tls-verify` does the same for one run.
+  final bool? mcpSkipTlsVerify;
 
   Map<String, Object?> toJson() => {
         'provider': provider,
@@ -141,6 +160,8 @@ class ClaudeCodeSettings {
         if (permissionMode != null) 'permissionMode': permissionMode,
         if (appendSystemPrompt != null) 'appendSystemPrompt': appendSystemPrompt,
         if (maxTurns != null) 'maxTurns': maxTurns,
+        if (apiSkipTlsVerify != null) 'apiSkipTlsVerify': apiSkipTlsVerify,
+        if (mcpSkipTlsVerify != null) 'mcpSkipTlsVerify': mcpSkipTlsVerify,
       };
 
   @override
@@ -213,6 +234,7 @@ class NetworkPolicy {
     this.secrets = const [],
     this.extraAllowedHeaders = const [],
     this.ask = false,
+    this.skipTlsVerify = false,
   });
 
   final List<String> allow;
@@ -236,6 +258,11 @@ class NetworkPolicy {
   /// Useful with a narrow [allow] list, e.g. `allow: ['api.openai.com'], ask: true`.
   final bool ask;
 
+  /// For development only: no HTTPS certificate is checked on the requests this computer makes
+  /// for the sandbox (servers with self-signed certificates, on this computer or the LAN); the
+  /// [secrets] still go. Programs that do their own TLS in the sandbox (curl, git) still check.
+  final bool skipTlsVerify;
+
   Map<String, Object?> toJson() => {
         'allow': allow,
         'deny': deny,
@@ -243,6 +270,7 @@ class NetworkPolicy {
         'secrets': [for (final s in secrets) s.toJson()],
         'extraAllowedHeaders': extraAllowedHeaders,
         'ask': ask,
+        'skipTlsVerify': skipTlsVerify,
       };
 }
 

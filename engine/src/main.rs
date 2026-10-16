@@ -64,6 +64,13 @@ Network (the guest's sockets and its request API go through the same policy):
   --secret HOST:HEADER=VALUE
                             a header the host adds to https requests to HOST (repeatable);
                             the guest never sees it, and it is never logged
+  --skip-tls-verify         check no https certificate at all, on any request the host makes
+                            for the guest (development against local servers; the app's
+                            secrets still go)
+  --allow-header NAME[,NAME...]
+                            a request header the guest may set on the request API itself,
+                            beyond accept, content-type, authorization and x-api-key
+                            (repeatable), e.g. an MCP server's own auth header
 
 Logs (none by default; FILE is appended to, each line after its UTC time; - is stderr):
   --log-network FILE        the network log: every request the guest makes ([network])
@@ -111,7 +118,7 @@ Examples (in a runtime folder):
 /// The options that take a value, so `--help` can be told from an option's value.
 const TAKES_VALUE: &[&str] = &[
     "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--gui-config", "--kernel",
-    "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--cwd", "--arg",
+    "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--allow-header", "--cwd", "--arg",
     "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate",
 ];
 
@@ -526,9 +533,14 @@ fn main() -> Result<()> {
             "--deny" => policy.deny.extend(argv.next()),
             "--no-network" => network = false,
             "--allow-loopback" => policy.allow_loopback = true,
+            "--skip-tls-verify" => policy.skip_tls_verify = true,
             "--secret" => {
                 let spec = argv.next().context("--secret needs HOST:HEADER=VALUE")?;
                 policy.secrets.push(http::parse_secret(&spec)?);
+            }
+            "--allow-header" => {
+                let spec = argv.next().context("--allow-header needs a header name")?;
+                policy.extra_headers.extend(http::parse_header_names(&spec)?);
             }
             "--log-requests" => log_requests = true,
             "--log-network" => log_network = Some(argv.next().context("--log-network needs a file (- for stderr)")?),
@@ -602,6 +614,9 @@ fn main() -> Result<()> {
     if !network {
         policy.allow.clear();
     }
+    if policy.skip_tls_verify {
+        eprintln!("collabo-core: --skip-tls-verify: https certificates are not checked (for development only)");
+    }
 
     // Each log goes where its own option says, else to --log-file; one place is opened once, so
     // two logs in one file share its size limit.
@@ -633,8 +648,9 @@ fn main() -> Result<()> {
             std::sync::Arc::new(move |event: http::Event| {
                 // The status or the error after it stays on the line however long the URL is.
                 let url = log::shorten(&event.url, URL_LIMIT);
+                let unverified = if event.unverified { " (certificate not checked)" } else { "" };
                 match (event.status, event.error) {
-                    (Some(status), _) => log(&format!("[network] {} {url} -> {status}", event.method)),
+                    (Some(status), _) => log(&format!("[network] {} {url} -> {status}{unverified}", event.method)),
                     (None, Some(error)) if event.blocked => log(&format!("[network] blocked {} {url}: {error}", event.method)),
                     (None, Some(error)) => log(&format!("[network] {} {url}: {error}", event.method)),
                     _ => {}

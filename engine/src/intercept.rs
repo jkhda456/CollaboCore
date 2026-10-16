@@ -7,6 +7,7 @@
 //!   guest ──TLS (a certificate for that host from the session CA)──▶ here
 //!         here: the request head gets the secret headers (a guest's own copy of them is dropped)
 //!   here ──TLS (verified against the real roots, for the host the guest named)──▶ the host
+//!         (not verified when the policy's skip_tls_verify, the app's development switch, is on)
 //!
 //! The session CA is made at start, lives only in this process, and the guest trusts it
 //! (/etc/ssl/cert.pem gets it at boot). Every other host's TLS still goes end to end untouched;
@@ -48,6 +49,8 @@ pub struct Interceptor {
     ca_pem: String,
     server: Arc<rustls::ServerConfig>,
     client: Arc<rustls::ClientConfig>,
+    /// The policy's skip_tls_verify: the real host's certificate is not checked.
+    unchecked: Arc<rustls::ClientConfig>,
     policy: Arc<RwLock<Policy>>,
     observer: Option<Observer>,
 }
@@ -121,16 +124,23 @@ impl Interceptor {
             .with_cert_resolver(Arc::new(certificates));
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        let mut client = rustls::ClientConfig::builder_with_provider(provider)
+        let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()?
             .with_root_certificates(root_store()?)
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut unchecked = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
+            .with_no_client_auth();
+        unchecked.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         Ok(Arc::new(Interceptor {
             ca_pem: ca.pem(),
             server: Arc::new(server),
             client: Arc::new(client),
+            unchecked: Arc::new(unchecked),
             policy,
             observer,
         }))
@@ -229,7 +239,8 @@ impl Interceptor {
             let socket = TcpStream::connect_timeout(&destination, Duration::from_secs(10))?;
             socket.set_read_timeout(Some(IDLE))?;
             let name = ServerName::try_from(host.clone())?;
-            let mut upstream = rustls::StreamOwned::new(rustls::ClientConnection::new(self.client.clone(), name)?, socket);
+            let client = if policy.skip_tls_verify { &self.unchecked } else { &self.client };
+            let mut upstream = rustls::StreamOwned::new(rustls::ClientConnection::new(client.clone(), name)?, socket);
             upstream.write_all(out_head.as_bytes())?;
             copy_body(&mut reader, &mut upstream, if chunked { Body::Chunked } else { Body::Length(length.unwrap_or(0)) })?;
             upstream.flush()?;
@@ -277,6 +288,46 @@ impl Interceptor {
         guest.conn.send_close_notify();
         let _ = guest.flush();
         copied
+    }
+}
+
+/// Takes any certificate (skip_tls_verify); the handshake's signatures are still checked with
+/// the key it holds.
+#[derive(Debug)]
+struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 

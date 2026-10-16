@@ -465,6 +465,28 @@ print(data.split(b'\\r\\n\\r\\n', 1)[1].decode())"`);
     const pinned = await c.sh(`curl -sS --cacert /tmp/test-ca.pem --resolve localhost:${HTTPS_PORT}:192.0.2.1 https://localhost:${HTTPS_PORT}/`);
     assert.notEqual(pinned.exitCode, 0);
   });
+  test("skipTlsVerify, the app's development switch: no certificate is checked, for the request API or the guest's own TLS", async () => {
+    // An engine that does not know the test CA: the local server's certificate is then one it
+    // cannot check, as a self-signed one is.
+    const d = new Client();
+    await d.call("start", { config: { cpus: 1, quiet: true, python: false,
+      network: { allow: ["localhost"], allowHostLoopback: true, secrets: [{ host: "localhost", header: "x-api-key", value: SECRET }] } } });
+    try {
+      const hfetch = () => d.sh(`hfetch https://localhost:${HTTPS_PORT}/unchecked`);
+      const curl = () => d.sh(`curl -sS -w ' %{http_code}' --resolve localhost:${HTTPS_PORT}:192.0.2.1 https://localhost:${HTTPS_PORT}/unchecked-curl`);
+      assert.match((await hfetch()).stderr, /invalid peer certificate/);
+      assert.equal((await curl()).stdout, " 502");
+      await d.call("policy.update", { network: { skipTlsVerify: true } });
+      const h = await hfetch();
+      assert.deepEqual(JSON.parse(h.stdout), { path: "/unchecked", hasKey: true, sawKeyHeader: true }, h.stderr);
+      const k = await curl();
+      assert.equal(k.stdout, JSON.stringify({ path: "/unchecked-curl", hasKey: true, sawKeyHeader: true }) + " 200", k.stderr);
+      assert.ok(d.events.some((e) => e.event === "network" && e.via === "api" && e.url === `https://localhost:${HTTPS_PORT}/unchecked` && e.tlsVerified === false && e.status === 200));
+    } finally {
+      await d.call("stop").catch(() => {});
+      await d.exited;
+    }
+  });
   test("ssh signs with a key that stays in the host's ssh-agent, once the app says yes", { skip: !SSH && "no sshd/ssh-agent on this computer" }, async () => {
     const asked = [];
     answers["ssh-agent"] = (target) => (asked.push(target), true);

@@ -26,11 +26,11 @@ use std::process::Command;
 /// Engine options that take a value, by the name launcher.conf uses.
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
-    "arg", "allow", "deny", "secret", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
+    "arg", "allow", "deny", "secret", "allow-header", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
     "log-exec-kinds", "log-max-size", "log-rotate",
 ];
 /// Engine options that are flags.
-const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "log-requests", "no-raw"];
+const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "skip-tls-verify", "log-requests", "no-raw"];
 /// The keys whose value is a host path, relative to the runtime folder.
 const PATH_KEYS: &[&str] =
     &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-network", "log-exec", "log-file"];
@@ -52,7 +52,7 @@ Usage:
 
 launcher.conf (beside this program): `key = value` per line, `#` for comments.
   <option> = VALUE    an engine option without its dashes, e.g. mount = work:/work (repeatable)
-  <flag> = yes|no     no-network, allow-loopback, log-requests, no-raw
+  <flag> = yes|no     no-network, allow-loopback, skip-tls-verify, log-requests, no-raw
   python = off        leave out the CPython overlay; tools = off: curl, ssh, git
   command = CMD...    run one command in the guest instead of the shell
   bin = DIR           the folder collabo-core-engine is in (default: bin beside this program)
@@ -433,11 +433,13 @@ mod tests {
              mount = ~/proj:/proj:ro   # read-only\n\
              cpus = 4\n\
              no-network = yes\n\
+             skip-tls-verify = yes\n\
              log-requests = no\n\
              log-network = logs/network.log\n\
              log-exec = -\n\
              log-file = logs/all.log\n\
              log-max-size = 10M\n\
+             allow-header = x-auth-token\n\
              python = off\n\
              addon-config = claude-code:apiKey=${KEY}\n\
              command = sh -c 'echo # not a comment'\n",
@@ -449,8 +451,8 @@ mod tests {
             conf.args,
             [
                 "--mount", "/rt/work:/work", "--mount", "/home/me/proj:/proj:ro", "--cpus", "4",
-                "--no-network", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
-                "--log-file", "/rt/logs/all.log", "--log-max-size", "10M", "--addon-config",
+                "--no-network", "--skip-tls-verify", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
+                "--log-file", "/rt/logs/all.log", "--log-max-size", "10M", "--allow-header", "x-auth-token", "--addon-config",
                 "claude-code:apiKey=sk-1",
             ]
         );

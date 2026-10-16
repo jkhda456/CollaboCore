@@ -395,6 +395,9 @@ impl Server {
                     fields.insert("blocked".into(), json!(true));
                     fields.insert("errorKind".into(), json!("denied"));
                 }
+                if event.unverified {
+                    fields.insert("tlsVerified".into(), json!(false));
+                }
                 match (event.status, event.error) {
                     (Some(status), _) => {
                         fields.insert("phase".into(), json!("response"));
@@ -970,6 +973,9 @@ fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) {
     if let Some(ask) = fields.get("ask").and_then(Value::as_bool) {
         policy.ask = ask;
     }
+    if let Some(skip) = fields.get("skipTlsVerify").and_then(Value::as_bool) {
+        policy.skip_tls_verify = skip;
+    }
     if let Some(secrets) = fields.get("secrets").and_then(Value::as_array) {
         policy.secrets = secrets
             .iter()
@@ -1003,3 +1009,21 @@ fn redacted_network(value: Option<&Value>) -> Value {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_app_turns_certificate_checks_off_and_on() {
+        let mut policy = network_policy(Some(&json!({"allow": ["*"]})));
+        assert!(!policy.skip_tls_verify);
+        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": true})));
+        assert!(policy.skip_tls_verify);
+        // A policy.update that does not mention it leaves it as it was.
+        apply_network_policy(&mut policy, Some(&json!({"deny": ["example.com"]})));
+        assert!(policy.skip_tls_verify);
+        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": false})));
+        assert!(!policy.skip_tls_verify);
+    }
+}

@@ -8,6 +8,11 @@
 //!   request   METHOD URL\n  name: value\n  content-length: N\n  \n  <N bytes>
 //!   response  STATUS TEXT\n name: value\n  \n  <hex-length>\n<bytes>… 0\n OK\n
 //!   failure   ERROR kind: message\n    (instead of the status line, or as the trailer)
+//!
+//! `x-collabo-tls-verify: false` in the head is for the host, not the server: that request's
+//! https certificate is not checked (a local server's self-signed one), as `curl -k` does. The
+//! app's secrets are never sent on such a request. The policy's `skip_tls_verify` (the app's
+//! choice, for development) checks no certificate at all, and then the secrets do go.
 use std::io::Read;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -20,6 +25,8 @@ pub const DEFAULT_PORT: u32 = 1080;
 
 /// The only request headers the guest may set, unless the policy adds more.
 const DEFAULT_ALLOWED_HEADERS: [&str; 4] = ["accept", "content-type", "authorization", "x-api-key"];
+/// The head's one header for the host itself: `false` skips the certificate check.
+const TLS_VERIFY_HEADER: &str = "x-collabo-tls-verify";
 const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 /// fetch() has already decoded the body, so its framing headers would only mislead the guest.
 const DROPPED_RESPONSE_HEADERS: [&str; 4] = ["content-encoding", "content-length", "transfer-encoding", "connection"];
@@ -54,6 +61,9 @@ pub struct Policy {
     /// A host neither list names is asked about (the app's `permission` event, kind "network")
     /// instead of refused.
     pub ask: bool,
+    /// No https certificate is checked, on any request (and on intercept.rs's connections):
+    /// for development against local servers. The app's choice, so its secrets still go.
+    pub skip_tls_verify: bool,
 }
 
 /// Asks the app whether the guest may reach a host the lists do not name: (via "api" or "net",
@@ -71,6 +81,7 @@ impl Default for Policy {
             addon_headers: Vec::new(),
             addon_secrets: Vec::new(),
             ask: false,
+            skip_tls_verify: false,
         }
     }
 }
@@ -220,6 +231,8 @@ struct Request {
     https: bool,
     headers: Vec<(String, String)>,
     content_length: usize,
+    /// Is the server's certificate checked? (`x-collabo-tls-verify`)
+    verify_tls: bool,
 }
 
 /// Splits an http(s) URL into its host and whether it is https. Anything else is refused.
@@ -269,6 +282,7 @@ fn parse_head(text: &str, policy: &Policy) -> BridgeResult<Request> {
     let mut headers = Vec::new();
     let mut content_length = 0usize;
     let mut saw_length = false;
+    let mut verify_tls = true;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -295,6 +309,14 @@ fn parse_head(text: &str, policy: &Policy) -> BridgeResult<Request> {
             };
             continue;
         }
+        if name == TLS_VERIFY_HEADER {
+            verify_tls = match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return fail("bad-request", format!("{TLS_VERIFY_HEADER} is true or false, not {}", one_line(&value))),
+            };
+            continue;
+        }
         if !policy.allows_header(&name) {
             return fail("header-not-allowed", format!("request header \"{name}\" is not allowed"));
         }
@@ -307,7 +329,7 @@ fn parse_head(text: &str, policy: &Policy) -> BridgeResult<Request> {
     if content_length > MAX_REQUEST_BODY {
         return fail("request-too-large", format!("request body of {content_length} bytes exceeds the limit"));
     }
-    Ok(Request { method: method.to_string(), url: target.to_string(), host, https, headers, content_length })
+    Ok(Request { method: method.to_string(), url: target.to_string(), host, https, headers, content_length, verify_tls })
 }
 
 /// Reads until the blank line that ends the head, returning it and whatever followed.
@@ -358,6 +380,8 @@ pub struct Event {
     pub error: Option<String>,
     /// The policy refused it: nothing was sent.
     pub blocked: bool,
+    /// An https request whose certificate was not checked (`x-collabo-tls-verify: false`).
+    pub unverified: bool,
 }
 
 type Observer = Arc<dyn Fn(Event) + Send + Sync>;
@@ -385,11 +409,17 @@ fn root_certificates() -> Result<ureq::tls::RootCerts> {
     Ok(ureq::tls::RootCerts::from(certificates))
 }
 
-/// Serves the guest's HTTP API on `port`, one thread per request.
-pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Option<Observer>, asker: Option<Asker>) -> Result<()> {
-    let agent = ureq::Agent::new_with_config(
+/// The two agents requests go through: one that checks certificates, one that does not.
+#[derive(Clone)]
+struct Agents {
+    verified: ureq::Agent,
+    unverified: ureq::Agent,
+}
+
+fn agent(roots: ureq::tls::RootCerts, verify: bool) -> ureq::Agent {
+    ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
-            .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certificates()?).build())
+            .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).disable_verification(!verify).build())
             // Per phase rather than one deadline for the whole exchange: a model's answer streams
             // for minutes, and a local model can take minutes to start. A body that stops
             // arriving still ends, at 30 minutes.
@@ -402,14 +432,20 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
             // 404 is an answer, not a failure: the guest gets the status like a browser does.
             .http_status_as_error(false)
             .build(),
-    );
+    )
+}
+
+/// Serves the guest's HTTP API on `port`, one thread per request.
+pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Option<Observer>, asker: Option<Asker>) -> Result<()> {
+    let roots = root_certificates()?;
+    let agents = Agents { verified: agent(roots.clone(), true), unverified: agent(roots, false) };
     vsock.listen(port, move |stream| {
-        let (policy, agent, observer, asker) = (policy.clone(), agent.clone(), observer.clone(), asker.clone());
+        let (policy, agents, observer, asker) = (policy.clone(), agents.clone(), observer.clone(), asker.clone());
         std::thread::spawn(move || {
             // A copy: the request keeps the policy it started with, and a question to the user
             // must not hold the lock policy.update needs.
             let policy = policy.read().unwrap().clone();
-            if let Err(error) = handle(&stream, &policy, &agent, observer.as_ref(), asker.as_ref()) {
+            if let Err(error) = handle(&stream, &policy, &agents, observer.as_ref(), asker.as_ref()) {
                 eprintln!("collabo-core: http bridge: {error:#}");
             }
         });
@@ -417,14 +453,16 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
 }
 
 /// Serves one connection. Every failure is reported to the guest in the protocol's own words.
-fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: Option<&Observer>, asker: Option<&Asker>) -> Result<()> {
+fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Option<&Observer>, asker: Option<&Asker>) -> Result<()> {
     let mut head_sent = false;
     let mut blocked = false;
+    let mut unverified = false;
     let mut seen: Option<(String, String)> = None;
     let outcome = (|| -> BridgeResult<()> {
         let (text, rest) = read_head(stream)?;
         let request = parse_head(&text, policy)?;
         seen = Some((request.method.clone(), request.url.clone()));
+        unverified = request.https && (policy.skip_tls_verify || !request.verify_tls);
         let body = read_body(stream, rest, request.content_length)?;
 
         let refused = match (policy.refuses(&request.host), asker) {
@@ -445,6 +483,7 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
                     status: None,
                     error: Some(reason.clone()),
                     blocked: true,
+                    unverified,
                 });
             }
             blocked = true;
@@ -454,6 +493,17 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
         // The host's secrets replace a header of the same name the guest set: a key the app
         // configured always wins over anything from inside the sandbox.
         let secrets = policy.secrets_for(request.https, &request.host);
+        // Only the guest asked: the app did not agree to send its keys unchecked.
+        if request.https && !request.verify_tls && !policy.skip_tls_verify && !secrets.is_empty() {
+            return fail(
+                "denied",
+                format!(
+                    "the app's key for \"{}\" is only sent to a server whose certificate is checked; \
+                     for a private CA give the engine COLLABO_CORE_CA_FILE instead of {TLS_VERIFY_HEADER}: false",
+                    request.host
+                ),
+            );
+        }
         let mut builder = ureq::http::Request::builder().method(request.method.as_str()).uri(&request.url);
         for (name, value) in &request.headers {
             if secrets.iter().any(|secret| secret.header == *name) {
@@ -470,6 +520,10 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
             Err(error) => return fail("bad-request", policy.redact(&error.to_string())),
         };
 
+        let agent = match unverified {
+            true => &agents.unverified,
+            false => &agents.verified,
+        };
         let mut response = match agent.run(built) {
             Ok(response) => response,
             Err(ureq::Error::Timeout(phase)) => return fail("timeout", format!("timed out ({phase})")),
@@ -484,6 +538,7 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
                 status: Some(status.as_u16()),
                 error: None,
                 blocked: false,
+                unverified,
             });
         }
 
@@ -520,7 +575,7 @@ fn handle(stream: &VsockStream, policy: &Policy, agent: &ureq::Agent, observer: 
         let message = policy.redact(&one_line(&error.message));
         // A refusal was already reported with its reason.
         if let (Some(observer), Some((method, url)), false) = (observer, seen, blocked) {
-            observer(Event { method, url, status: None, error: Some(message.clone()), blocked: false });
+            observer(Event { method, url, status: None, error: Some(message.clone()), blocked: false, unverified });
         }
         let line = format!("ERROR {}: {message}\n", error.kind);
         // Before the head the error replaces the status line; after it, it is the trailer.
@@ -554,6 +609,18 @@ pub fn parse_secret(spec: &str) -> Result<Secret> {
         bail!("{header} is not a valid header name for a secret");
     }
     Ok(Secret { host: host.to_lowercase(), header, value: value.to_string() })
+}
+
+/// Parses `NAME[,NAME...]`, the command line spelling of extra allowed headers.
+pub fn parse_header_names(spec: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = spec.split(',').map(|name| name.trim().to_lowercase()).filter(|name| !name.is_empty()).collect();
+    if names.is_empty() {
+        bail!("--allow-header needs a header name");
+    }
+    if let Some(name) = names.iter().find(|name| !is_token(name)) {
+        bail!("{name} is not a valid header name");
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -617,6 +684,28 @@ mod tests {
         assert_eq!(parse_head("GET https://user:pw@example.com/\n", &policy).unwrap_err().kind, "bad-request");
         assert_eq!(parse_head("GET https://example.com/\ncontent-length: 5\n", &policy).unwrap_err().kind, "bad-request");
         assert_eq!(parse_head("SING https://example.com/\n", &policy).unwrap_err().kind, "bad-request");
+    }
+
+    #[test]
+    fn extra_headers_from_the_command_line() {
+        assert_eq!(parse_header_names("X-Auth-Token, cf-access-client-id").unwrap(), ["x-auth-token", "cf-access-client-id"]);
+        assert!(parse_header_names(" , ").is_err());
+        assert!(parse_header_names("x auth").is_err());
+        let policy = Policy { extra_headers: parse_header_names("x-auth-token").unwrap(), ..Policy::default() };
+        assert_eq!(parse_head("POST https://mcp.test/mcp\nX-Auth-Token: t\n", &policy).unwrap().headers, vec![("x-auth-token".to_string(), "t".to_string())]);
+        assert_eq!(parse_head("POST https://mcp.test/mcp\nx-other: t\n", &policy).unwrap_err().kind, "header-not-allowed");
+    }
+
+    #[test]
+    fn the_certificate_check_is_skipped_only_when_asked() {
+        let policy = Policy::default();
+        assert!(parse_head("GET https://example.com/\n", &policy).unwrap().verify_tls);
+        // For the host, not the server: taken out of the headers, and allowed without the list.
+        let request = parse_head("POST https://localhost:8443/mcp\nx-collabo-tls-verify: false\naccept: */*\n", &policy).unwrap();
+        assert!(!request.verify_tls);
+        assert_eq!(request.headers, vec![("accept".to_string(), "*/*".to_string())]);
+        assert!(parse_head("GET https://example.com/\nX-Collabo-TLS-Verify: true\n", &policy).unwrap().verify_tls);
+        assert_eq!(parse_head("GET https://example.com/\nx-collabo-tls-verify: no\n", &policy).unwrap_err().kind, "bad-request");
     }
 
     #[test]
