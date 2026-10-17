@@ -14,6 +14,9 @@ anyhow = "1"
 rand = "0.9"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 serde_json = "1.0.151"
+# launcher --addons get: the release's zips are deflated (the zip reader is the launcher's own).
+flate2 = "1"
+crc32fast = "1"
 # SHA-256 for ssh key fingerprints (already in the tree through rustls).
 ring = "0.17"
 # The secret-injecting TLS proxy for the packet network (intercept.rs): the same rustls and roots

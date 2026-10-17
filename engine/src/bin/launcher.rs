@@ -19,6 +19,14 @@
 //! runtime's parts: `bin = DIR` is where `collabo-core-engine` is (default `bin`), `app = DIR`
 //! the folder the manifest's `app/...` paths (images, add-ons) are in (default `app`). The
 //! manifest stays beside the launcher, and the engine still runs in the launcher's folder.
+//!
+//! `launcher --addons list` lists the add-ons of the add-on repository's latest release (marking
+//! those in the add-on folder, and naming those only there), `launcher --addons get NAME...`
+//! downloads them into it again (addons.rs). `addons-repo = URL` (or `OWNER/REPO`) in launcher.conf
+//! names another repository.
+
+#[path = "launcher/addons.rs"]
+mod addons;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,6 +56,8 @@ Usage:
   launcher --dry-run                      print the engine command line instead (secrets hidden)
   launcher --config FILE                  read FILE instead of launcher.conf (with --dry-run too;
                                           both go before the engine options)
+  launcher --addons [list]                the add-ons in the add-on repository (and which are here)
+  launcher --addons get NAME...           download those add-ons (always the latest) into this runtime
   launcher --help                         this text; bin/collabo-core-engine --help has the options
 
 launcher.conf (beside this program): `key = value` per line, `#` for comments.
@@ -57,6 +67,8 @@ launcher.conf (beside this program): `key = value` per line, `#` for comments.
   command = CMD...    run one command in the guest instead of the shell
   bin = DIR           the folder collabo-core-engine is in (default: bin beside this program)
   app = DIR           the folder images/ and the add-ons are in (default: app beside it)
+  addons-repo = URL   the GitHub release --addons uses, its API URL or OWNER/REPO (default:
+                      the latest release of jkhda456/CollaboCoreAddons)
   ~ is the home folder, ${NAME} an environment variable; relative host paths are relative to
   the config file's folder, and a mount's missing host folder there is made.
 ";
@@ -74,6 +86,8 @@ struct Conf {
     app: Option<PathBuf>,
     /// `bin = DIR`: where the engine is, when not in `bin` beside the launcher.
     bin: Option<PathBuf>,
+    /// `addons-repo = URL`: the release `--addons` lists and fetches from.
+    addons_repo: Option<String>,
 }
 
 fn parse_conf(text: &str, base: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Conf, String> {
@@ -93,6 +107,7 @@ fn parse_conf(text: &str, base: &Path, env: &dyn Fn(&str) -> Option<String>) -> 
             "command" => conf.command = split_words(&value).map_err(at)?,
             "app" => conf.app = Some(resolve(&value, base)),
             "bin" => conf.bin = Some(resolve(&value, base)),
+            "addons-repo" => conf.addons_repo = Some(addons::repo_url(&value)),
             flag if FLAG_KEYS.contains(&flag) => {
                 if yes(&value).map_err(at)? {
                     conf.args.push(format!("--{flag}"));
@@ -247,6 +262,18 @@ fn engine_args(entry: Vec<String>, conf: &Conf, extra: &[String]) -> Vec<String>
     args
 }
 
+/// The add-on folder the engine would get: the last `--addon-dir`, relative to the runtime folder.
+fn addon_dir<'a>(args: impl Iterator<Item = &'a String>, base: &Path) -> PathBuf {
+    let (mut dir, mut previous) = (DEFAULT_ADDON_DIR, "");
+    for arg in args {
+        if previous == "--addon-dir" {
+            dir = arg;
+        }
+        previous = arg;
+    }
+    resolve(dir, base)
+}
+
 /// For --dry-run: a --secret's value, and anything in `--addon-config NAME:apiKey=`, hidden.
 fn shown(args: &[String]) -> String {
     let mut out: Vec<String> = Vec::new();
@@ -265,13 +292,24 @@ fn shown(args: &[String]) -> String {
     out.join(" ")
 }
 
-/// The launcher's own options, which come first: `--dry-run` and `--config FILE` (or
-/// `--config=FILE`), in either order. The rest are the engine's.
-fn launcher_options(mut args: &[String]) -> Result<(bool, Option<PathBuf>, &[String]), String> {
+/// The launcher's own options, which come first.
+#[derive(Debug, PartialEq)]
+struct Options<'a> {
+    dry_run: bool,
+    config: Option<PathBuf>,
+    /// `--addons`: `rest` is its subcommand rather than the engine's arguments.
+    addons: bool,
+    rest: &'a [String],
+}
+
+/// `--dry-run` and `--config FILE` (or `--config=FILE`), in either order, then `--addons` and
+/// its subcommand or the engine's arguments.
+fn launcher_options(mut args: &[String]) -> Result<Options<'_>, String> {
     let (mut dry_run, mut config) = (false, None);
     loop {
         match args.first().map(String::as_str) {
             Some("--dry-run") => (dry_run, args) = (true, &args[1..]),
+            Some("--addons") => return Ok(Options { dry_run, config, addons: true, rest: &args[1..] }),
             Some("--config") => {
                 let file = args.get(1).ok_or("--config needs a file")?;
                 (config, args) = (Some(PathBuf::from(file)), &args[2..]);
@@ -279,15 +317,15 @@ fn launcher_options(mut args: &[String]) -> Result<(bool, Option<PathBuf>, &[Str
             Some(arg) if arg.starts_with("--config=") => {
                 (config, args) = (Some(PathBuf::from(&arg["--config=".len()..])), &args[1..]);
             }
-            _ => return Ok((dry_run, config, args)),
+            _ => return Ok(Options { dry_run, config, addons: false, rest: args }),
         }
     }
 }
 
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (dry_run, config, extra) = launcher_options(&argv)?;
-    if matches!(extra.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+    let Options { dry_run, config, addons, rest: extra } = launcher_options(&argv)?;
+    if !addons && matches!(extra.first().map(String::as_str), Some("-h" | "--help" | "help")) {
         print!("{USAGE}");
         return Ok(0);
     }
@@ -309,7 +347,16 @@ fn run() -> Result<i32, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !named => Conf { python: true, tools: true, ..Conf::default() },
         Err(e) => return Err(format!("{}: {e}", conf_path.display())),
     };
-    let args = engine_args(entry_args(&manifest, conf.python, conf.tools, conf.app.as_deref())?, &conf, extra);
+    let entry = entry_args(&manifest, conf.python, conf.tools, conf.app.as_deref())?;
+    if addons {
+        let place = addons::Place {
+            repo: conf.addons_repo.clone().unwrap_or_else(|| addons::DEFAULT_REPO.into()),
+            dir: addon_dir(entry.iter().chain(&conf.args), &base),
+            licenses: conf.app.clone().unwrap_or_else(|| base.join("app")).join("licenses"),
+        };
+        return addons::command(extra, &place);
+    }
+    let args = engine_args(entry, &conf, extra);
     let bin = conf.bin.clone().unwrap_or_else(|| base.join("bin"));
     let engine = bin.join(if cfg!(windows) { "collabo-core-engine.exe" } else { "collabo-core-engine" });
 
@@ -507,15 +554,32 @@ mod tests {
     fn launcher_options_come_first() {
         let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         let all = args(&["--config", "my.conf", "--dry-run", "--cpus", "1", "--config", "x"]);
-        let (dry_run, config, rest) = launcher_options(&all).unwrap();
-        assert!(dry_run);
-        assert_eq!(config, Some(PathBuf::from("my.conf")));
-        assert_eq!(rest, &all[3..]);
+        let options = launcher_options(&all).unwrap();
+        assert!(options.dry_run && !options.addons);
+        assert_eq!(options.config, Some(PathBuf::from("my.conf")));
+        assert_eq!(options.rest, &all[3..]);
         let eq = args(&["--dry-run", "--config=/c/l.conf"]);
-        assert_eq!(launcher_options(&eq).unwrap(), (true, Some(PathBuf::from("/c/l.conf")), &[][..]));
+        let options = launcher_options(&eq).unwrap();
+        assert_eq!((options.dry_run, options.config, options.rest), (true, Some(PathBuf::from("/c/l.conf")), &[][..]));
         let plain = args(&["--addon", "x"]);
-        assert_eq!(launcher_options(&plain).unwrap(), (false, None, &plain[..]));
+        assert_eq!(launcher_options(&plain).unwrap(), Options { dry_run: false, config: None, addons: false, rest: &plain[..] });
+        let get = args(&["--config", "c", "--addons", "get", "nmap"]);
+        let options = launcher_options(&get).unwrap();
+        assert!(options.addons);
+        assert_eq!((options.config, options.rest), (Some(PathBuf::from("c")), &get[3..]));
         assert!(launcher_options(&args(&["--config"])).unwrap_err().contains("needs a file"));
+    }
+
+    #[test]
+    fn addons_go_to_the_last_addon_dir() {
+        let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let base = Path::new("/rt");
+        assert_eq!(addon_dir(args(&["--kernel", "k"]).iter(), base), PathBuf::from("/rt/app/images/addons"));
+        let both = args(&["--addon-dir", "app/images/addons", "--cpus", "1", "--addon-dir", "/my/addons"]);
+        assert_eq!(addon_dir(both.iter(), base), PathBuf::from("/my/addons"));
+        let conf = parse_conf("addons-repo = me/addons\n", base, &env).unwrap();
+        assert_eq!(conf.addons_repo.as_deref(), Some("https://api.github.com/repos/me/addons/releases/latest"));
+        assert!(conf.args.is_empty());
     }
 
     #[test]
