@@ -12,6 +12,7 @@ class CollaboConfig {
     this.networkEnabled = true,
     this.hostExec = HostExecPolicy.deny,
     this.hostFunctions = const [],
+    this.serial = const SerialPolicy(),
     this.permissionTimeout = const Duration(minutes: 2),
     this.quiet = false,
     this.consoleColumns = 120,
@@ -61,6 +62,10 @@ class CollaboConfig {
   /// [CollaboCore.onHostCall] (guest: `hostcall NAME '{...}'`, python `collabo_core.host.call`).
   final List<String> hostFunctions;
 
+  /// Which of this computer's serial ports (USB serial adapters, on-board UARTs) the sandbox may
+  /// open, with the c-sh add-on's `serial:` targets. None by default.
+  final SerialPolicy serial;
+
   /// How long an "ask" permission request waits for [CollaboCore.onPermission] before refusing.
   final Duration permissionTimeout;
 
@@ -79,6 +84,7 @@ class CollaboConfig {
         'network': networkEnabled ? network.toJson() : false,
         'hostExec': hostExec.name,
         'hostFunctions': hostFunctions,
+        if (serial.mode != SerialMode.off) 'serial': serial.toJson(),
         'permissionTimeoutMs': permissionTimeout.inMilliseconds,
         'quiet': quiet,
         'consoleSize': {'cols': consoleColumns, 'rows': consoleRows},
@@ -286,6 +292,40 @@ class Secret {
 
   @override
   String toString() => 'Secret($host, $header, ***)';
+}
+
+/// Whether the sandbox may open this computer's serial ports ([CollaboConfig.serial]).
+enum SerialMode {
+  /// No serial port is reachable (the default).
+  off,
+
+  /// The [SerialPolicy.devices] listed; every other one is asked about
+  /// ([CollaboCore.onPermission], kind "serial") as it is opened.
+  ask,
+
+  /// The [SerialPolicy.devices] listed, or, when the list is empty, every serial port the system
+  /// lists (USB serial adapters, on-board ports; never a terminal or a pty, which must be named).
+  allow,
+}
+
+/// This computer's serial ports the sandbox may open (`c-sh open NAME serial:/dev/ttyUSB0`,
+/// `serial:usb:0403:6001`; `c-sh ports` lists them). A device is named by its path, a glob
+/// (`/dev/ttyUSB*`, `/dev/cu.usbserial-*`, `COM3`), or its USB identity `usb:VID:PID[:SERIAL]`
+/// in hex, which stays the same wherever the adapter is plugged in. Only terminal devices are
+/// ever opened, whatever the list says.
+///
+///   CollaboConfig(serial: SerialPolicy.allow(['usb:0403:6001']), addons: {'c-sh': {}})
+class SerialPolicy {
+  const SerialPolicy({this.mode = SerialMode.off, this.devices = const []});
+
+  const SerialPolicy.allow([List<String> devices = const []]) : this(mode: SerialMode.allow, devices: devices);
+
+  const SerialPolicy.ask([List<String> devices = const []]) : this(mode: SerialMode.ask, devices: devices);
+
+  final SerialMode mode;
+  final List<String> devices;
+
+  Map<String, Object?> toJson() => {'mode': mode.name, 'devices': devices};
 }
 
 enum HostExecPolicy {

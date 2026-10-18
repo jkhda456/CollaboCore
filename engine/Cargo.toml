@@ -28,12 +28,13 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 time = "0.3"
 
 # The host side of the guest's ping (icmp.rs): an ICMP datagram socket, or IcmpSendEcho; the host
-# terminal in raw mode (main.rs): termios, or the console modes.
+# terminal in raw mode (main.rs): termios, or the console modes; the serial ports lent to the guest
+# (serial.rs): termios and modem ioctls, or the COM port functions and the registry's list.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_Console", "Win32_Devices_Communication", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_IO"] }
 
 [profile.release]
 opt-level = 3

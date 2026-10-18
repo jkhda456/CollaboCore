@@ -33,12 +33,14 @@ class CollaboCore {
   final _execStreams = <int, void Function(String stream, Uint8List data)>{};
   final _console = StreamController<Uint8List>.broadcast();
   final _network = StreamController<NetworkEvent>.broadcast();
+  final _serial = StreamController<SerialEvent>.broadcast();
   final _diagnostics = StreamController<String>.broadcast();
   final _exit = Completer<SandboxExit>();
   final _hostFunctions = <String, HostFunction>{};
 
   /// Decides "ask" permission requests: host programs (hostExec: ask), unlisted hosts
-  /// (NetworkPolicy.ask) and ssh-agent use (sshAgent: ask). Without a handler they are refused.
+  /// (NetworkPolicy.ask), ssh-agent use (sshAgent: ask) and serial ports (SerialPolicy.ask).
+  /// Without a handler they are refused.
   PermissionHandler? onPermission;
 
   /// Starts a sandbox and returns once its guest agent accepts commands (a few seconds).
@@ -66,6 +68,9 @@ class CollaboCore {
 
   /// Every network access attempt of the sandbox.
   Stream<NetworkEvent> get networkEvents => _network.stream;
+
+  /// The sandbox's use of this computer's serial ports ([CollaboConfig.serial]).
+  Stream<SerialEvent> get serialEvents => _serial.stream;
 
   /// The runtime's own diagnostics (stderr).
   Stream<String> get diagnostics => _diagnostics.stream;
@@ -137,12 +142,14 @@ class CollaboCore {
 
   Future<void> resizeConsole(int columns, int rows) => _call('console.resize', {'cols': columns, 'rows': rows});
 
-  /// Changes network rules or host access while running; applies to the next request.
-  Future<void> updatePolicy({NetworkPolicy? network, HostExecPolicy? hostExec, List<String>? hostFunctions}) =>
+  /// Changes network rules, host access or the shared serial ports while running; applies to the
+  /// next request (a serial port already open stays open).
+  Future<void> updatePolicy({NetworkPolicy? network, HostExecPolicy? hostExec, List<String>? hostFunctions, SerialPolicy? serial}) =>
       _call('policy.update', {
         if (network != null) 'network': network.toJson(),
         if (hostExec != null) 'hostExec': hostExec.name,
         if (hostFunctions != null) 'hostFunctions': hostFunctions,
+        if (serial != null) 'serial': serial.toJson(),
       });
 
   /// Writes a mounted folder ([guestPath] as in [Mount.guestPath]) to [outFile] as a zip
@@ -196,6 +203,8 @@ class CollaboCore {
         _execStreams[message['execId']]?.call(message['stream'] as String, base64.decode(message['dataBase64'] as String));
       case 'network':
         _network.add(NetworkEvent(message));
+      case 'serial':
+        if (!_serial.isClosed) _serial.add(SerialEvent(message));
       case 'hostCall':
         unawaited(_answerHostCall(message));
       case 'permission':
@@ -243,5 +252,6 @@ class CollaboCore {
     _pending.clear();
     _console.close();
     _network.close();
+    _serial.close();
   }
 }

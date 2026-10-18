@@ -14,6 +14,7 @@ mod intercept;
 mod log;
 mod machine;
 mod protocol;
+mod serial;
 mod sshagent;
 mod module_info;
 mod net;
@@ -88,6 +89,14 @@ Logs (none by default; FILE is appended to, each line after its UTC time; - is s
                             FILE.2, ...) keeping N old files; default 0: the file is kept and
                             later lines are dropped
 
+Serial ports (the host's, for the c-sh add-on's serial: targets; none by default):
+  --serial DEVICE           share a serial device with the guest (repeatable): a path or glob
+                            (/dev/ttyUSB0, /dev/ttyACM*, COM3), usb:VID:PID[:SERIAL] in hex
+                            (the adapter wherever it is plugged in), or '*' for every serial
+                            port the system lists (a terminal or a pty only by name). Only
+                            terminal devices are ever opened; the guest lists them with
+                            `c-sh ports`
+
 GUI programs (the `gui` command in the tools image; headless until asked):
   --gui-config KEY=VALUE    a setting of the display, written to /etc/collabo/gui.json
                             (repeatable): defaultSize=1024x768, maxSize=1920x1080,
@@ -119,7 +128,7 @@ Examples (in a runtime folder):
 const TAKES_VALUE: &[&str] = &[
     "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--gui-config", "--kernel",
     "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--allow-header", "--cwd", "--arg",
-    "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate",
+    "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate", "--serial",
 ];
 
 /// Bytes of a URL a network log line keeps.
@@ -488,6 +497,7 @@ fn main() -> Result<()> {
     let mut command_kinds = CommandKinds::default();
     let mut log_limits = log::Limits::default();
     let mut raw = true;
+    let mut serial_devices: Vec<String> = Vec::new();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if wants_help(&argv) {
@@ -553,6 +563,7 @@ fn main() -> Result<()> {
                 log_limits.rotate = count.parse().with_context(|| format!("--log-rotate {count}: a number of files"))?;
             }
             "--no-raw" => raw = false,
+            "--serial" => serial_devices.push(argv.next().context("--serial needs a device (a path, a glob, usb:VID:PID[:SERIAL], or '*')")?),
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
             "--" => command.extend(argv.by_ref()),
@@ -658,6 +669,25 @@ fn main() -> Result<()> {
             })
         }),
         None,
+    )?;
+    // Host serial ports the command line shares (c-sh's serial: targets). No app to ask here:
+    // only what --serial names, or any serial device for '*'.
+    serial::serve(
+        &vsock,
+        Arc::new(std::sync::RwLock::new(serial::Policy {
+            mode: if serial_devices.is_empty() { serial::Mode::Off } else { serial::Mode::Allow },
+            devices: serial_devices,
+        })),
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        Arc::new(|_: &str| None),
+        match request_log.clone() {
+            Some(log) => Arc::new(move |event: serial::Event| {
+                let verdict = if event.allowed { "" } else { " refused" };
+                let reason = event.reason.map(|r| format!(": {r}")).unwrap_or_default();
+                log(&format!("[serial] {}{verdict} {}{reason}", event.op, event.device));
+            }),
+            None => Arc::new(|_: serial::Event| {}),
+        },
     )?;
     // The guest's shell gets this terminal, raw and at its size (not for one command: its
     // output is this process's output, and Ctrl-C ends it).

@@ -70,7 +70,10 @@ class NetworkEvent {
 ///  * [kind] "network": reach [target] ("host:port"), which the network policy does not name
 ///    (`NetworkPolicy.ask`);
 ///  * [kind] "ssh-agent": use the host's ssh-agent ([target] says for what, e.g. "sign with
-///    ED25519 SHA256:… (me@laptop)"), under `sshAgent: ask`.
+///    ED25519 SHA256:… (me@laptop)"), under `sshAgent: ask`;
+///  * [kind] "serial": open one of this computer's serial ports ([target]: "open the serial port
+///    /dev/ttyUSB0 (USB 0403:6001 FTDI FT232R USB UART, serial A50285BI)"), under
+///    `SerialPolicy.ask`.
 class PermissionRequest {
   PermissionRequest(this.raw);
   final Map<String, Object?> raw;
@@ -82,7 +85,7 @@ class PermissionRequest {
   bool get gui => raw['gui'] == true;
   String? get target => raw['target'] as String?;
 
-  /// For "network" and "ssh-agent": whether the answer also covers the next requests for the same
+  /// For "network", "ssh-agent" and "serial": whether the answer also covers the next requests for the same
   /// [target] in this session. The handler may set it to false to be asked every time.
   bool remember = true;
 
@@ -91,8 +94,29 @@ class PermissionRequest {
         'open' => 'open $target',
         'network' => 'connect to $target',
         'ssh-agent' => 'ssh-agent: $target',
+        'serial' => '$target',
         _ => '${gui ? 'start' : 'run'} ${argv.join(' ')}${cwd != null ? ' in $cwd' : ''}',
       };
+}
+
+/// The sandbox listed or opened one of this computer's serial ports, or one closed
+/// ([CollaboCore.serialEvents]).
+class SerialEvent {
+  SerialEvent(this.raw);
+  final Map<String, Object?> raw;
+
+  /// "list", "open" or "close".
+  String get op => raw['op'] as String;
+
+  /// The device's path (for open and close).
+  String? get device => raw['device'] as String?;
+
+  /// For open: whether it was opened; false with the [reason] it was not.
+  bool get allowed => raw['allowed'] == true;
+  String? get reason => raw['reason'] as String?;
+
+  @override
+  String toString() => 'SerialEvent($op ${device ?? ''}${allowed ? '' : ' REFUSED: $reason'})';
 }
 
 /// Why the sandbox stopped.

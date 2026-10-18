@@ -717,3 +717,266 @@ class WebTools {
     return r.ok ? out : 'Error (exit ${r.exitCode}): $out';
   }
 }
+
+/// Tools for terminal sessions that stay connected, with the c-sh add-on (`addons: {'c-sh': {}}`,
+/// bundled with the runtime): SSH, telnet, rlogin, raw TCP, serial lines and local programs,
+/// opened once and then driven call by call — the remote shell keeps its directory, environment
+/// and whatever program it is in. `term_run` returns a command's output and exit status;
+/// `term_input` types and presses keys; `term_screen` shows full-screen programs as text.
+///
+/// ```dart
+/// final term = TermTools(sandbox);
+/// // request body: {"tools": [...term.definitions, ...]}
+/// // for each tool_use block whose name term.handles(name):
+/// final text = await term.call(block['name'], block['input']);  // tool_result content
+/// ```
+///
+/// Passwords given to `term_open` reach `c-sh` in its environment (`--password-env`), never on a
+/// command line. For SSH with the host's keys, start the sandbox with its ssh-agent lent
+/// (`sshAgent`); the keys then stay on this computer.
+class TermTools {
+  TermTools(this.sandbox, {this.maxOutputChars = 30000, this.idleMs = 400});
+
+  final CollaboCore sandbox;
+
+  /// Longer output is cut in the middle, so the model sees both ends.
+  final int maxOutputChars;
+
+  /// After input, wait until the session has been quiet this long before returning what it
+  /// printed (at most 10 s).
+  final int idleMs;
+
+  static const _names = {
+    'term_open', 'term_run', 'term_input', 'term_read', 'term_screen', 'term_wait', 'term_list', 'term_close', 'term_ports' //
+  };
+
+  bool handles(String name) => _names.contains(name);
+
+  static const _name = {'type': 'string', 'description': 'The session\'s name (given to term_open).'};
+
+  List<Map<String, Object?>> get definitions => [
+        {
+          'name': 'term_open',
+          'description': 'Open a terminal session that stays connected between calls: SSH, telnet, rlogin, a raw TCP '
+              'port, a serial line, or a program in a terminal in the sandbox. Returns the connection details (for SSH '
+              'the host key fingerprint and whether it was new) and what the session printed first (banner, prompt).',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': {'type': 'string', 'description': 'A short name to refer to the session by, e.g. "web1".'},
+              'target': {
+                'type': 'string',
+                'description': 'ssh://user@host[:port] (or user@host), telnet://[user@]host[:port], '
+                    'rlogin://user@host, raw://host:port, serial:/dev/ttyUSB0?baud=115200&parity=none (this '
+                    'computer\'s serial ports, as term_ports lists them; serial:usb:VID:PID for a USB adapter by '
+                    'identity), or "run" (a shell in the sandbox) / "run:COMMAND" (a program in a terminal).',
+              },
+              'password': {'type': 'string', 'description': 'SSH password, or the login password for telnet/rlogin/serial.'},
+              'user': {'type': 'string', 'description': 'The user, when not in the target.'},
+              'identity': {'type': 'string', 'description': 'SSH: a private key file in the sandbox.'},
+              'command': {'type': 'string', 'description': 'SSH: run this one command instead of a shell.'},
+              'size': {'type': 'string', 'description': 'Terminal size COLSxROWS (default 120x40).'},
+              'strict_host_key': {
+                'type': 'boolean',
+                'description': 'SSH: refuse a host key not already known (default: trust a first-seen key, refuse a '
+                    'changed one).',
+              },
+            },
+            'required': ['name', 'target'],
+          },
+        },
+        {
+          'name': 'term_run',
+          'description': 'Run a command in a session and return its output and exit code, waiting for it to finish. '
+              'For shells (sh, bash, zsh, ...); state carries over between calls (cd, variables, sudo). For a '
+              'router CLI, a REPL or anything else that is not a POSIX shell, give "prompt". A command still running at '
+              'the timeout keeps running: use term_read / term_screen / term_input (e.g. keys "ctrl+c").',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': _name,
+              'command': {'type': 'string'},
+              'timeout_seconds': {'type': 'integer', 'description': 'Give up waiting after this long (default 60).'},
+              'prompt': {
+                'type': 'string',
+                'description': 'Not a POSIX shell: a regular expression the prompt line matches, e.g. "[>#] ?\$". The '
+                    'output then has no exit code.',
+              },
+            },
+            'required': ['name', 'command'],
+          },
+        },
+        {
+          'name': 'term_input',
+          'description': 'Type into a session and/or press keys, as a person at the terminal would (answer a prompt, '
+              'drive a full-screen program, interrupt). Returns what the session printed in response.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': _name,
+              'text': {'type': 'string', 'description': 'Text to type.'},
+              'enter': {'type': 'boolean', 'description': 'Press Enter after the text (default true when text is given).'},
+              'keys': {
+                'type': 'string',
+                'description': 'Keys to press after the text, separated by spaces: Enter Tab Esc Up Down Left Right '
+                    'Home End PageUp PageDown Backspace Delete F1..F12, ctrl+c, ctrl+d, alt+x, shift+Tab, ...',
+              },
+            },
+            'required': ['name'],
+          },
+        },
+        {
+          'name': 'term_read',
+          'description': 'What the session printed since the last term_read / term_run / term_input, as plain text.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': _name,
+              'wait_ms': {'type': 'integer', 'description': 'If nothing new yet, wait up to this long for output.'},
+            },
+            'required': ['name'],
+          },
+        },
+        {
+          'name': 'term_screen',
+          'description': 'The session\'s screen as a person would see it now: for full-screen programs (top, vi, menus).',
+          'input_schema': {
+            'type': 'object',
+            'properties': {'name': _name},
+            'required': ['name'],
+          },
+        },
+        {
+          'name': 'term_wait',
+          'description': 'Wait until the session\'s output shows a text or matches a regular expression, or goes quiet.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': _name,
+              'text': {'type': 'string'},
+              'regex': {'type': 'string'},
+              'idle_ms': {'type': 'integer', 'description': 'Until no output for this long.'},
+              'timeout_seconds': {'type': 'integer', 'description': 'Default 30.'},
+            },
+            'required': ['name'],
+          },
+        },
+        {
+          'name': 'term_list',
+          'description': 'The open sessions: name, target, state, age.',
+          'input_schema': {'type': 'object', 'properties': <String, Object?>{}},
+        },
+        {
+          'name': 'term_ports',
+          'description': 'The serial ports of the computer the sandbox runs on (USB serial adapters with their '
+              'vendor:product IDs and serial numbers, on-board ports), and whether the sandbox may open each.',
+          'input_schema': {'type': 'object', 'properties': <String, Object?>{}},
+        },
+        {
+          'name': 'term_close',
+          'description': 'Close a session (the connection, or the program).',
+          'input_schema': {
+            'type': 'object',
+            'properties': {'name': _name},
+            'required': ['name'],
+          },
+        },
+      ];
+
+  /// Runs one tool call and returns the text for the tool_result block. Failures come back as
+  /// text starting with "Error:", so the model can react to them.
+  Future<String> call(String name, Map<String, Object?> input) async {
+    try {
+      final session = input['name'] as String?;
+      String need() => session ?? (throw _GuiError('$name needs a name'));
+      switch (name) {
+        case 'term_open':
+          final env = <String, String>{};
+          final args = ['open', need(), input['target'] as String? ?? (throw _GuiError('term_open needs a target'))];
+          args.addAll(['--size', (input['size'] as String?) ?? '120x40']);
+          if (input['user'] != null) args.addAll(['--user', input['user'] as String]);
+          if (input['identity'] != null) args.addAll(['--identity', input['identity'] as String]);
+          if (input['command'] != null) args.addAll(['--command', input['command'] as String]);
+          if (input['strict_host_key'] == true) args.add('--strict');
+          if (input['password'] != null) {
+            env['CSH_PASSWORD'] = input['password'] as String;
+            args.addAll(['--password-env', 'CSH_PASSWORD']);
+          }
+          final opened = await _csh(args, env: env, timeout: const Duration(minutes: 2));
+          if (opened.startsWith('Error')) return opened;
+          await _csh(['wait', need(), 'idle', '$idleMs', '--timeout', '10']);
+          final first = await _csh(['read', need()]);
+          return '$opened\n\n${_cut(first)}'.trimRight();
+        case 'term_run':
+          final seconds = (input['timeout_seconds'] as int?) ?? 60;
+          final args = ['run', need(), input['command'] as String? ?? (throw _GuiError('term_run needs a command')),
+            '--timeout', '$seconds'];
+          if (input['prompt'] != null) args.addAll(['--prompt', input['prompt'] as String]);
+          final r = await sandbox.exec(['c-sh', ...args], timeout: Duration(seconds: seconds + 30));
+          final out = '${r.stderrText}${r.stdoutText}'.trimRight();
+          if (r.exitCode == 3 && r.stderrText.contains('timed out')) return _cut(out);
+          if (r.exitCode == 4 || r.exitCode == 5 || r.exitCode == 2) return 'Error: ${out.replaceFirst('c-sh: ', '')}';
+          final status = input['prompt'] != null ? '' : 'exit code: ${r.exitCode}\n';
+          return '$status${_cut(out)}'.trimRight();
+        case 'term_input':
+          final text = input['text'] as String?;
+          final keys = (input['keys'] as String?)?.trim();
+          if (text == null && (keys == null || keys.isEmpty)) throw _GuiError('term_input needs text or keys');
+          if (text != null) {
+            final enter = (input['enter'] as bool?) ?? true;
+            final r = await _csh([enter ? 'enter' : 'send', need(), _escape(text)]);
+            if (r.startsWith('Error')) return r;
+          }
+          if (keys != null && keys.isNotEmpty) {
+            final r = await _csh(['key', need(), ...keys.split(RegExp(r'\s+'))]);
+            if (r.startsWith('Error')) return r;
+          }
+          await _csh(['wait', need(), 'idle', '$idleMs', '--timeout', '10']);
+          return _cut(await _csh(['read', need()]));
+        case 'term_read':
+          return _cut(await _csh(['read', need(), if (input['wait_ms'] != null) ...['--timeout', '${input['wait_ms']}']]));
+        case 'term_screen':
+          return await _csh(['screen', need()]);
+        case 'term_wait':
+          final cond = input['text'] != null
+              ? ['text', input['text'] as String]
+              : input['regex'] != null
+                  ? ['regex', input['regex'] as String]
+                  : ['idle', '${(input['idle_ms'] as int?) ?? 500}'];
+          final seconds = (input['timeout_seconds'] as int?) ?? 30;
+          final r = await sandbox.exec(['c-sh', 'wait', need(), ...cond, '--timeout', '$seconds'],
+              timeout: Duration(seconds: seconds + 30));
+          if (r.ok) return 'ok\n${_cut(await _csh(['read', need()]))}'.trimRight();
+          return r.exitCode == 3 ? 'timed out; the output so far:\n${_cut(await _csh(['read', need()]))}' : 'Error: ${r.stderrText.trim()}';
+        case 'term_list':
+          return await _csh(['list']);
+        case 'term_close':
+          return await _csh(['close', need()]);
+        case 'term_ports':
+          return await _csh(['ports']);
+        default:
+          return 'Error: unknown tool "$name"';
+      }
+    } on _GuiError catch (e) {
+      return 'Error: ${e.message}';
+    } catch (e) {
+      return 'Error: $e';
+    }
+  }
+
+  /// `c-sh send/enter` read backslash escapes; text from the model is literal.
+  String _escape(String text) => text.replaceAll('\\', '\\\\');
+
+  String _cut(String text) {
+    if (text.length <= maxOutputChars) return text;
+    final half = maxOutputChars ~/ 2;
+    return '${text.substring(0, half)}\n… [${text.length - maxOutputChars} characters omitted] …\n${text.substring(text.length - half)}';
+  }
+
+  Future<String> _csh(List<String> args, {Map<String, String>? env, Duration timeout = const Duration(minutes: 2)}) async {
+    final r = await sandbox.exec(['c-sh', ...args], env: env, timeout: timeout);
+    final out = '${r.stdoutText}${r.stderrText}'.trimRight();
+    if (r.ok) return out;
+    return 'Error (exit ${r.exitCode}): ${out.replaceFirst('c-sh: ', '')}';
+  }
+}

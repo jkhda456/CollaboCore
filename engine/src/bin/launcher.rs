@@ -35,7 +35,7 @@ use std::process::Command;
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
     "arg", "allow", "deny", "secret", "allow-header", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
-    "log-exec-kinds", "log-max-size", "log-rotate",
+    "log-exec-kinds", "log-max-size", "log-rotate", "serial",
 ];
 /// Engine options that are flags.
 const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "skip-tls-verify", "log-requests", "no-raw"];

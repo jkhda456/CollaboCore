@@ -9,17 +9,19 @@
 //! Methods: start, exec, readFile, writeFile, console.write, console.resize (the guest tty's size,
 //! set through the agent), policy.update,
 //! reply, exportZip, stop. Events: ready, console, network, execOutput, hostCall, permission,
-//! sshAgent, exit.
+//! sshAgent, serial, exit.
 //!
 //! start.config: cpus, python, tools, gui {settings of the display in tools.cpio}, addons {name:
 //! settings} (addons.rs), mounts, network {allow,
 //! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
-//! "ask", "allow"), sshAgentSocket, quiet, consoleSize. policy.update takes network, hostExec,
-//! hostFunctions, sshAgent and sshAgentSocket.
+//! "ask", "allow"), sshAgentSocket, serial {mode: "off"/"ask"/"allow", devices: [path globs or
+//! usb:VID:PID[:SERIAL]]} (serial.rs), quiet, consoleSize. policy.update takes network, hostExec,
+//! hostFunctions, sshAgent, sshAgentSocket and serial.
 //!
 //! permission events (answered with reply {id, allow, remember?}): kind "exec" / "open" (hostExec:
 //! ask), "network" (target "host:port" that network.ask leaves to the app), "ssh-agent" (target
-//! "sign with <key>"). remember (default true) keeps a network or ssh-agent answer for the session.
+//! "sign with <key>"), "serial" (target "open the serial port <device>"). remember (default true)
+//! keeps a network, ssh-agent or serial answer for the session.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -29,7 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{addons, agent, console, fs, hostfn, http, intercept, machine, net, sshagent, virtio, vsock, zip};
+use crate::{addons, agent, console, fs, hostfn, http, intercept, machine, net, serial, sshagent, virtio, vsock, zip};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -137,6 +139,8 @@ struct Running {
     network_answers: Arc<Mutex<HashMap<String, bool>>>,
     ssh_agent: Arc<RwLock<sshagent::Policy>>,
     ssh_answers: sshagent::Answers,
+    serial: Arc<RwLock<serial::Policy>>,
+    serial_answers: serial::Answers,
     host_policy: Arc<RwLock<hostfn::HostPolicy>>,
     host_functions: hostfn::HostFunctions,
 }
@@ -252,6 +256,10 @@ impl Server {
             Ok(policy) => policy,
             Err(message) => return failed("bad-request", message),
         };
+        let serial_ports = match serial_policy(&config, serial::Policy::default()) {
+            Ok(policy) => policy,
+            Err(message) => return failed("bad-request", message),
+        };
 
         // Mounts: a host folder each, mounted by the guest's /etc/rc from the command line.
         let mut mounts: Vec<Mount> = Vec::new();
@@ -359,6 +367,31 @@ impl Server {
                         fields.insert("reason".into(), json!(reason));
                     }
                     observer_out.event("sshAgent", fields);
+                }),
+            )?;
+        }
+
+        // The host's serial ports, when the app shares them: c-sh's `serial:` targets come here.
+        let serial_ports = Arc::new(RwLock::new(serial_ports));
+        let serial_answers: serial::Answers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let (asker_functions, observer_out) = (host_functions.clone(), self.out.clone());
+            serial::serve(
+                &vsock,
+                serial_ports.clone(),
+                serial_answers.clone(),
+                Arc::new(move |target: &str| asker_functions.ask_permission("serial", target)),
+                Arc::new(move |event: serial::Event| {
+                    let mut fields = Map::new();
+                    fields.insert("op".into(), json!(event.op));
+                    if !event.device.is_empty() {
+                        fields.insert("device".into(), json!(event.device));
+                    }
+                    fields.insert("allowed".into(), json!(event.allowed));
+                    if let Some(reason) = event.reason {
+                        fields.insert("reason".into(), json!(reason));
+                    }
+                    observer_out.event("serial", fields);
                 }),
             )?;
         }
@@ -625,6 +658,10 @@ impl Server {
             "tools": tools,
             "addons": addons.names,
             "sshAgent": config.get("sshAgent").cloned().unwrap_or_else(|| json!("off")),
+            "serial": {
+                "mode": format!("{:?}", serial_ports.read().unwrap().mode).to_lowercase(),
+                "devices": serial_ports.read().unwrap().devices.clone(),
+            },
             "quiet": quiet,
             "mounts": mounts.iter().map(|mount| json!({
                 "hostPath": mount.host_path.to_string_lossy(),
@@ -643,6 +680,8 @@ impl Server {
                 network_answers: answers,
                 ssh_agent,
                 ssh_answers,
+                serial: serial_ports,
+                serial_answers,
                 host_policy,
                 host_functions,
             }));
@@ -803,6 +842,14 @@ impl Server {
             }
             running.ssh_answers.lock().unwrap().clear();
         }
+        if params.get("serial").is_some() {
+            let current = running.serial.read().unwrap().clone();
+            match serial_policy(params, current) {
+                Ok(policy) => *running.serial.write().unwrap() = policy,
+                Err(message) => return failed("bad-request", message),
+            }
+            running.serial_answers.lock().unwrap().clear();
+        }
         {
             let mut policy = running.host_policy.write().unwrap();
             if let Some(mode) = params.get("hostExec").and_then(Value::as_str) {
@@ -928,6 +975,27 @@ fn ssh_agent_policy(fields: &Value, mut policy: sshagent::Policy) -> std::result
         Some(Value::Null) | Some(Value::String(_)) => policy.socket = None,
         Some(_) => return Err("sshAgentSocket must be a path".into()),
         None => {}
+    }
+    Ok(policy)
+}
+
+/// `serial`: off/ask/allow as a string, or {mode, devices}, from a start or policy.update request,
+/// over what was there before.
+fn serial_policy(fields: &Value, mut policy: serial::Policy) -> std::result::Result<serial::Policy, String> {
+    let bad = || "serial must be \"off\", \"ask\", \"allow\" or {mode, devices: [...]}".to_string();
+    match fields.get("serial") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(mode)) => policy.mode = serial::Mode::parse(mode).ok_or_else(bad)?,
+        Some(Value::Object(object)) => {
+            if let Some(mode) = object.get("mode") {
+                policy.mode = mode.as_str().and_then(serial::Mode::parse).ok_or_else(bad)?;
+            }
+            if let Some(devices) = object.get("devices") {
+                let list = devices.as_array().ok_or_else(bad)?;
+                policy.devices = list.iter().map(|d| d.as_str().map(str::to_string).ok_or_else(bad)).collect::<std::result::Result<_, _>>()?;
+            }
+        }
+        Some(_) => return Err(bad()),
     }
     Ok(policy)
 }

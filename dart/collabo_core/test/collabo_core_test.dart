@@ -283,6 +283,106 @@ void main() {
 
   // The wpe add-on is not bundled: these run with a runtime that has it in app/images/addons
   // (addons/wpe/README.md), and are skipped otherwise.
+  group('term tools', () {
+    final hasCsh = File('${CollaboRuntime.locate().directory}/app/images/addons/c-sh.cpio').existsSync();
+    late CollaboCore ts;
+    late TermTools term;
+    Process? fake;
+    late String device;
+    final serialEvents = <SerialEvent>[];
+    final asked = <PermissionRequest>[];
+    var allowSerial = false;
+    setUpAll(() async {
+      if (!hasCsh) return;
+      // A pretend serial device on this computer: a pty that answers like a modem.
+      fake = await Process.start('python3', ['../../addons/c-sh/tests/fakeserial.py']);
+      device = (await fake!.stdout.transform(utf8.decoder).transform(const LineSplitter()).first).trim();
+      ts = await CollaboCore.start(CollaboConfig(
+          cpus: 2, quiet: true, python: false, networkEnabled: false, addons: const {'c-sh': {}}, serial: SerialPolicy.allow([device])));
+      ts.serialEvents.listen(serialEvents.add);
+      ts.onPermission = (request) async {
+        asked.add(request);
+        request.remember = false;
+        return allowSerial;
+      };
+      term = TermTools(ts);
+    });
+    tearDownAll(() async {
+      if (hasCsh) await ts.stop();
+      fake?.kill();
+    });
+
+    test('definitions are Anthropic tool schemas', () {
+      final t = TermTools(sandbox);
+      expect(t.definitions.map((d) => d['name']), containsAll(['term_open', 'term_run', 'term_input', 'term_screen']));
+      for (final d in t.definitions) {
+        expect(d['input_schema'], isA<Map>());
+        expect(t.handles(d['name'] as String), isTrue);
+      }
+    });
+
+    test('a session stays open across calls: run, state, input, keys, screen, close', () async {
+      if (!hasCsh) {
+        markTestSkipped('no c-sh add-on in the runtime');
+        return;
+      }
+      final opened = await term.call('term_open', {'name': 'sh', 'target': 'run', 'size': '80x24'});
+      expect(opened, contains('opened sh'));
+      final r1 = await term.call('term_run', {'name': 'sh', 'command': 'cd /tmp && X=kept && echo 한글 ok'});
+      expect(r1, startsWith('exit code: 0'));
+      expect(r1, contains('한글 ok'));
+      // A later call (another exec) finds the same shell: its directory and variable.
+      final r2 = await term.call('term_run', {'name': 'sh', 'command': r'echo "$X $(pwd)"; false'});
+      expect(r2, startsWith('exit code: 1'));
+      expect(r2, contains('kept /tmp'));
+      // Typing into a program that reads a line, then interrupting a running command.
+      final typed = await term.call('term_input', {'name': 'sh', 'text': r'read v; echo "got:$v"'});
+      expect(typed, isNot(startsWith('Error')));
+      final answered = await term.call('term_input', {'name': 'sh', 'text': 'an answer'});
+      expect(answered, contains('got:an answer'));
+      final slow = await term.call('term_run', {'name': 'sh', 'command': 'sleep 30', 'timeout_seconds': 1});
+      expect(slow, contains('still running'));
+      await term.call('term_input', {'name': 'sh', 'keys': 'ctrl+c'});
+      expect(await term.call('term_run', {'name': 'sh', 'command': 'echo after'}), contains('after'));
+      // A full-screen program's screen.
+      await term.call('term_input', {'name': 'sh', 'text': 'clear; echo on-screen'});
+      final screen = await term.call('term_screen', {'name': 'sh'});
+      expect(screen, contains('on-screen'));
+      expect(screen, isNot(contains('CSHDONE')));
+      expect(await term.call('term_list', {}), contains('sh'));
+      expect(await term.call('term_close', {'name': 'sh'}), contains('closed sh'));
+      expect(await term.call('term_run', {'name': 'sh', 'command': 'true'}), startsWith('Error'));
+    });
+
+    test('this computer\'s serial port: shared, asked about, refused', () async {
+      if (!hasCsh) {
+        markTestSkipped('no c-sh add-on in the runtime');
+        return;
+      }
+      expect(await term.call('term_ports', {}), contains('the host shares serial ports: allow'));
+      final opened = await term.call('term_open', {'name': 'modem', 'target': 'serial:host:$device?baud=9600'});
+      expect(opened, contains('opened modem'));
+      final answer = await term.call('term_input', {'name': 'modem', 'text': 'ATI'});
+      expect(answer, contains('c-sh test modem'));
+      expect(await term.call('term_close', {'name': 'modem'}), contains('closed modem'));
+      expect(serialEvents.where((e) => e.op == 'open' && e.allowed && e.device == device), isNotEmpty);
+      // Under ask, with nothing listed: the app is asked each time (remember: false).
+      await ts.updatePolicy(serial: const SerialPolicy.ask());
+      allowSerial = false;
+      final refused = await term.call('term_open', {'name': 'm2', 'target': 'serial:host:$device'});
+      expect(refused, startsWith('Error'));
+      expect(refused, contains('did not allow'));
+      expect(asked.last.kind, 'serial');
+      expect(asked.last.target, contains(device));
+      allowSerial = true;
+      expect(await term.call('term_open', {'name': 'm3', 'target': 'serial:host:$device'}), contains('opened m3'));
+      await term.call('term_close', {'name': 'm3'});
+      await ts.updatePolicy(serial: const SerialPolicy());
+      expect(await term.call('term_open', {'name': 'm4', 'target': 'serial:host:$device'}), contains('serial: off'));
+      expect(serialEvents.where((e) => e.op == 'open' && !e.allowed), hasLength(2));
+    });
+  });
+
   group('web tools', () {
     final hasWpe = File('${CollaboRuntime.locate().directory}/app/images/addons/wpe.cpio').existsSync();
     late CollaboCore ws;
