@@ -8,6 +8,9 @@
 #   screen    5.0   GNU screen, the terminal multiplexer
 #   openssl   3.5   the openssl command (keys, certificates, s_client, enc, dgst, ...)
 #   sqlite    3.51  the sqlite3 shell, the same SQLite (and options) as Python's sqlite3 module
+#   svn       1.15  Subversion: svn, svnadmin, svnlook, svnserve, svnsync, svnrdump, svnmucc,
+#                   svndumpfilter, svnfsfs, svnversion (one program, the others links to it),
+#                   over APR 1.7, APR-util 1.6, expat and serf 1.3 (http and https)
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
 #   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, 7z (one
@@ -17,10 +20,10 @@
 # xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
 #
 # Mirrors third_party/distro/distro/{curl,dropbear,git}/package.nix without Nix, with distro's
-# patches; distro has no screen, so its patch is ours (patches/screen-nofork.patch). OpenSSL,
-# zlib and ncurses are the static libraries python/build-deps.sh builds (python/deps), so the
-# python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen openssl sqlite gui rust cpio (gui and rust always run: cargo
+# patches; distro has no screen or Subversion, so their patches are ours (patches/screen-nofork.patch,
+# patches/apr-wasm.patch). OpenSSL, zlib, ncurses and SQLite are the static libraries
+# python/build-deps.sh builds (python/deps), so the python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
+# them.   stages: curl dropbear git screen openssl sqlite svn gui rust cpio (gui and rust always run: cargo
 # and the compiles are incremental)
 set -euo pipefail
 
@@ -58,12 +61,22 @@ fetch() { # NAME: download (once) and check the source sources.lock names; print
   echo "$file"
 }
 
+untar() { # FILE TAR-ARGS...: tar of FILE; a .bz2 through Python's bz2 if the host has no bzip2
+  local file="$1"; shift
+  if [[ "$file" == *.bz2 ]] && ! command -v bzip2 > /dev/null; then
+    python3 -I -c 'import bz2, shutil, sys; shutil.copyfileobj(bz2.open(sys.argv[1]), sys.stdout.buffer)' "$file" \
+      | tar "$@" -f -
+  else
+    tar "$@" -f "$file"
+  fi
+}
+
 unpack() { # NAME: a fresh copy of the source under build/; prints the directory
   local file dir
   file="$(fetch "$1")"
-  dir="$B/$(tar -tf "$file" 2>/dev/null | head -1 | cut -d/ -f1)"
+  dir="$B/$(untar "$file" -t | awk -F/ 'NR == 1 { print $1 }')"
   rm -rf "$dir"; mkdir -p "$B"
-  tar -xf "$file" -C "$B"
+  untar "$file" -x -C "$B"
   echo "$dir"
 }
 
@@ -174,6 +187,100 @@ if stage sqlite "$STAGE/usr/bin/sqlite3"; then
   install -D -m644 "$S/sqlite3.1" "$STAGE/usr/share/man/man1/sqlite3.1"
 fi
 
+STEP=svn  # Subversion and the libraries it needs, which only it uses (so they stay in build/svn-deps):
+          # APR (patches/apr-wasm.patch: children start with clone(CLONE_VM | CLONE_VFORK), as
+          # posix_spawn's do, and getopt's errfn has its type; no SysV IPC in the guest's kernel,
+          # so its locks are fcntl's), APR-util
+          # with expat for XML, and serf (http and https, OpenSSL and zlib), compiled here without
+          # SCons as its SConstruct does. SQLite is python/deps' (the shell's, without WAL and mmap);
+          # utf8proc and lz4 are Subversion's own copies. svnserve has no fork either: it serves
+          # each connection in a thread, and -d stays in the foreground (APR_HAS_FORK is 0).
+# Upstream's `make install-bin` set, but svnbench (a benchmark)
+SVN_PROGRAMS="svn svnadmin svndumpfilter svnfsfs svnlook svnmucc svnrdump svnserve svnsync svnversion"
+if stage svn "$STAGE/usr/bin/svn"; then
+  SD="$B/svn-deps"
+  rm -rf "$SD"
+  DEPCONF=("${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 CFLAGS="-O2" --prefix="$SD"
+           --disable-shared --enable-static)
+  STEP=svn-apr
+  S="$(unpack apr)"
+  (cd "$S" && patch -p1 --quiet < "$N/patches/apr-wasm.patch")
+  # What configure cannot run to find out: musl's answers (XSI strerror_r, a 32-bit size_t and
+  # 64-bit off_t, epoll, accept4/dup3/SOCK_CLOEXEC); semget and sem_open exist in musl but not in
+  # the kernel (no CONFIG_SYSVIPC) or need mmap, which leaves fcntl for process locks. No DSO:
+  # there is no dlopen in a static program.
+  (cd "$S" && log ./configure "${DEPCONF[@]}" CC_FOR_BUILD=clang-19 --disable-dso \
+     ac_cv_file__dev_zero=yes ac_cv_strerror_r_rc_int=yes ac_cv_sizeof_struct_iovec=8 \
+     ac_cv_sizeof_off_t=8 ac_cv_sizeof_pid_t=4 ac_cv_sizeof_size_t=4 ac_cv_sizeof_ssize_t=4 \
+     apr_cv_process_shared_works=no apr_cv_mutex_robust_shared=no apr_cv_mutex_recursive=yes \
+     apr_cv_tcp_nodelay_with_cork=yes ac_cv_func_setpgrp_void=yes apr_cv_epoll=yes \
+     apr_cv_epoll_create1=yes apr_cv_dup3=yes apr_cv_accept4=yes apr_cv_sock_cloexec=yes \
+     apr_cv_gai_addrconfig=yes ac_cv_func_semget=no ac_cv_func_semctl=no ac_cv_func_sem_open=no)
+  log make -C "$S" -j"$JOBS"
+  log make -C "$S" install
+  STEP=svn-expat
+  S="$(unpack expat)"
+  (cd "$S" && log ./configure "${DEPCONF[@]}" --without-docbook --without-examples --without-tests --without-xmlwf)
+  log make -C "$S" -j"$JOBS" install
+  STEP=svn-apr-util  # only what Subversion uses of it: no crypto, DBM or SQL drivers, no LDAP
+  S="$(unpack apr-util)"
+  # wasm-ld 19 takes the static functions of an archive's members for lazy definitions too: this
+  # static BF_set_key (bcrypt's) would stand for OpenSSL's, and e_bf.o's call to it go nowhere
+  sed -i 's/\<BF_set_key\>/apu_bcrypt_set_key/g' "$S/crypto/crypt_blowfish.c"
+  (cd "$S" && log ./configure "${DEPCONF[@]}" --with-apr="$SD" --with-expat="$SD" \
+     --without-crypto --without-openssl --without-nss --without-commoncrypto --without-berkeley-db \
+     --without-gdbm --without-ndbm --without-pgsql --without-mysql --without-sqlite2 --without-sqlite3 \
+     --without-oracle --without-odbc --without-ldap)
+  log make -C "$S" -j"$JOBS"
+  log make -C "$S" install
+  STEP=svn-serf  # SConstruct's sources and flags; no GSSAPI (Negotiate) or SSPI
+  S="$(unpack serf)"
+  (cd "$S" && for f in *.c buckets/*.c auth/auth*.c; do
+     [[ "$f" == auth/auth_spnego_sspi.c ]] && continue
+     "$CC" -O2 -DNDEBUG -DOPENSSL_NO_STDIO -D_GNU_SOURCE -I. -I"$SD/include/apr-1" -I"$DEPS/include" \
+       -c "$f" -o "$(echo "${f%.c}" | tr / _).o" || exit 1
+   done > "$B/$STEP.log" 2>&1) || { tail -30 "$B/$STEP.log"; echo "FAILED: $STEP" >&2; exit 1; }
+  rm -f "$SD/lib/libserf-1.a"
+  llvm-ar-19 rcs "$SD/lib/libserf-1.a" "$S"/*.o
+  install -D -m644 -t "$SD/include/serf-1" "$S"/serf.h "$S"/serf_bucket_types.h "$S"/serf_bucket_util.h
+  STEP=svn
+  S="$(unpack subversion)"
+  # LIBS: what the static serf needs, for configure's link tests and the programs. The editor
+  # for log messages when neither SVN_EDITOR, VISUAL nor EDITOR is set: vi, as for git.
+  (cd "$S" && log ./configure "${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
+     --prefix=/usr CFLAGS="-O2" CPPFLAGS="-I$DEPS/include" LDFLAGS="-L$DEPS/lib $LINK_FLAGS" \
+     LIBS="-lssl -lcrypto -lz" --disable-shared --enable-static \
+     --with-apr="$SD" --with-apr-util="$SD" --with-serf="$SD" --with-expat="$SD/include:$SD/lib:expat" \
+     --with-sqlite="$DEPS" --with-zlib="$DEPS" --with-utf8proc=internal --with-lz4=internal \
+     --without-berkeley-db --without-apxs --without-jdk --disable-javahl --without-gnome-keyring \
+     --without-kwallet --without-sasl --without-doxygen --without-boost --disable-nls --with-editor=vi)
+  # libtool would hand wasm-ld the -rpath every link gets (wasm-ld has none)
+  sed -i 's/^hardcode_libdir_flag_spec=.*/hardcode_libdir_flag_spec=""/' "$S/libtool"
+  log make -C "$S" -j"$JOBS" $SVN_PROGRAMS
+  # The image carries them as one program (patches/svn-multicall.c), as their code is nearly all
+  # the same libraries: each command's main() compiled again as svn_main_<command>, the rest of
+  # its objects as make built them, and the libraries once.
+  STEP=svn-multicall
+  MC="$B/svn-multicall"
+  rm -rf "$MC"; mkdir -p "$MC"
+  mkvar() { printf 'show:\n\t@echo %s\n' "$1" | make -s -C "$S" -f Makefile -f - show; }
+  COMPILE="$(mkvar '$(COMPILE)')"
+  objs=()
+  for p in $SVN_PROGRAMS; do
+    (cd "$S" && log $COMPILE -Dmain="svn_main_$p" -c "subversion/$p/$p.c" -o "$MC/$p.o")
+    for o in $(mkvar "\$(${p}_OBJECTS)"); do
+      [[ "$o" == "$p.lo" ]] || objs+=("$S/subversion/$p/${o%.lo}.o")
+    done
+  done
+  log "$CC" -O2 -c "$N/patches/svn-multicall.c" -o "$MC/multicall.o"
+  log "$CC" -o "$MC/svn" "$MC"/*.o "${objs[@]}" \
+    $(for l in client wc ra ra_local ra_svn ra_serf repos fs fs_fs fs_x fs_util delta diff subr; do
+        echo "$S/subversion/libsvn_$l/.libs/libsvn_$l-1.a"; done) \
+    -L"$SD/lib" -laprutil-1 -lexpat -lapr-1 -lserf-1 -L"$DEPS/lib" -lsqlite3 -lssl -lcrypto -lz $LINK_FLAGS
+  rm -f "$STAGE"/usr/bin/svn*
+  install -D "$MC/svn" "$STAGE/usr/bin/svn"
+fi
+
 STEP=gui
 echo "== gui"
 STAGE="$STAGE" bash "$N/gui/build.sh"
@@ -209,6 +316,8 @@ echo "== cpio"   # always: packing takes a second
     $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt 7z 7za 7zr; do echo "--link usr/bin/$n=collabo-archive"; done) \
     --file usr/bin/jq="$STAGE/usr/bin/jq" \
     --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
+    --file usr/bin/svn="$STAGE/usr/bin/svn" \
+    $(for p in $SVN_PROGRAMS; do [[ $p == svn ]] || echo "--link usr/bin/$p=svn"; done) \
     --tree usr/share/terminfo="$DEPS/share/terminfo" \
     --file etc/ssl/cert.pem="$CACERT" \
     --etc "$N/etc"

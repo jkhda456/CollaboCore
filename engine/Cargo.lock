@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "collabo-core-engine"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "crc32fast",

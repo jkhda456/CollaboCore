@@ -137,6 +137,13 @@ if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
   cp "$B/dropbear-2026.92/LICENSE" "$OUT/licenses/dropbear.MIT.txt"
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
   cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
+  # Subversion's LICENSE also has those of the utf8proc and LZ4 it carries; Apache's NOTICE
+  # files go with their licenses
+  for x in subversion.Apache-2.0:subversion-1.15.0 apr.Apache-2.0:apr-1.7.6 apr-util.Apache-2.0:apr-util-1.6.5 \
+           serf.Apache-2.0:serf-1.3.10; do
+    cat "$B/${x#*:}/LICENSE" - "$B/${x#*:}/NOTICE" <<< $'\n---- NOTICE ----\n' > "$OUT/licenses/${x%%:*}.txt"
+  done
+  cp "$B/expat-2.9.0/COPYING" "$OUT/licenses/expat.MIT.txt"
   for file in "$B"/gui/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
   # The openssl command is OpenSSL's (listed above); the Rust tools list their crates.
   for file in "$B"/rust/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done

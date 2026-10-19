@@ -152,6 +152,12 @@ if [[ "$MODE" == "--all" ]]; then
   fi
   tail -1 "$log"
 
+  echo "== Subversion: file://, svn:// (svnserve), svn+ssh://, hooks, dump/load, vi in a terminal"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_svn.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: svn"; exit 1
+  fi
+  tail -1 "$log"
+
   echo "== GUI programs: the display, input, screenshots (tools/gui, in the guest)"
   if ! python3 "$ROOT/tools/gui/tests/test_gui.py" guest "$runtime" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: gui"; exit 1

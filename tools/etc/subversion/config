@@ -1,0 +1,8 @@
+# System Subversion configuration of the collaboCore guest (/etc/subversion/config, from
+# tools/etc); ~/.subversion/config overrides what it sets.
+[tunnels]
+# svn+ssh:// runs `ssh`, which is dropbear's dbclient. Subversion's own default, "$SVN_SSH ssh -q
+# --", ends ssh's options with "--", which dbclient does not know: it would warn "Ignoring unknown
+# option --" on every connection. (What "--" guards against, a host name taken for an option,
+# Subversion refuses by itself: no host name it accepts begins with "-".)
+ssh = $SVN_SSH ssh -q
