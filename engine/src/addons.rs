@@ -3,7 +3,7 @@
 //! it. The app turns them on at start (`start.config.addons`, `--addon` on the command line); the
 //! default is none.
 //!
-//!   addons: {"claude-code": {"provider": "openai", "baseUrl": "http://localhost:11434/v1", ...}}
+//!   addons: {"agent": {"provider": "openai", "baseUrl": "http://localhost:11434/v1", ...}}
 //!
 //! What the engine does for an add-on it turns on:
 //!   * appends `<name>.cpio` to the initramfs, after the base, python and tools images
@@ -212,9 +212,9 @@ mod tests {
     #[test]
     fn command_line_settings() {
         let mut map = Map::new();
-        parse_setting("claude-code:provider=openai", &mut map).unwrap();
-        parse_setting("claude-code:maxTokens=4096", &mut map).unwrap();
-        parse_setting("claude-code:baseUrl=http://h:1/v1", &mut map).unwrap();
-        assert_eq!(Value::Object(map), json!({"claude-code": {"provider": "openai", "maxTokens": 4096, "baseUrl": "http://h:1/v1"}}));
+        parse_setting("agent:provider=openai", &mut map).unwrap();
+        parse_setting("agent:maxTokens=4096", &mut map).unwrap();
+        parse_setting("agent:baseUrl=http://h:1/v1", &mut map).unwrap();
+        assert_eq!(Value::Object(map), json!({"agent": {"provider": "openai", "maxTokens": 4096, "baseUrl": "http://h:1/v1"}}));
     }
 }

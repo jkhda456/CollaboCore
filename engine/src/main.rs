@@ -107,7 +107,7 @@ Add-ons (optional overlays; addons/README.md):
   --addon NAME              boot with that add-on (repeatable)
   --addon-config NAME:KEY=VALUE
                             one of its settings (repeatable; implies --addon NAME), e.g.
-                            claude-code:provider=openai; an apiKey becomes a --secret
+                            agent:provider=openai; an apiKey becomes a --secret
 
 Terminal:
   --no-raw                  leave this terminal line-buffered (Ctrl-C then ends the engine)

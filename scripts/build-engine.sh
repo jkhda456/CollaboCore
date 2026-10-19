@@ -11,8 +11,8 @@
 #   dist/engine/images/tools.cpio      curl, ssh, git, screen, gui overlay, optional (tools/build.sh)
 #   dist/engine/images/addons/<name>.cpio + <name>.json   the bundled add-ons (addons/build.sh)
 #
-#   ADDONS="claude-code codex" scripts/build-engine.sh   bundle these add-ons instead of the ones
-#                                                       whose addon.json says "bundled": true
+#   ADDONS="agent codex" scripts/build-engine.sh   bundle these add-ons instead of the ones
+#                                                 whose addon.json says "bundled": true
 #
 # The kernel and guest JS come from third_party/distro with our patches (patches/*.patch).
 set -euo pipefail

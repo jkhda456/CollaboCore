@@ -36,11 +36,11 @@ class CollaboConfig {
 
   /// Add-ons to boot with (addons/README.md), by name, each with its settings (`{}` for none).
   /// None by default. An `apiKey` setting never reaches the sandbox: the host adds it to the
-  /// add-on's https requests, like a [Secret]. For the claude-code add-on see
-  /// [ClaudeCodeSettings]:
+  /// add-on's https requests, like a [Secret]. For the agent add-on (collaboCore's coding agent)
+  /// see [AgentSettings]:
   ///
   /// ```dart
-  /// addons: {'claude-code': ClaudeCodeSettings.openai(baseUrl: 'http://localhost:11434/v1',
+  /// addons: {'agent': AgentSettings.openai(baseUrl: 'http://localhost:11434/v1',
   ///     model: 'qwen3-coder').toJson()},
   /// network: NetworkPolicy(allowHostLoopback: true),   // localhost is this computer
   /// ```
@@ -91,11 +91,15 @@ class CollaboConfig {
       };
 }
 
-/// Settings of the claude-code add-on: `claude` in the sandbox, a coding agent that talks to
-/// the Anthropic Messages API or to an OpenAI-compatible server (a local LLM). Written to
-/// /etc/collabo/addons/claude-code.json in the sandbox; `claude --show-config` shows them.
-class ClaudeCodeSettings {
-  const ClaudeCodeSettings({
+/// Settings of the agent add-on: `agent` in the sandbox, collaboCore's own coding agent, which
+/// talks to the Anthropic Messages API or to an OpenAI-compatible server (a local LLM). Written
+/// to /etc/collabo/addons/agent.json in the sandbox; `agent --show-config` shows them.
+///
+/// ```dart
+/// addons: {'agent': AgentSettings.anthropic(apiKey: key).toJson()},
+/// ```
+class AgentSettings {
+  const AgentSettings({
     this.provider = 'anthropic',
     this.baseUrl,
     this.model,
@@ -110,14 +114,14 @@ class ClaudeCodeSettings {
   });
 
   /// Anthropic's API (or a gateway that speaks it).
-  const ClaudeCodeSettings.anthropic({String? baseUrl, String? model, String? apiKey, int? maxTokens})
+  const AgentSettings.anthropic({String? baseUrl, String? model, String? apiKey, int? maxTokens})
       : this(provider: 'anthropic', baseUrl: baseUrl, model: model, apiKey: apiKey, maxTokens: maxTokens);
 
   /// An OpenAI-compatible Chat Completions server: Ollama (`http://localhost:11434/v1`),
   /// llama.cpp, vLLM, LM Studio, … The request is made by this computer, so `localhost` is
   /// this computer: that needs [NetworkPolicy.allowHostLoopback]. Without [model], the first
   /// one the server lists is used.
-  const ClaudeCodeSettings.openai({required String baseUrl, String? model, String? apiKey, int? maxTokens})
+  const AgentSettings.openai({required String baseUrl, String? model, String? apiKey, int? maxTokens})
       : this(provider: 'openai', baseUrl: baseUrl, model: model, apiKey: apiKey, maxTokens: maxTokens);
 
   /// `anthropic` or `openai`.
@@ -132,13 +136,14 @@ class ClaudeCodeSettings {
   final int? maxTokens;
   final bool? stream;
 
-  /// `default` (ask before commands and edits), `acceptEdits`, `plan` or `bypassPermissions`
-  /// (the sandbox is the boundary). With `claude -p` nobody can answer, so what needs a yes is
-  /// refused unless the mode or the permission rules allow it.
+  /// The mode sessions start in: `default` (ask before commands and edits), `acceptEdits`,
+  /// `plan` or `bypassPermissions` (the sandbox is the boundary), which the agent add-on starts in
+  /// when null (the claude-code add-on: `default`). With `agent -p` nobody can answer, so in a mode
+  /// other than bypass what needs a yes is refused unless the permission rules allow it.
   final String? permissionMode;
   final String? appendSystemPrompt;
 
-  /// Model calls in one prompt before `claude` stops; 300 when null.
+  /// Model calls in one prompt before `agent` stops; 300 when null.
   final int? maxTurns;
 
   /// true: the model's API ([baseUrl]) over https is reached without checking its certificate
@@ -146,14 +151,14 @@ class ClaudeCodeSettings {
   /// not add [apiKey] (a [Secret]) to those requests and refuses them: with a key, give it in the
   /// sandbox's own settings, or turn checks off for the whole sandbox
   /// (`NetworkPolicy.skipTlsVerify`).
-  /// `claude --api-skip-tls-verify` does the same for one run.
+  /// `agent --api-skip-tls-verify` does the same for one run.
   final bool? apiSkipTlsVerify;
 
   /// true: MCP servers over https are reached without checking their certificate (a local
-  /// server's self-signed one), as `NODE_TLS_REJECT_UNAUTHORIZED=0` does for the Node CLI. This
+  /// server's self-signed one), as `NODE_TLS_REJECT_UNAUTHORIZED=0` does for a Node CLI. This
   /// computer makes the request and skips the check, and refuses it for a host with a [Secret]
   /// (for a private CA, give the engine `COLLABO_CORE_CA_FILE` instead).
-  /// `claude --mcp-skip-tls-verify` does the same for one run.
+  /// `agent --mcp-skip-tls-verify` does the same for one run.
   final bool? mcpSkipTlsVerify;
 
   Map<String, Object?> toJson() => {
@@ -171,9 +176,14 @@ class ClaudeCodeSettings {
       };
 
   @override
-  String toString() => 'ClaudeCodeSettings($provider, ${baseUrl ?? 'default URL'}, ${model ?? 'default model'}'
+  String toString() => 'AgentSettings($provider, ${baseUrl ?? 'default URL'}, ${model ?? 'default model'}'
       '${apiKey != null ? ', key ***' : ''})';
 }
+
+/// Settings of the claude-code add-on (`claude`), which the agent add-on came from and which takes
+/// the same ones: `addons: {'claude-code': ClaudeCodeSettings.anthropic(apiKey: key).toJson()}`.
+/// The runtime bundles the agent add-on instead.
+typedef ClaudeCodeSettings = AgentSettings;
 
 /// Settings of the sandbox's display for GUI programs ([CollaboConfig.gui]): headless, each window
 /// a whole canvas of its own (no positions, no overlap), driven by the `gui` command there and by

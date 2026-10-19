@@ -1,6 +1,6 @@
 //! `launcher --addons`: the add-ons of a GitHub release, listed and fetched into the add-on folder.
 //!
-//! The release (by default the latest of jkhda456/CollaboCoreAddons, `addons-repo` in
+//! The release (by default the latest of jkhda456/CollaboAddons, `addons-repo` in
 //! launcher.conf for another) has one `<name>-wasm.zip` per add-on, holding `<name>.cpio`,
 //! `<name>.json` and `licenses/*`. `get` always downloads the release's current zip again and
 //! puts `<name>.*` in the add-on folder and each `licenses/FILE` in app/licenses as
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The release `addons-repo` replaces.
-pub const DEFAULT_REPO: &str = "https://api.github.com/repos/jkhda456/CollaboCoreAddons/releases/latest";
+pub const DEFAULT_REPO: &str = "https://api.github.com/repos/jkhda456/CollaboAddons/releases/latest";
 
 /// Where add-ons come from and go.
 pub struct Place {
@@ -375,12 +375,13 @@ mod tests {
     fn release_assets_are_add_ons_by_name() {
         let release = serde_json::json!({"assets": [
             {"name": "tcpdump-wasm.zip", "size": 482379, "browser_download_url": "https://x/tcpdump-wasm.zip"},
-            {"name": "claude-code-wasm.zip", "size": 666826, "browser_download_url": "https://x/claude-code-wasm.zip"},
+            {"name": "agent-wasm.zip", "size": 666826, "browser_download_url": "https://x/agent-wasm.zip"},
+            {"name": "c-sh-wasm.zip", "size": 873251, "browser_download_url": "https://x/c-sh-wasm.zip"},
             {"name": "SHA256SUMS", "size": 10, "browser_download_url": "https://x/SHA256SUMS"},
         ]});
         let assets = assets(&release).unwrap();
-        assert_eq!(assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["claude-code", "tcpdump"]);
-        assert_eq!(assets[1], Asset { name: "tcpdump".into(), size: 482379, url: "https://x/tcpdump-wasm.zip".into() });
+        assert_eq!(assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["agent", "c-sh", "tcpdump"]);
+        assert_eq!(assets[2], Asset { name: "tcpdump".into(), size: 482379, url: "https://x/tcpdump-wasm.zip".into() });
         assert_eq!(addon_name("plain.zip"), Some("plain"));
         assert_eq!(addon_name("-wasm.zip"), None);
         assert!(super::assets(&serde_json::json!({"message": "Not Found"})).is_err());

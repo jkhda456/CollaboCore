@@ -10,14 +10,16 @@
   </sub>
 </p>
 
-<h1 align="center">collaboCore</h1>
+<h1 align="center">CollaboCore</h1>
 
 <p align="center"><b>English</b> | <a href="readme.ko.md">한국어</a></p>
 
 Easy on the admin, easy on the agent — an all-in-one sandbox machine.
 
  * 📦 **Download:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
- * 📦 **Download:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
+
+If you need more features
+ * 📦 **Download:** [CollaboAddons Releases](https://github.com/jkhda456/CollaboAddons/releases)
  * 📦 **Download:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
 
 
@@ -30,6 +32,8 @@ Just run the launcher, and you're done!
 
 <br>
 
+When you're done, just close it! shutdown / poweroff work fine too — this is a computer, after all!
+
 ## 🌀 Comfort
 
  * A WASM build of the Linux kernel ([tombl/linux](https://github.com/tombl/linux), 7.1) runs as a native process.
@@ -40,7 +44,7 @@ Just run the launcher, and you're done!
 ## 🚀 Just change launcher.conf
 
 Write only what you want in `launcher.conf` in the runtime folder. Say you want to hand your project to
-a Claude Code agent but decide where it may reach:
+the built-in agent (just type `agent`!) but decide where it may reach:
 
 ```ini
 # My project as /work, reference data read-only
@@ -56,9 +60,9 @@ allow = files.pythonhosted.org
 # Log every request with its time
 log-file = logs/network.log
 
-# Claude Code in the guest; the key stays on the host and the guest never sees it
-addon = claude-code
-addon-config = claude-code:apiKey=${ANTHROPIC_API_KEY}
+# Agent in the guest — the key stays on the host and the guest never sees it
+addon = agent
+addon-config = agent:apiKey=${LLM_API_KEY}
 ```
 
 `./launcher --dry-run` shows the command line it would run (with the key hidden); every key is
@@ -66,7 +70,7 @@ listed by `./launcher --help` and in the comments of the `launcher.conf` that sh
 
 
 
-## 📐 Collabo IDE example
+## 📐 Collabo IDE architecture
 
 ```
  Flutter app ── package:collabo_core ──stdio JSON──▶ collabo-core engine (Rust + wasmtime, 11 MB)
@@ -119,7 +123,7 @@ IndexedDB.
 | `nettools/` | curl, dropbear (ssh), git and GNU screen for the guest, with distro's patches (screen's is ours) → `tools.cpio` |
 | `dart/collabo_core/` | the Dart package an app uses; `SandboxTools` exposes the sandbox as LLM tools |
 | `flutter/collabo_core_demo/` | a desktop demo app, including how to bundle the runtime on all three platforms |
-| `addons/` | optional overlays the app can boot with (`addons/README.md`); `claude-code`: Claude Code for the guest, with Anthropic or OpenAI-compatible (local) models |
+| `addons/` | optional overlays the app can boot with (`addons/README.md`); `agent`: the agent tool for the guest, with Anthropic or OpenAI-compatible (local) models |
 | `web/`, `host/` | the browser build and the host modules it shares with it |
 | `runtime/src/` | the earlier Node implementation, kept as the reference the engine was ported from (not shipped) |
 | `tests/`, `docs/note.md` | the checks, and a running log of decisions and pitfalls |
@@ -190,4 +194,5 @@ add-ons, the terminal).
 
 [readme.detail.md](readme.detail.md) — what is implemented and verified, Flutter integration and
 bundling, the full configuration, the guest's tools, the security model and the control protocol.
+
 [docs/note.md](docs/note.md) — the running work log (Korean).

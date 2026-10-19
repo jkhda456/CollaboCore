@@ -19,7 +19,7 @@
  * 📦 **다운로드:** [CollaboCore Releases](https://github.com/jkhda456/CollaboCore/releases)
 
 더 많은 기능이 필요하다면
- * 📦 **다운로드:** [CollaboCoreAddons Releases](https://github.com/jkhda456/CollaboCoreAddons/releases)
+ * 📦 **다운로드:** [CollaboAddons Releases](https://github.com/jkhda456/CollaboAddons/releases)
  * 📦 **다운로드:** [CollaboIDE Releases](https://github.com/jkhda456/CollaboIDE/releases)
 
 
@@ -45,7 +45,7 @@
 
 ## 🚀 launcher.conf 만 바꾸세요
 
-런타임 폴더의 `launcher.conf`에 원하는 것만 적으면 됩니다. 예를 들어 내 프로젝트를 Claude Code 에이전트에게
+런타임 폴더의 `launcher.conf`에 원하는 것만 적으면 됩니다. 예를 들어 내 프로젝트를 내장 에이전트(agent를 치세요!)에게
 맡기되, 나갈 수 있는 곳은 정해두고 싶다면:
 
 ```ini
@@ -62,9 +62,9 @@ allow = files.pythonhosted.org
 # 모든 요청을 시간과 함께 기록
 log-file = logs/network.log
 
-# 게스트 안에서 Claude Code — 키는 호스트에만 있고 게스트는 보지 못함
-addon = claude-code
-addon-config = claude-code:apiKey=${ANTHROPIC_API_KEY}
+# 게스트 안에서 Agent — 키는 호스트에만 있고 게스트는 보지 못함
+addon = agent
+addon-config = agent:apiKey=${LLM_API_KEY}
 ```
 
 `./launcher --dry-run`은 실제로 실행될 명령줄을 보여주고(키는 가려집니다), 쓸 수 있는 키 전체는
@@ -123,7 +123,7 @@ Python이 62 MB, 네트워크 도구가 14 MB). Node.js도, 컨테이너도, VM�
 |`nettools/`|게스트용 curl, dropbear(ssh), git, GNU screen과 배포판 패치(screen 패치는 자체 작성) → `tools.cpio`|
 |`dart/collabo_core/`|앱이 쓰는 Dart 패키지. `SandboxTools`는 샌드박스를 LLM 도구로 노출|
 |`flutter/collabo_core_demo/`|데스크톱 데모 앱. 세 플랫폼에서 런타임을 번들하는 방법 포함|
-|`addons/`|앱이 부팅할 때 붙일 수 있는 선택형 오버레이(`addons/README.md`). `claude-code`: 게스트용 Claude Code, Anthropic 또는 OpenAI 호환(로컬) 모델 사용|
+|`addons/`|앱이 부팅할 때 붙일 수 있는 선택형 오버레이(`addons/README.md`). `agent`: 게스트용 agent 도구, Anthropic 또는 OpenAI 호환(로컬) 모델 사용|
 |`web/`, `host/`|브라우저 빌드와, 그것과 공유하는 호스트 모듈|
 |`runtime/src/`|이전의 Node 구현. 엔진 포팅의 원본으로 남겨둠 (배포물에는 포함되지 않음)|
 |`tests/`, `docs/note.md`|검사들, 그리고 결정 사항과 함정을 적는 작업 기록|

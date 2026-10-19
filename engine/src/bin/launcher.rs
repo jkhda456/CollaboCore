@@ -68,7 +68,7 @@ launcher.conf (beside this program): `key = value` per line, `#` for comments.
   bin = DIR           the folder collabo-core-engine is in (default: bin beside this program)
   app = DIR           the folder images/ and the add-ons are in (default: app beside it)
   addons-repo = URL   the GitHub release --addons uses, its API URL or OWNER/REPO (default:
-                      the latest release of jkhda456/CollaboCoreAddons)
+                      the latest release of jkhda456/CollaboAddons)
   ~ is the home folder, ${NAME} an environment variable; relative host paths are relative to
   the config file's folder, and a mount's missing host folder there is made.
 ";
@@ -488,7 +488,7 @@ mod tests {
              log-max-size = 10M\n\
              allow-header = x-auth-token\n\
              python = off\n\
-             addon-config = claude-code:apiKey=${KEY}\n\
+             addon-config = agent:apiKey=${KEY}\n\
              command = sh -c 'echo # not a comment'\n",
             Path::new("/rt"),
             &env,
@@ -500,7 +500,7 @@ mod tests {
                 "--mount", "/rt/work:/work", "--mount", "/home/me/proj:/proj:ro", "--cpus", "4",
                 "--no-network", "--skip-tls-verify", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
                 "--log-file", "/rt/logs/all.log", "--log-max-size", "10M", "--allow-header", "x-auth-token", "--addon-config",
-                "claude-code:apiKey=sk-1",
+                "agent:apiKey=sk-1",
             ]
         );
         assert_eq!(conf.command, ["sh", "-c", "echo # not a comment"]);
@@ -595,10 +595,10 @@ mod tests {
 
     #[test]
     fn dry_run_hides_secrets() {
-        let args: Vec<String> = ["--secret", "api.x:authorization=Bearer k", "--addon-config", "claude-code:apiKey=k", "--addon-config", "claude-code:model=m"]
+        let args: Vec<String> = ["--secret", "api.x:authorization=Bearer k", "--addon-config", "agent:apiKey=k", "--addon-config", "agent:model=m"]
             .map(String::from)
             .into();
-        assert_eq!(shown(&args), "--secret api.x:authorization=… --addon-config claude-code:apiKey=… --addon-config claude-code:model=m");
+        assert_eq!(shown(&args), "--secret api.x:authorization=… --addon-config agent:apiKey=… --addon-config agent:model=m");
     }
 
     #[test]
