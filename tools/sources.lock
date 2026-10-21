@@ -12,6 +12,7 @@ git       https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz         
 openssl   https://github.com/openssl/openssl/releases/download/openssl-3.5.7/openssl-3.5.7.tar.gz a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
 screen    https://ftp.gnu.org/gnu/screen/screen-5.0.2.tar.gz                             ca9a2c7e240919bc7ac12124593ae4529bb4eb5f7349d8857829b7e3f0b3b332
 sqlite    https://sqlite.org/2025/sqlite-autoconf-3510000.tar.gz                         42e26dfdd96aa2e6b1b1be5c88b0887f9959093f650d693cb02eb9c36d146ca5
+file      https://astron.com/pub/file/file-5.48.tar.gz                                   ed14656883b23a364b4057c05595d93252da9bc473d30106519519d0da141283
 apr        https://archive.apache.org/dist/apr/apr-1.7.6.tar.bz2                       49030d92d2575da735791b496dc322f3ce5cff9494779ba8cc28c7f46c5deb32
 apr-util   https://archive.apache.org/dist/apr/apr-util-1.6.5.tar.bz2                  96de1dd6f6a0476d2d2e7964926d8c1ddc3bb0e210e1b1812d3ba5a454a392e2
 expat      https://github.com/libexpat/libexpat/releases/download/R_2_9_0/expat-2.9.0.tar.xz 1e6371862cc31999b368c3b89b49994f0677e1bab5f1b2b85ae3741f5d803051

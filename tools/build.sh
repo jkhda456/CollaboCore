@@ -8,6 +8,7 @@
 #   screen    5.0   GNU screen, the terminal multiplexer
 #   openssl   3.5   the openssl command (keys, certificates, s_client, enc, dgst, ...)
 #   sqlite    3.51  the sqlite3 shell, the same SQLite (and options) as Python's sqlite3 module
+#   file      5.48  file(1) and its magic database; gzip, bzip2, xz and lzma looked into (-z) in-process
 #   svn       1.15  Subversion: svn, svnadmin, svnlook, svnserve, svnsync, svnrdump, svnmucc,
 #                   svndumpfilter, svnfsfs, svnversion (one program, the others links to it),
 #                   over APR 1.7, APR-util 1.6, expat and serf 1.3 (http and https)
@@ -19,11 +20,11 @@
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image; so do xz, unxz,
 # xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
 #
-# Mirrors third_party/distro/distro/{curl,dropbear,git}/package.nix without Nix, with distro's
+# Mirrors third_party/distro/distro/{curl,dropbear,git,file}/package.nix without Nix, with distro's
 # patches; distro has no screen or Subversion, so their patches are ours (patches/screen-nofork.patch,
-# patches/apr-wasm.patch). OpenSSL, zlib, ncurses and SQLite are the static libraries
+# patches/apr-wasm.patch), and file's fork is ours to replace (patches/file-nofork.patch). OpenSSL, zlib, ncurses and SQLite are the static libraries
 # python/build-deps.sh builds (python/deps), so the python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen openssl sqlite svn gui rust cpio (gui and rust always run: cargo
+# them.   stages: curl dropbear git screen openssl sqlite file svn gui rust cpio (gui and rust always run: cargo
 # and the compiles are incremental)
 set -euo pipefail
 
@@ -187,6 +188,34 @@ if stage sqlite "$STAGE/usr/bin/sqlite3"; then
   install -D -m644 "$S/sqlite3.1" "$STAGE/usr/share/man/man1/sqlite3.1"
 fi
 
+STEP=file  # distro's configuration: static, no seccomp (Landlock is compiled in, and does nothing
+           # where the kernel has none, as here), the magic database at /usr/share/misc/magic.mgc.
+           # zlib, bzip2 and xz are python/deps' and decompress in-process; other formats (-z)
+           # go to their programs through posix_spawnp. There is no fork (config.site says so,
+           # as for distro), which leaves out -z altogether: -DHAVE_FORK=1 keeps it, and the patch
+           # turns its one fork (a child feeding a decompressor from memory) into a thread. The
+           # database is compiled by a file of the same version built for this machine first, as
+           # distro does with pkgs.file (the guest's cannot run here).
+if stage file "$STAGE/usr/bin/file"; then
+  STEP=file-host
+  S="$(unpack file)"
+  H="$B/file-host"
+  rm -rf "$H"; mv "$S" "$H"
+  (cd "$H" && log ./configure CC=clang-19 --disable-shared --enable-static --disable-libseccomp --disable-zlib \
+     --disable-bzlib --disable-xzlib --disable-zstdlib --disable-lzlib --disable-lrziplib)
+  log make -C "$H" -j"$JOBS"
+  STEP=file
+  S="$(unpack file)"
+  (cd "$S" && patch -p1 --quiet < "$N/patches/file-nofork.patch")
+  (cd "$S" && log ./configure "${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
+     --prefix=/usr CFLAGS="-O2" CPPFLAGS="-DHAVE_FORK=1 -I$DEPS/include" \
+     LDFLAGS="-L$DEPS/lib $LINK_FLAGS" --disable-shared --enable-static --disable-libseccomp \
+     --enable-zlib --enable-bzlib --enable-xzlib --disable-zstdlib --disable-lzlib --disable-lrziplib)
+  log make -C "$S" -j"$JOBS" FILE_COMPILE="$H/src/file" pkgdatadir=/usr/share/misc
+  install -D "$S/src/file" "$STAGE/usr/bin/file"
+  install -D -m644 "$S/magic/magic.mgc" "$STAGE/usr/share/misc/magic.mgc"
+fi
+
 STEP=svn  # Subversion and the libraries it needs, which only it uses (so they stay in build/svn-deps):
           # APR (patches/apr-wasm.patch: children start with clone(CLONE_VM | CLONE_VFORK), as
           # posix_spawn's do, and getopt's errfn has its type; no SysV IPC in the guest's kernel,
@@ -308,6 +337,8 @@ echo "== cpio"   # always: packing takes a second
     --file usr/bin/openssl="$STAGE/usr/bin/openssl" \
     --file etc/ssl/openssl.cnf="$STAGE/etc/ssl/openssl.cnf" \
     --file usr/bin/sqlite3="$STAGE/usr/bin/sqlite3" \
+    --file usr/bin/file="$STAGE/usr/bin/file" \
+    --file usr/share/misc/magic.mgc="$STAGE/usr/share/misc/magic.mgc" \
     --file usr/bin/gui="$STAGE/usr/bin/gui" \
     --file usr/bin/gui-demo="$STAGE/usr/bin/gui-demo" \
     --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \

@@ -1,0 +1,127 @@
+--- a/src/compress.c
++++ b/src/compress.c
+@@ -52,6 +52,7 @@
+ #include <ctype.h>
+ #include <stdarg.h>
+ #include <signal.h>
++#include <pthread.h>
+ #ifndef HAVE_SIG_T
+ typedef void (*sig_t)(int);
+ #endif /* HAVE_SIG_T */
+@@ -994,30 +995,42 @@
+ 	file_clear_closexec(STDERR_FILENO);
+ }
+ 
+-static pid_t
+-writechild(int fd, const void *old, size_t n)
++/*
++ * The guest has no fork: the writer is a thread, which owns the pipe's
++ * write end and closes it when done (or when the decompressor went away).
++ */
++struct writer {
++	pthread_t thread;
++	int fd;
++	const void *buf;
++	size_t n;
++};
++
++static void *
++writer_main(void *v)
+ {
+-	pid_t pid;
++	struct writer *w = CAST(struct writer *, v);
+ 
+-	/*
+-	 * fork again, to avoid blocking because both
+-	 * pipes filled
+-	 */
+-	pid = fork();
+-	if (pid == -1) {
+-		DPRINTF("Fork failed (%s)\n", strerror(errno));
++	if (swrite(w->fd, w->buf, w->n) != CAST(ssize_t, w->n))
++		DPRINTF("Write failed (%s)\n", strerror(errno));
++	(void)close(w->fd);
++	return NULL;
++}
++
++static int
++writechild(struct writer *w, int fd, const void *old, size_t n)
++{
++	int e;
++
++	w->fd = fd;
++	w->buf = old;
++	w->n = n;
++	if ((e = pthread_create(&w->thread, NULL, writer_main, w)) != 0) {
++		DPRINTF("Thread failed (%s)\n", strerror(e));
++		errno = e;
+ 		return -1;
+ 	}
+-	if (pid == 0) {
+-		/* child */
+-		if (swrite(fd, old, n) != CAST(ssize_t, n)) {
+-			DPRINTF("Write failed (%s)\n", strerror(errno));
+-			exit(EXIT_FAILURE);
+-		}
+-		exit(EXIT_SUCCESS);
+-	}
+-	/* parent */
+-	return pid;
++	return 0;
+ }
+ 
+ static ssize_t
+@@ -1127,7 +1140,8 @@
+ 	int fdp[3][2];
+ 	int status, rv, w;
+ 	pid_t pid;
+-	pid_t writepid = -1;
++	struct writer writer;
++	int writing = 0;
+ 	size_t i;
+ 	ssize_t r, re;
+ 	char *const *args;
+@@ -1225,14 +1239,14 @@
+ 	/* Write the buffer data to child stdin, if we don't have fd */
+ 	if (fd == -1) {
+ 		closefd(fdp[STDIN_FILENO], 0);
+-		writepid = writechild(fdp[STDIN_FILENO][1], old, *n);
+-		if (writepid == (pid_t)-1) {
++		if (writechild(&writer, fdp[STDIN_FILENO][1], old, *n) == -1) {
+ 			rv = makeerror(newch, n, "Write to child failed, %s",
+ 			    strerror(errno));
+ 			DPRINTF("Write to child failed\n");
+ 			goto err;
+ 		}
+-		closefd(fdp[STDIN_FILENO], 1);
++		writing = 1;
++		fdp[STDIN_FILENO][1] = -1;	/* the writer's now */
+ 	}
+ 
+ 	rv = OKDATA;
+@@ -1275,7 +1289,6 @@
+ 	closefd(fdp[STDERR_FILENO], 0);
+ 
+ 	w = waitpid(pid, &status, 0);
+-wait_err:
+ 	if (w == -1) {
+ 		rv = makeerror(newch, n, "Wait failed, %s", strerror(errno));
+ 		DPRINTF("Child wait return %#x\n", status);
+@@ -1284,14 +1297,13 @@
+ 	} else if (WEXITSTATUS(status) != 0) {
+ 		DPRINTF("Child exited (%#x)\n", WEXITSTATUS(status));
+ 	}
+-	if (writepid > 0) {
++	if (writing) {
+ 		/* _After_ we know decompressor has exited, our input writer
+ 		 * definitely will exit now (at worst, writing fails in it,
+ 		 * since output fd is closed now on the reading size).
+ 		 */
+-		w = waitpid(writepid, &status, 0);
+-		writepid = -1;
+-		goto wait_err;
++		(void)pthread_join(writer.thread, NULL);
++		writing = 0;
+ 	}
+ 
+ 	closefd(fdp[STDIN_FILENO], 0); //why? it is already closed here!

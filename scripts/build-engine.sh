@@ -144,6 +144,7 @@ if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
     cat "$B/${x#*:}/LICENSE" - "$B/${x#*:}/NOTICE" <<< $'\n---- NOTICE ----\n' > "$OUT/licenses/${x%%:*}.txt"
   done
   cp "$B/expat-2.9.0/COPYING" "$OUT/licenses/expat.MIT.txt"
+  cp "$B/file-5.48/COPYING" "$OUT/licenses/file.BSD-2-Clause.txt"
   for file in "$B"/gui/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
   # The openssl command is OpenSSL's (listed above); the Rust tools list their crates.
   for file in "$B"/rust/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done

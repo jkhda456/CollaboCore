@@ -152,6 +152,12 @@ if [[ "$MODE" == "--all" ]]; then
   fi
   tail -1 "$log"
 
+  echo "== file(1): types, --mime, -z (in-process and through zstd), in the guest"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_file.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: file"; exit 1
+  fi
+  tail -1 "$log"
+
   echo "== Subversion: file://, svn:// (svnserve), svn+ssh://, hooks, dump/load, vi in a terminal"
   if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_svn.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: svn"; exit 1
