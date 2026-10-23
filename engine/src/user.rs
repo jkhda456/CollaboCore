@@ -16,6 +16,7 @@ use crate::machine::{guest_bytes, HostState};
 const ENOMEM: i32 = -12;
 const EFAULT: i32 = -14;
 const EINVAL: i32 = -22;
+const EINTR: i32 = -4;
 const ENOSYS: i32 = -38;
 const ENOEXEC: i32 = -8;
 
@@ -207,18 +208,19 @@ fn imports_supported(module: &Module) -> bool {
 }
 
 /// Compiles the streamed program and gives it a memory of its own.
-pub fn compile_end(state: &mut HostState, rlimit_pages: u32) -> i32 {
-    let Some(bytes) = state.user.pending_bytes.take() else { return EINVAL };
+pub fn compile_end(caller: &mut Caller<'_, HostState>, rlimit_pages: u32) -> Result<i32> {
+    let state = caller.data_mut();
+    let Some(bytes) = state.user.pending_bytes.take() else { return Ok(EINVAL) };
     let engine = state.shared.engine.clone();
 
     let Ok((shared, minimum, maximum)) = crate::module_info::memory_import(&bytes).map(|(info, _)| {
         (info.is_shared, info.minimum_pages, info.maximum_pages.unwrap_or(0))
     }) else {
-        return ENOEXEC;
+        return Ok(ENOEXEC);
     };
     if !shared || maximum == 0 {
         eprintln!("[collabo-core] the guest program needs a shared memory with a maximum (shared={shared}, max={maximum})");
-        return ENOEXEC;
+        return Ok(ENOEXEC);
     }
     // The same program is spawned over and over (every shell command is busybox again), and
     // compiling it costs about a second, so keep what has been compiled (a large program also on
@@ -233,34 +235,64 @@ pub fn compile_end(state: &mut HostState, rlimit_pages: u32) -> i32 {
     let cached = state.shared.programs.lock().unwrap().get(&key).cloned();
     let module = match cached {
         Some(module) => module,
-        None => match crate::program_cache::load_or_compile(&engine, &bytes) {
-            Ok(module) => {
-                state.shared.programs.lock().unwrap().insert(key, module.clone());
-                module
-            }
-            Err(error) => {
+        None => match compile_waiting(caller, bytes, key)? {
+            Some(Ok(module)) => module,
+            Some(Err(error)) => {
                 eprintln!("[collabo-core] the guest program does not compile: {error:?}");
-                return ENOEXEC;
+                return Ok(ENOEXEC);
             }
+            None => return Ok(EINTR),
         },
     };
     if !imports_supported(&module) {
         eprintln!("[collabo-core] the guest program imports something the sandbox does not provide");
-        return ENOEXEC;
+        return Ok(ENOEXEC);
     }
     let maximum = maximum.min(rlimit_pages as u64);
     if maximum < minimum {
-        return ENOMEM;
+        return Ok(ENOMEM);
     }
     let memory = match SharedMemory::new(&engine, wasmtime::MemoryType::shared(minimum as u32, maximum as u32)) {
         Ok(memory) => memory,
         Err(error) => {
             eprintln!("[collabo-core] the guest program's memory ({minimum}..{maximum} pages) could not be allocated: {error}");
-            return ENOMEM;
+            return Ok(ENOMEM);
         }
     };
-    state.user.pending_context = Some(UserContext { module, memory, maximum_pages: maximum, dylink: crate::dylink::Process::new() });
-    0
+    caller.data_mut().user.pending_context =
+        Some(UserContext { module, memory, maximum_pages: maximum, dylink: crate::dylink::Process::new() });
+    Ok(0)
+}
+
+/// Compiles a program this machine has not compiled before, and keeps it. That can take tens of
+/// seconds (program_cache.rs), all inside the exec, and the guest CPU this task holds would run
+/// nothing else meanwhile: not its other tasks, not its timers (the kernel reported an RCU stall
+/// after 21 s). So the program compiles on a thread of its own while the task sleeps in the
+/// kernel, a tick at a time (`compile_wait`); with a kernel that does not export it, on this
+/// thread as before. `None`: the task got a fatal signal meanwhile; the compile goes on, and its
+/// result is kept for the next exec.
+fn compile_waiting(caller: &mut Caller<'_, HostState>, bytes: Vec<u8>, key: u64) -> Result<Option<Result<Module>>> {
+    let shared = caller.data().shared.clone();
+    let compile = move || {
+        let compiled = crate::program_cache::load_or_compile(&shared.engine, &bytes);
+        if let Ok(module) = &compiled {
+            shared.programs.lock().unwrap().insert(key, module.clone());
+        }
+        compiled
+    };
+    let kernel = caller.data().kernel_instance;
+    let wait = kernel.and_then(|kernel| kernel.get_typed_func::<(), i32>(&mut *caller, "compile_wait").ok());
+    let Some(wait) = wait else { return Ok(Some(compile())) };
+    let thread = match std::thread::Builder::new().name("compile".into()).spawn(compile) {
+        Ok(thread) => thread,
+        Err(error) => return Ok(Some(Err(error.into()))),
+    };
+    while !thread.is_finished() {
+        if wait.call(&mut *caller, ())? != 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(thread.join().unwrap_or_else(|_| Err(anyhow!("the compiler panicked")))))
 }
 
 pub fn compile_begin(state: &mut HostState, size: u32) -> i32 {
@@ -415,8 +447,8 @@ pub fn link(linker: &mut Linker<HostState>) -> Result<()> {
             compile_write(caller.data_mut(), source as u32, offset as u32, length as u32)
         },
     )?;
-    linker.func_wrap("user", "compile_end", |mut caller: Caller<'_, HostState>, pages: i32| -> i32 {
-        compile_end(caller.data_mut(), pages as u32)
+    linker.func_wrap("user", "compile_end", |mut caller: Caller<'_, HostState>, pages: i32| -> Result<i32> {
+        compile_end(&mut caller, pages as u32)
     })?;
     linker.func_wrap("user", "compile_abort", |mut caller: Caller<'_, HostState>| {
         compile_abort(caller.data_mut());

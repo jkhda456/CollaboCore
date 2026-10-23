@@ -9,7 +9,7 @@
 #   collabo.work=TAG               old spelling of collabo.mount=TAG:/work
 #   collabo.agent=1                start collabo-agentd, through which the host runs commands
 #   collabo.sshagent=1             the host lends its ssh-agent: SSH_AUTH_SOCK (collabo-sshagent)
-#   collabo.quiet=1                no banner
+#   collabo.quiet=1                no banner (the logo and versions, `version`, and the hints)
 #   collabo.version=V              the engine's version (the `version` command)
 # The engine's session CA, when it came with the boot images: the sandbox's own HTTPS clients
 # (curl, git, python) then get the app's API keys for the hosts that have them, added on the host
@@ -76,6 +76,7 @@ if [ -n "$AGENT" ]; then
 	collabo-agentd 2>/tmp/collabo-agentd.log &
 fi
 
+[ -n "$QUIET" ] || version
 say "hfetch URL: HTTP(S) through the host (hfetch -h); hostcall --list: host functions"
 [ -x /usr/bin/python3 ] && say "python3: CPython 3.13 (import collabo_core for host HTTP and host functions)"
 true
