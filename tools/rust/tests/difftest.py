@@ -1,11 +1,14 @@
-"""Differential tests of our xz and zstd against the originals (on a host that has both): each
-case runs in a fresh directory with each, and compares exit status, messages (program path
-normalized), stdout and the files left behind (new compressed files by what they decode to).
+"""Differential tests of our xz, zstd, lz4 and 7z against the originals (on a host that has them):
+each case runs in a fresh directory with each, and compares exit status, messages (program path
+normalized), stdout and the files left behind (new compressed files by what they decode to; lz4's,
+which come out the same byte for byte, as they are).
 
     python3 difftest.py TOOL OUR_DIR [REF_DIR]
 
-TOOL is xz or zstd; the directories hold the commands under their names (xz, unxz, xzcat, lzma,
-unlzma, lzcat / zstd, unzstd, zstdcat). Known, intended differences are listed in KNOWN."""
+TOOL is xz, zstd, lz4 or 7z; the directories hold the commands under their names (xz, unxz, xzcat,
+lzma, unlzma, lzcat / zstd, unzstd, zstdcat / lz4, unlz4, lz4cat). The reference lz4 is 1.10.0's
+single-threaded build (`make -C programs lz4 HAVE_MULTITHREAD=0`), which ours is. Known, intended
+differences are listed in KNOWN."""
 import hashlib, os, re, shutil, subprocess, sys, tempfile
 TOOL, OURS, REF = sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "/usr/bin"
 DATA = bytes(range(256)) * 300 + b"hello world\n" * 1000
@@ -13,7 +16,37 @@ FIXTURE_XZ = subprocess.run(["xz", "-c"], input=DATA, capture_output=True, check
 FIXTURE_ZST = subprocess.run(["zstd", "-c"], input=DATA, capture_output=True, check=True).stdout
 
 def setup(d):
-    {"xz": setup_xz, "zstd": setup_zstd, "7z": setup_7z}[TOOL](d)
+    {"xz": setup_xz, "zstd": setup_zstd, "7z": setup_7z, "lz4": setup_lz4}[TOOL](d)
+
+def setup_lz4(d):
+    lz4 = lambda *a, data=DATA: subprocess.run([f"{REF}/lz4", "-c", *a], input=data, capture_output=True, check=True).stdout
+    open(f"{d}/a.txt", "wb").write(DATA)
+    open(f"{d}/b.txt", "wb").write(b"small\n")
+    open(f"{d}/empty", "wb").close()
+    os.makedirs(f"{d}/dir/sub")
+    open(f"{d}/dir/x", "wb").write(b"x" * 1000)
+    open(f"{d}/dir/sub/y", "wb").write(b"y" * 1000)
+    os.symlink("a.txt", f"{d}/link")
+    a = lz4()
+    open(f"{d}/a.txt.lz4", "wb").write(a)
+    open(f"{d}/empty.lz4", "wb").write(lz4(data=b""))
+    open(f"{d}/legacy.lz4", "wb").write(lz4("-l"))
+    open(f"{d}/skip.lz4", "wb").write(b"\x52\x2a\x4d\x18\x04\x00\x00\x00abcd" + a)
+    open(f"{d}/cat2.lz4", "wb").write(a + lz4("-BD", "-9"))
+    open(f"{d}/junk.lz4", "wb").write(a + b"junk")
+    open(f"{d}/bad.lz4", "wb").write(b"not lz4 at all")
+    open(f"{d}/trunc.lz4", "wb").write(a[:len(a) // 2])
+    c = bytearray(a); c[len(c) // 2] ^= 0xFF
+    open(f"{d}/corrupt.lz4", "wb").write(bytes(c))
+    open(f"{d}/nocrc.lz4", "wb").write(lz4("--no-frame-crc"))
+    open(f"{d}/cs.lz4", "wb").write(lz4("--content-size"))
+    open(f"{d}/bx.lz4", "wb").write(lz4("-BX", "-B4"))
+    open(f"{d}/bd.lz4", "wb").write(lz4("-BD", "-B4", "-12"))
+    open(f"{d}/dict.bin", "wb").write(DATA[5000:90000])
+    subprocess.run([f"{REF}/lz4", "-c", "-D", f"{d}/dict.bin", f"{d}/a.txt"], stdout=open(f"{d}/d.lz4", "wb"), check=True)
+    open(f"{d}/zeros.lz4", "wb").write(lz4(data=bytes(300000) + b"end" + bytes(70000)))
+    os.chmod(f"{d}/a.txt", 0o640)
+    os.utime(f"{d}/a.txt", (1_000_000_000, 1_000_000_000))
 
 SEVEN = os.environ.get("SEVENZ_REF", f"{REF}/7z")
 
@@ -197,11 +230,37 @@ SEVENZ_CASES = [
     "7z h d/h.txt", "7z h -scrcSHA256 d/h.txt", "7z h d", "7z h -scrc* n.txt", "7z i", "7z", "7z z", "7z a", "7z x", "7z l -zz x.7z",
     "7z x x.7z -oout -bb1", "7z a new.7z d -bb1",
 ]
-CASES = {"xz": XZ_CASES, "zstd": ZSTD_CASES, "7z": SEVENZ_CASES}[TOOL]
+LZ4_CASES = [
+    "lz4 a.txt", "lz4 -q a.txt", "lz4 -v a.txt", "lz4 a.txt o.lz4", "lz4 a.txt --rm", "lz4 -c a.txt > o.lz4", "lz4 a.txt; lz4 a.txt",
+    "lz4 -f a.txt; lz4 -f a.txt", "lz4 -q a.txt; lz4 -q a.txt", "lz4 -m a.txt b.txt", "lz4 -m a.txt b.txt --rm", "lz4 -r dir",
+    "lz4 -r dir -c > o", "lz4 a.txt b.txt c.txt", "lz4 -f a.txt b.txt c.txt", "lz4 -d a.txt.lz4", "lz4 -df a.txt.lz4", "lz4 a.txt.lz4",
+    "lz4 -d a.txt.lz4 out", "unlz4 a.txt.lz4 out", "unlz4 --rm a.txt.lz4 o", "lz4cat a.txt.lz4 > o", "lz4 -dc a.txt.lz4 > o",
+    "lz4 -t a.txt.lz4", "lz4 -t bad.lz4", "lz4 -t trunc.lz4", "lz4 -t corrupt.lz4", "lz4 -tm a.txt.lz4 bad.lz4 trunc.lz4",
+    "lz4 -d bad.lz4 o", "lz4 -d trunc.lz4 o", "lz4 -d corrupt.lz4 o", "lz4 -d a.txt", "lz4 -d a.txt o", "lz4 -dc a.txt > o",
+    "lz4 -dcf a.txt > o", "lz4cat a.txt > o", "lz4cat a.txt.lz4 a.txt > o", "lz4 -d empty o", "lz4 -dc empty.lz4 > o",
+    "lz4 -d legacy.lz4 o", "lz4 -dc skip.lz4 > o", "lz4 -dc cat2.lz4 > o", "lz4 -d junk.lz4 o", "cat junk.lz4 | lz4 -d > o",
+    "lz4 -dc nocrc.lz4 > o", "lz4 -dc cs.lz4 > o", "lz4 -dc bx.lz4 > o", "lz4 -dc bd.lz4 > o", "lz4 -d -D dict.bin d.lz4 o",
+    "lz4 -d d.lz4 o", "lz4 -dm a.txt.lz4 b.txt", "lz4 -d -m a.txt.lz4 bd.lz4 -c > o", "lz4 -d --no-frame-crc corrupt.lz4 o",
+    "lz4 --list a.txt.lz4", "lz4 --list -v a.txt.lz4 skip.lz4 legacy.lz4 cs.lz4", "lz4 --list cs.lz4", "lz4 --list cat2.lz4 bd.lz4",
+    "lz4 --list bad.lz4", "lz4 --list a.txt", "lz4 --list dir", "lz4 --list", "lz4 --list nonexist", "lz4 --list legacy.lz4",
+    "lz4 --list -v junk.lz4", "lz4 --list skip.lz4 trunc.lz4", "lz4 -9 a.txt", "lz4 -12 --content-size a.txt", "lz4 --fast=3 a.txt",
+    "lz4 --fast a.txt", "lz4 --fast=0 a.txt", "lz4 --fastx a.txt", "lz4 --best a.txt", "lz4 -BD -BX -B4 a.txt", "lz4 -B3 a.txt",
+    "lz4 -B20 a.txt", "lz4 -B100000 a.txt", "lz4 -B32 a.txt", "lz4 -l a.txt", "lz4 -l -m a.txt b.txt", "lz4 --no-frame-crc a.txt",
+    "lz4 --favor-decSpeed -10 a.txt", "lz4 -D dict.bin a.txt", "lz4 -D", "lz4 -D nonexist a.txt", "lz4 --threads=3 a.txt",
+    "lz4 --threads x a.txt", "lz4 --threads", "lz4 --threads=4x a.txt", "lz4 -T4 a.txt", "LZ4_CLEVEL=9 lz4 a.txt",
+    "LZ4_CLEVEL=x lz4 a.txt", "LZ4_NBWORKERS=y lz4 a.txt", "lz4 -V", "lz4 --version", "lz4 -h", "lz4 -H", "lz4 --help",
+    "lz4 --bogus", "lz4 -Z", "lz4 -- -x", "lz4 nonexist", "lz4 dir", "lz4 link", "lz4 -c link > o", "lz4 empty",
+    "lz4 -z a.txt.lz4", "cat a.txt | lz4 > o.lz4", "cat a.txt | lz4 - o.lz4", "cat a.txt | lz4 -c | lz4 -d > o",
+    "cat a.txt.lz4 | lz4 -d - o", "lz4 a.txt -", "lz4 a.txt null", "lz4 -d a.txt.lz4 null", "lz4 -vv a.txt", "lz4 -vvvv a.txt",
+    "lz4 -b1 a.txt", "lz4 -m", "lz4 -m nonexist a.txt", "lz4 --sparse -dc a.txt.lz4 > o", "lz4 --rm -c a.txt > o", "lz4 -k a.txt",
+    "lz4 --no-sparse -d a.txt.lz4 o", "lz4 -dc zeros.lz4 > o", "lz4 -d zeros.lz4 z", "lz4 -c empty | lz4 -d > o",
+    "lz4 -9 -BD a.txt b.txt c", "lz4 -d -f a.txt.lz4 a.txt", "lz4 -Bx a.txt", "lz4 -1e3 a.txt", "lz4 -i2 a.txt", "lz4c -c1 a.txt",
+]
+CASES = {"xz": XZ_CASES, "zstd": ZSTD_CASES, "7z": SEVENZ_CASES, "lz4": LZ4_CASES}[TOOL]
 # Intended differences: our tools say who they are, and leave out what they do not do.
 # The usage text and the too-high-level warning follow zstd's development branch (the reference
 # clone), which the host's 1.5.7 predates; lz4 is not among our formats.
-KNOWN = {"zstd -V", "zstd -qV", "zstd --train a.txt", "zstd -b1 a.txt", "xz --list --format=lzma a.lzma",
+KNOWN = {"lz4 -b1 a.txt", "zstd -V", "zstd -qV", "zstd --train a.txt", "zstd -b1 a.txt", "xz --list --format=lzma a.lzma",
          # 7z: the usage names the program as run (the original always says 7zz); i lists our
          # formats; b is not ours.
          "7z", "7z i",
@@ -234,6 +293,7 @@ def run(d, binpath, cmd):
     err = r.stderr.decode(errors="replace").replace(f"{binpath}/", "")
     out = r.stdout.decode(errors="replace")
     # What depends on the encoder (compressed sizes in summaries) or on who we are (the banner).
+    err = re.sub(r"Done in [0-9.]+ s ==> [0-9.]+ MiB/s  \(cpu load : [0-9]+%\)", "Done in TIME", err)
     err = re.sub(r"=> +[0-9.]+ *[KMG]?i?B", "=> SIZE", err)
     err = re.sub(r"(compressed : |:) ?[0-9]+\.[0-9]+%", r"\1 PCT", err)
     err = re.sub(r"(?m)^\*\*\* Zstandard CLI.*\n", "", err)

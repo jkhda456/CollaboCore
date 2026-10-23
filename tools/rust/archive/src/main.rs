@@ -1,16 +1,17 @@
-//! collabo-archive: xz, zstd and 7z for the collaboCore guest in one binary, which acts as the
+//! collabo-archive: xz, zstd, lz4 and 7z for the collaboCore guest in one binary, which acts as the
 //! name it is run as (the image links each name to it), or as its first argument's
 //! (`collabo-archive xz -d f.xz`).
 
 mod common;
 mod getopt;
+mod lz4;
 mod sevenz;
 mod verify;
 mod xz;
 mod zstd;
 mod xzindex;
 
-const APPLETS: &[&str] = &["xz", "unxz", "xzcat", "lzma", "unlzma", "lzcat", "zstd", "unzstd", "zstdcat", "zstdmt", "7z", "7za", "7zr", "7zz"];
+const APPLETS: &[&str] = &["xz", "unxz", "xzcat", "lzma", "unlzma", "lzcat", "zstd", "unzstd", "zstdcat", "zstdmt", "lz4", "unlz4", "lz4cat", "7z", "7za", "7zr", "7zz"];
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
@@ -32,6 +33,7 @@ fn main() {
     let code = match name.as_str() {
         "xz" | "unxz" | "xzcat" | "lzma" | "unlzma" | "lzcat" => xz::main(&name, args),
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => zstd::main(&name, args),
+        "lz4" | "unlz4" | "lz4cat" => lz4::main(&name, args),
         "7z" | "7za" | "7zr" | "7zz" => sevenz::main(&name, args),
         _ => unreachable!(),
     };

@@ -5,11 +5,15 @@ One cargo workspace, built for the guest by `build.sh` (the `rust` step of `tool
 
 | crate | binary | what |
 |---|---|---|
-| `archive` | `collabo-archive` | xz, zstd and 7z (and unxz, xzcat, lzma, unlzma, lzcat, unzstd, zstdcat, zstdmt, 7za, 7zr), picked by the name it runs as |
+| `archive` | `collabo-archive` | xz, zstd, lz4 and 7z (and unxz, xzcat, lzma, unlzma, lzcat, unzstd, zstdcat, zstdmt, unlz4, lz4cat, 7za, 7zr), picked by the name it runs as |
 | `jq` | `jq` | the JSON processor, following jq's development tree (1.8) |
 | `git-lfs` | `git-lfs` | Git LFS, following git-lfs 3.8.0: every command, its configuration, messages and protocols |
 
-The codecs are pure Rust crates. git-lfs links libcurl (with OpenSSL and zlib) for HTTP: on the
+The codecs are pure Rust crates; lz4's is our port of lz4 1.10.0's library (`archive/src/lz4/`:
+the fast compressor, the mid, hash-chain and optimal compressors of levels 2..12, the frame
+format), whose frames are the original's byte for byte at every level and option, and whose
+decoder fails where the original's does; its command line is a port of lz4's (BSD-2-Clause and
+GPL-2.0-or-later, `archive/LICENSE-lz4-lib`, `archive/COPYING-lz4-programs`). git-lfs links libcurl (with OpenSSL and zlib) for HTTP: on the
 guest the static libraries of `tools/build/curl-root` and `python/deps`, which `build.sh` hands to
 `git-lfs/build.rs` as `COLLABO_CURL_LIBDIRS`; on the host the system's `libcurl.so.4`.
 
@@ -25,7 +29,8 @@ Fixes to crates.io crates are patches in `patches/<crate>-<version>-<what>.patch
 
 - `tests/test_guest.sh [RUNTIME]` — all of them in the guest (`tests/run.sh --all` runs it);
   `NET=1` adds an HTTPS download of LFS objects.
-- `tests/difftest.py {xz,zstd,7z} OUR_DIR REF_DIR` — output compared with the original tools.
+- `tests/difftest.py {xz,zstd,lz4,7z} OUR_DIR REF_DIR` — output compared with the original tools
+  (lz4's reference: 1.10.0's single-threaded build, `make -C programs lz4 HAVE_MULTITHREAD=0`).
 - jq: `jq --run-tests` with jq's own `tests/*.test`; `tests/jq-difftest.py` and `tests/jq-fuzz.py`
   compare with a jq built from its sources.
 - git-lfs: git-lfs's own integration tests (`t/t-*.sh` of the git-lfs 3.8.0 sources) run against

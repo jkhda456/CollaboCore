@@ -103,7 +103,11 @@ for p in sorted(meta["packages"], key=lambda p: p["name"]):
         print(p["name"], p["version"] + ":", p.get("license") or "see crate", p.get("repository") or "")
 ' > "$B/licenses/rust-tools-crates.txt"
 # jq's builtin definitions (jq/src/builtin.jq) and git-lfs's manual pages and completion scripts
-# come from those projects, both MIT-licensed.
+# come from those projects, both MIT-licensed. archive's lz4 is a port of lz4 1.10.0: its codec
+# (archive/src/lz4/{block,hc,frame}.rs) of the library, BSD-2-Clause, its command line
+# (archive/src/lz4/mod.rs) of programs/, GPL-2.0-or-later.
 cp "$W/jq/COPYING-jq" "$B/licenses/jq.MIT.txt"
 cp "$W/git-lfs/LICENSE-git-lfs.md" "$B/licenses/git-lfs.MIT.txt"
+cp "$W/archive/LICENSE-lz4-lib" "$B/licenses/lz4-lib.BSD-2-Clause.txt"
+cp "$W/archive/COPYING-lz4-programs" "$B/licenses/lz4-programs.GPL-2.0.txt"
 for bin in "${BINS[@]}"; do echo "== rust tools: $(du -k "$STAGE/usr/bin/$bin" | cut -f1) KiB $bin"; done

@@ -14,8 +14,8 @@
 #                   over APR 1.7, APR-util 1.6, expat and serf 1.3 (http and https)
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
-#   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, 7z (one
-#                   binary, collabo-archive, under each name), jq, git-lfs
+#   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, lz4, 7z
+#                   (one binary, collabo-archive, under each name), jq, git-lfs
 #
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image; so do xz, unxz,
 # xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
@@ -344,7 +344,7 @@ echo "== cpio"   # always: packing takes a second
     --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \
     --file usr/lib/libcollabo-gui.a="$STAGE/usr/lib/libcollabo-gui.a" \
     --file usr/bin/collabo-archive="$STAGE/usr/bin/collabo-archive" \
-    $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt 7z 7za 7zr; do echo "--link usr/bin/$n=collabo-archive"; done) \
+    $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt lz4 unlz4 lz4cat 7z 7za 7zr; do echo "--link usr/bin/$n=collabo-archive"; done) \
     --file usr/bin/jq="$STAGE/usr/bin/jq" \
     --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
     --file usr/bin/svn="$STAGE/usr/bin/svn" \

@@ -35,6 +35,7 @@ pub enum Codec {
     Lzma,
     Lzip,
     Gzip,
+    Lz4,
 }
 
 /// Counts and hashes what passes through it.
@@ -199,6 +200,7 @@ fn decode(codec: Codec, input: ChannelReader, dict: Option<Vec<u8>>) -> Result<(
         Codec::Lzma => lzma_rust2::LzmaReader::new_mem_limit(&mut input, u32::MAX, None).and_then(|mut r| io::copy(&mut r, &mut out).map(|_| ())),
         Codec::Lzip => io::copy(&mut lzma_rust2::LzipReader::new(&mut input), &mut out).map(|_| ()),
         Codec::Gzip => io::copy(&mut flate2::read::MultiGzDecoder::new(&mut input), &mut out).map(|_| ()),
+        Codec::Lz4 => crate::lz4::decode_all(&mut input, &mut out, dict.unwrap_or_default()),
     };
     // Drain what is left, so the writer side never blocks on a full channel.
     let _ = io::copy(&mut input, &mut io::sink());

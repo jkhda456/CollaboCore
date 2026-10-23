@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The tools of tools.cpio written in Rust (and openssl), run in the guest: xz, zstd and 7z
+# The tools of tools.cpio written in Rust (and openssl), run in the guest: xz, zstd, lz4 and 7z
 # round trips, jq, and git-lfs (clean/smudge filters, a push to a file:// remote and a clone
 # from it, ls-files, fsck, prune). Needs a built runtime (dist/runtime).
 #
@@ -30,11 +30,16 @@ check() {  # check NAME OUTPUT PATTERN
 
 out="$(guest 300 '
 cd /tmp && head -c 300000 /dev/urandom > r && cat /etc/services /etc/services > t
-for c in xz zstd; do $c -k -c r > r.$c && $c -d -c r.$c | cmp - r && echo "$c-ok"; done
+for c in xz zstd lz4; do $c -k -c r > r.$c && $c -d -c r.$c | cmp - r && echo "$c-ok"; done
+lz4 -12 -BD -c t | lz4cat | cmp - t && lz4 -l -c t | unlz4 -c | cmp - t && echo lz4hc-ok
+tar cf - t | lz4 > t.tar.lz4 && file -z t.tar.lz4 | grep -q "tar archive" && echo lz4file-ok
 xz -9e -c t | xzcat | cmp - t && echo xz9-ok
 7z a -bd -mx=5 a.7z r t >/dev/null && mkdir x && cd x && 7z x -bd ../a.7z >/dev/null && cmp r ../r && cmp t ../t && echo 7z-ok')"
 check "xz round trip" "$out" "^xz-ok"
 check "zstd round trip" "$out" "^zstd-ok"
+check "lz4 round trip" "$out" "^lz4-ok"
+check "lz4 -12 linked, legacy format" "$out" "^lz4hc-ok"
+check "file -z through lz4" "$out" "^lz4file-ok"
 check "xz -9e text" "$out" "^xz9-ok"
 check "7z archive and extract" "$out" "^7z-ok"
 
