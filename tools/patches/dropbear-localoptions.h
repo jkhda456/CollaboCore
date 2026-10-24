@@ -45,8 +45,8 @@
  * default, set explicitly for the record.) */
 #define DROPBEAR_X11FWD 0
 
-/* sftp-server is OpenSSH's binary, not shipped here. scp needs a remote-side
- * binary too and is not built. */
+/* sftp-server is OpenSSH's binary, not shipped here. scp (the client) is built
+ * by tools/build.sh with its own patch; the server side is not. */
 #define DROPBEAR_SFTPSERVER 0
 
 /* Sane guest search paths for the spawned shell/command. */

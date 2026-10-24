@@ -135,6 +135,17 @@ if [[ -f "$ROOT/tools/out/tools.cpio" ]]; then
   B="$ROOT/tools/build"
   cp "$B/curl-8.21.0/COPYING" "$OUT/licenses/curl.curl.txt"
   cp "$B/dropbear-2026.92/LICENSE" "$OUT/licenses/dropbear.MIT.txt"
+  # scp is OpenSSH's (BSD), under the notices at the top of its source, which LICENSE leaves out
+  sed -n '1,/^#include/p' "$B/dropbear-2026.92/src/scp.c" | sed '$d' > "$OUT/licenses/dropbear-scp.BSD.txt"
+  # column is BSD-4-Clause-UC; the libsmartcols and lib/ code linked in with it LGPL-2.1-or-later
+  cat "$B/util-linux-2.42.2/Documentation/licenses/COPYING.BSD-4-Clause-UC" - \
+      "$B/util-linux-2.42.2/Documentation/licenses/COPYING.LGPL-2.1-or-later" \
+      <<< $'\n---- libsmartcols, lib/ ----\n' > "$OUT/licenses/util-linux-column.BSD-4-Clause-UC.LGPL-2.1.txt"
+  for file in "$B"/ripgrep/licenses/*; do [[ -f "$file" ]] && cp "$file" "$OUT/licenses/"; done
+  # perl and the modules it carries: the Artistic License or the GPL (version 1 or later), at the
+  # user's choice; perl-cross only builds it
+  cat "$B/perl-5.44.0/Artistic" - "$B/perl-5.44.0/Copying" <<< $'\n---- or ----\n' \
+    > "$OUT/licenses/perl.Artistic-or-GPL.txt"
   cp "$B/git-2.55.0/COPYING" "$OUT/licenses/git.GPL-2.0.txt"
   cp "$B/screen-5.0.2/COPYING" "$OUT/licenses/screen.GPL-3.0.txt"
   # Subversion's LICENSE also has those of the utf8proc and LZ4 it carries; Apache's NOTICE

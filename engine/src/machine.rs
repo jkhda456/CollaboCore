@@ -72,6 +72,8 @@ pub struct Shared {
     /// same shell is compiled once and reused for the life of the machine.
     pub programs: Mutex<HashMap<u64, Module>>,
     pub memory: SharedMemory,
+    /// Programs are interrupted on a tick (BootOptions::preempt).
+    preempt: bool,
     requests: Mutex<Sender<Request>>,
     /// Where the guest's early kernel messages go (before its console device exists).
     boot_console: Mutex<Box<dyn FnMut(&[u8]) + Send>>,
@@ -461,7 +463,8 @@ fn call_indirect(store: &mut Store<HostState>, instance: &Instance, function: u3
 
 /// One virtual CPU: its own store and instance over the shared memory.
 fn run_cpu(shared: Arc<Shared>, function: u32, arg: u32, user: Option<crate::user::UserContext>) -> Result<()> {
-    let mut store = Store::new(
+    let preempt = shared.preempt;
+    let mut store = with_ticks(Store::new(
         &shared.engine,
         HostState {
             shared: shared.clone(),
@@ -471,7 +474,7 @@ fn run_cpu(shared: Arc<Shared>, function: u32, arg: u32, user: Option<crate::use
             kernel_instance: None,
             user: Default::default(),
         },
-    );
+    ), preempt);
     store.data_mut().user.context = user.clone();
     let linker = make_linker(&shared, &store)?;
     let instance = linker.instantiate(&mut store, &shared.module)?;
@@ -519,6 +522,11 @@ pub struct BootOptions {
     pub boot_console: Box<dyn FnMut(&[u8]) + Send>,
     /// Receives every program the guest starts (the kernel reports them only when this is set).
     pub exec_log: Option<ExecObserver>,
+    /// Interrupt a program running its own code every EPOCH_TICK, so that a loop without
+    /// syscalls still gives up its cpu and takes signals (SIGKILL too). It costs a check in every
+    /// loop and call of the guest's code: nothing for code that waits on I/O, up to about 15% for
+    /// an interpreter's inner loop (Python, a shell); `--no-preempt` turns it off.
+    pub preempt: bool,
 }
 
 /// Native stack a guest thread's WebAssembly may use (wasmtime's `max_wasm_stack`).
@@ -526,6 +534,19 @@ pub const MAX_WASM_STACK: usize = 32 << 20;
 /// Stack of the host threads that run guest CPUs: the wasm stack plus room for the host's own
 /// frames (wasmtime, the kernel's host functions).
 const CPU_THREAD_STACK: usize = MAX_WASM_STACK + (8 << 20);
+/// How often a program running its own code is interrupted (user::on_epoch): the latency of a
+/// signal to a loop that makes no syscalls, and of the scheduler taking its cpu back.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A new store's tick (with preemption): every store gets it, the kernel's code passes through
+/// it unchanged.
+fn with_ticks(mut store: Store<HostState>, preempt: bool) -> Store<HostState> {
+    if preempt {
+        store.epoch_deadline_callback(crate::user::on_epoch);
+        store.set_epoch_deadline(1);
+    }
+    store
+}
 
 impl Machine {
     pub fn boot(options: BootOptions) -> Result<Machine> {
@@ -537,7 +558,21 @@ impl Machine {
         // than wasmtime's 512 KiB of native stack, or a deep call traps and takes the whole
         // machine down. CPU threads are spawned with room for it (CPU_THREAD_STACK).
         config.max_wasm_stack(MAX_WASM_STACK);
+        // WebAssembly has no asynchronous trap: without a check compiled into loops and calls, a
+        // program that makes no syscalls never gives the kernel its cpu back, nor takes a signal
+        // (not even SIGKILL). The check is a load and a compare; a thread bumps the epoch.
+        config.epoch_interruption(options.preempt);
         let engine = Engine::new(&config)?;
+        if options.preempt {
+            let ticks = engine.weak();
+            std::thread::Builder::new().name("epoch".into()).spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                match ticks.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => break,
+                }
+            })?;
+        }
         let module = Module::new(&engine, &options.kernel).context("compiling the kernel")?;
 
         let (memory_type, kernel_pages) = crate::module_info::memory_import(&options.kernel)?;
@@ -587,6 +622,7 @@ impl Machine {
             module,
             programs: Mutex::new(HashMap::new()),
             memory,
+            preempt: options.preempt,
             requests: Mutex::new(sender),
             boot_console: Mutex::new(options.boot_console),
             exec_log: options.exec_log.clone(),
@@ -597,7 +633,7 @@ impl Machine {
         if !options.initcpio.is_empty() {
             write_memory(&shared.memory, initcpio_address as u32, &options.initcpio)?;
         }
-        let mut store = Store::new(
+        let mut store = with_ticks(Store::new(
             &shared.engine,
             HostState {
                 shared: shared.clone(),
@@ -607,7 +643,7 @@ impl Machine {
                 kernel_instance: None,
                 user: Default::default(),
             },
-        );
+        ), options.preempt);
         let linker = make_linker(&shared, &store)?;
         let instance = linker.instantiate(&mut store, &shared.module)?;
         store.data_mut().kernel_instance = Some(instance);

@@ -1,0 +1,200 @@
+Esc then a key as Alt-key at the shell prompt. read_key joins ESC to the key after it only when
+that key arrives within 50 ms, which is how a terminal sends Alt (Option as Meta) as one burst.
+Typed by hand, as Mac users do (Esc, then Backspace), the pause is longer: the ESC was dropped
+and Backspace removed one character instead of a word. readline and zle treat ESC as the Meta
+prefix with no time limit; lineedit now does too, for Backspace, d, f and b (the Alt keys it
+binds) and '.'. Any other key after ESC is taken as itself.
+
+Alt-. (Esc .) is new, as in bash: it inserts the last word of the previous command (quotes kept,
+a quoted space does not split it); pressed again, that word gives way to the one from the
+command before. read_key does not map ESC '.', so busybox vi's "Esc ." stays two keys.
+
+diff --git a/libbb/lineedit.c b/libbb/lineedit.c
+index 151208c..539ad19 100644
+--- a/libbb/lineedit.c
++++ b/libbb/lineedit.c
+@@ -1861,6 +1861,135 @@ static void ctrl_right(void)
+ 	}
+ }
+ 
++/* Alt-. (Esc .), insert the previous command's last argument. Only lineedit
++ * knows it: read_key leaves ESC . as two keys, which vi's "Esc ." needs. */
++enum { KEYCODE_ALT_PERIOD = -14 & ~0x20 };
++
++/* The Alt- keycode for a key typed after a lone ESC, as readline treats
++ * ESC as the Meta prefix: Esc then Backspace deletes a word like
++ * Alt-Backspace, however long the pause between the two keys. */
++static int32_t meta_key(int32_t ic)
++{
++	switch (ic) {
++	case '\x7f':
++	case '\b':
++		return KEYCODE_ALT_BACKSPACE;
++	case 'd':
++		return KEYCODE_ALT_D;
++	case 'f':
++		return KEYCODE_ALT_RIGHT;
++	case 'b':
++		return KEYCODE_ALT_LEFT;
++	case '.':
++		return KEYCODE_ALT_PERIOD;
++	}
++	return ic;
++}
++
++#if MAX_HISTORY > 0
++/* The last word of a command line as typed, quotes and backslashes kept:
++ * a quoted space does not split it. Returns its length (0: no word). */
++static int last_word(const char *line, const char **word)
++{
++	const char *p, *start = NULL, *end = NULL;
++	char quote = 0;
++
++	for (p = line; *p; p++) {
++		if (!quote && (*p == ' ' || *p == '\t' || *p == '\n')) {
++			if (start && !end)
++				end = p;
++			continue;
++		}
++		if (!start || end) {
++			start = p;
++			end = NULL;
++		}
++		if (quote) {
++			if (*p == quote)
++				quote = 0;
++			else if (*p == '\\' && quote == '"' && p[1])
++				p++;
++		} else if (*p == '\'' || *p == '"') {
++			quote = *p;
++		} else if (*p == '\\' && p[1]) {
++			p++;
++		}
++	}
++	if (!start)
++		return 0;
++	*word = start;
++	return (end ? end : p) - start;
++}
++
++/* Puts len bytes of multibyte text at the cursor, the cursor after them.
++ * Returns how many characters went in. */
++static int input_insert(const char *text, int len)
++{
++	CHAR_T chars[MAX_LINELEN];
++	char mb[MAX_LINELEN];
++	int n, sc;
++
++	if (len >= MAX_LINELEN)
++		return 0;
++	memcpy(mb, text, len);
++	mb[len] = '\0';
++# if ENABLE_UNICODE_SUPPORT
++	if (unicode_status == UNICODE_ON) {
++		n = mbstowcs(chars, mb, MAX_LINELEN - 1);
++		if (n < 0)
++			return 0;
++	} else
++# endif
++	for (n = 0; n < len; n++)
++		chars[n] = (unsigned char)mb[n];
++	if ((int)command_len + n >= S.maxsize - 2) {
++		beep();
++		return 0;
++	}
++
++	sc = cursor;
++	memmove(command_ps + sc + n, command_ps + sc,
++		(command_len - sc + 1) * sizeof(command_ps[0]));
++	memcpy(command_ps + sc, chars, n * sizeof(command_ps[0]));
++	command_len += n;
++	put_till_end_and_adv_cursor();
++	input_backward(cursor - sc - n);
++	return n;
++}
++
++/* Alt-. as in bash: the last argument of the command before the one shown.
++ * Pressed again (*index >= 0), the word it put in gives way to the one from
++ * the command before that. */
++static void yank_last_arg(int *index, int *inserted)
++{
++	const char *word;
++	int i, len = 0;
++
++	if (!(state->flags & DO_HISTORY)) {
++		beep();
++		return;
++	}
++	i = *index >= 0 ? *index : state->cur_history;
++	while (--i >= 0) {
++		len = last_word(state->history[i], &word);
++		if (len)
++			break;
++	}
++	if (i < 0) {
++		beep();
++		return;
++	}
++	if (*index >= 0) {
++		int n = *inserted;
++		input_backward(n);
++		while (--n >= 0)
++			input_delete(0);
++	}
++	*index = i;
++	*inserted = input_insert(word, len);
++}
++#endif
++
+ 
+ /*
+  * read_line_input and its helpers
+@@ -2466,6 +2595,11 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
+ 	int timeout;
+ #if ENABLE_FEATURE_TAB_COMPLETION
+ 	smallint lastWasTab = 0;
++#endif
++#if MAX_HISTORY > 0
++	/* The history line the last Alt-. took a word from (-1: the key
++	 * before was another), and how many characters it put in */
++	int yank_index = -1, yank_len = 0;
+ #endif
+ 	smallint break_out = 0;
+ #if ENABLE_FEATURE_EDITING_VI
+@@ -2577,6 +2711,13 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
+ 		}
+ #endif
+ 		ic = ic_raw = lineedit_read_key(read_key_buffer, timeout);
++		/* read_key joins ESC to the next key only within 50 ms, so a
++		 * lone ESC (vi mode aside) waits here for the key it modifies.
++		 * ic_raw stays that key: ESC then Ctrl-C still interrupts. */
++		while (ic == '\x1b' && !(state->flags & VI_MODE)) {
++			ic_raw = lineedit_read_key(read_key_buffer, timeout);
++			ic = meta_key(ic_raw);
++		}
+ 
+ #if ENABLE_FEATURE_REVERSE_SEARCH
+  again:
+@@ -2703,6 +2844,11 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
+ 				input_delete(1);
+ 			break;
+ 		}
++#if MAX_HISTORY > 0
++		case KEYCODE_ALT_PERIOD:
++			yank_last_arg(&yank_index, &yank_len);
++			break;
++#endif
+ #if ENABLE_FEATURE_REVERSE_SEARCH
+ 		case CTRL('R'):
+ 			ic = ic_raw = reverse_i_search(timeout);
+@@ -2969,6 +3115,10 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
+ #if ENABLE_FEATURE_TAB_COMPLETION
+ 		if (ic_raw != '\t')
+ 			lastWasTab = 0;
++#endif
++#if MAX_HISTORY > 0
++		if (ic != KEYCODE_ALT_PERIOD)
++			yank_index = -1;
+ #endif
+ 	} /* while (1) */
+ 

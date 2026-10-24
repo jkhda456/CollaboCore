@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use wasmtime::{AsContextMut, Caller, Func, Instance, Linker, Module, Ref, SharedMemory, Val};
+use wasmtime::{AsContextMut, Caller, Func, Instance, Linker, Module, Ref, SharedMemory, StoreContextMut, TypedFunc, UpdateDeadline, Val};
 
 use crate::machine::{guest_bytes, HostState};
 
@@ -45,6 +45,12 @@ pub struct User {
     siginfo_results: Vec<Option<i32>>,
     /// This thread's instances of the process's libraries (dlopen).
     pub dylink: crate::dylink::Thread,
+    /// The program's own code is running (not the kernel's): an epoch tick here is an interrupt
+    /// from user mode ([`on_epoch`]). Set where the host enters the program, cleared where the
+    /// program calls into the kernel, each restored on the way back.
+    in_user: bool,
+    /// The kernel's `user_interrupt`, once looked up (`Some(None)`: a kernel without it).
+    interrupt: Option<Option<TypedFunc<(), ()>>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -349,13 +355,10 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
             let before = caller.data().user.generation;
             // A trap of the program's own signal handler (UserTrapped) or an exec (HaltUser) passes
             // through; anything else failed in the kernel.
-            let result = syscall.call(&mut caller, (nr, a0, a1, a2, a3, a4, a5)).map_err(|error| {
-                if error.chain().any(|cause| cause.is::<HaltUser>() || cause.is::<UserTrapped>()) {
-                    error
-                } else {
-                    error.context(KernelFailed)
-                }
-            })?;
+            let was = std::mem::replace(&mut caller.data_mut().user.in_user, false);
+            let result = syscall.call(&mut caller, (nr, a0, a1, a2, a3, a4, a5));
+            caller.data_mut().user.in_user = was;
+            let result = result.map_err(kernel_error)?;
             // execve replaced the program under us: leave the old instance's frames.
             if caller.data().user.generation != before {
                 caller.data_mut().user.entry = Entry::Start;
@@ -366,11 +369,17 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
     )?;
     if let Some(get_thread_area) = get_thread_area {
         linker.func_wrap("linux", "get_thread_area", move |mut caller: Caller<'_, HostState>| -> Result<i32> {
-            get_thread_area.call(&mut caller, ())
+            let was = std::mem::replace(&mut caller.data_mut().user.in_user, false);
+            let result = get_thread_area.call(&mut caller, ());
+            caller.data_mut().user.in_user = was;
+            result
         })?;
     }
     linker.func_wrap("linux", "copy_siginfo", move |mut caller: Caller<'_, HostState>, to: i32| -> Result<i32> {
-        let result = copy_siginfo.call(&mut caller, to)?;
+        let was = std::mem::replace(&mut caller.data_mut().user.in_user, false);
+        let result = copy_siginfo.call(&mut caller, to);
+        caller.data_mut().user.in_user = was;
+        let result = result?;
         if let Some(slot) = caller.data_mut().user.siginfo_results.last_mut() {
             *slot = Some(result);
         }
@@ -385,6 +394,44 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
     // a new instance has none of the process's libraries yet: it catches up when it first syncs
     state.user.dylink = crate::dylink::Thread::default();
     Ok(())
+}
+
+/// What a call into the kernel failed with, as the program's caller should see it: a trap of the
+/// program's own signal handler (UserTrapped) or an exec (HaltUser) passes through; anything
+/// else failed in the kernel.
+fn kernel_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<HaltUser>() || cause.is::<UserTrapped>()) {
+        error
+    } else {
+        error.context(KernelFailed)
+    }
+}
+
+/// While the kernel takes a tick: no deadline (about 10^11 ticks). The callback is out of the
+/// store while it runs, so a nested one would trap, and the kernel may park this thread a while.
+const NO_TICK: u64 = 1 << 40;
+
+/// The epoch tick (machine.rs), on every store. In the program's own code the kernel takes it as
+/// an interrupt from user mode (`user_interrupt`): expired timers, pending signals (SIGKILL ends
+/// the task right there) and the scheduler, which is how a loop without syscalls still gets
+/// signals and gives up its cpu. In the kernel's code, or with a kernel without the export,
+/// nothing happens.
+pub fn on_epoch(mut store: StoreContextMut<'_, HostState>) -> Result<UpdateDeadline> {
+    if store.data().user.in_user {
+        if store.data().user.interrupt.is_none() {
+            let kernel = store.data().kernel_instance;
+            let found = kernel.and_then(|kernel| kernel.get_typed_func::<(), ()>(&mut store, "user_interrupt").ok());
+            store.data_mut().user.interrupt = Some(found);
+        }
+        if let Some(Some(interrupt)) = store.data().user.interrupt.clone() {
+            store.set_epoch_deadline(NO_TICK);
+            store.data_mut().user.in_user = false;
+            let result = interrupt.call(&mut store, ());
+            store.data_mut().user.in_user = true;
+            result.map_err(kernel_error)?;
+        }
+    }
+    Ok(UpdateDeadline::Continue(1))
 }
 
 /// Calls a guest function whatever its result type is: a thread entry point or a signal handler
@@ -411,6 +458,7 @@ pub fn call(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
     loop {
         let instance = store.as_context().data().user.instance.context("no user program is running")?;
         let entry = store.as_context().data().user.entry;
+        let was = std::mem::replace(&mut store.as_context_mut().data_mut().user.in_user, true);
         let outcome = match entry {
             Entry::Start => instance
                 .get_typed_func::<(), ()>(store.as_context_mut(), "_start")
@@ -419,6 +467,7 @@ pub fn call(mut store: impl AsContextMut<Data = HostState>) -> Result<()> {
             Entry::Function { function, arg } => table_function(store.as_context_mut(), &instance, function)
                 .and_then(|function| call_dynamic(store.as_context_mut(), function, &[Val::I32(arg as i32)])),
         };
+        store.as_context_mut().data_mut().user.in_user = was;
         match outcome.map_err(|error| uncaught(store.as_context_mut(), error)) {
             // A program that returns instead of exiting is a bug in the program, not the host.
             Ok(()) => return Ok(()),
@@ -520,7 +569,9 @@ pub fn link(linker: &mut Linker<HostState>) -> Result<()> {
 pub fn call_signal_handler(mut store: impl AsContextMut<Data = HostState>, function: u32, signal: i32) -> Result<()> {
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let handler = table_function(store.as_context_mut(), &instance, function)?;
+    let was = std::mem::replace(&mut store.as_context_mut().data_mut().user.in_user, true);
     let called = call_dynamic(store.as_context_mut(), handler, &[Val::I32(signal)]);
+    store.as_context_mut().data_mut().user.in_user = was;
     called.map_err(|error| mark_user_trap(uncaught(store.as_context_mut(), error)))
 }
 
@@ -542,7 +593,9 @@ pub fn call_siginfo_handler(mut store: impl AsContextMut<Data = HostState>, tram
     let instance = store.as_context().data().user.instance.context("no user program is running")?;
     let entry = table_function(store.as_context_mut(), &instance, trampoline)?;
     store.as_context_mut().data_mut().user.siginfo_results.push(None);
+    let was = std::mem::replace(&mut store.as_context_mut().data_mut().user.in_user, true);
     let called = call_dynamic(store.as_context_mut(), entry, &[Val::I32(function), Val::I32(signal)]);
+    store.as_context_mut().data_mut().user.in_user = was;
     let called = called.map_err(|error| mark_user_trap(uncaught(store.as_context_mut(), error)));
     let result = store.as_context().data().user.siginfo_results.last().copied().flatten().unwrap_or(EINVAL);
     // The kernel's own cleanup must run even if the handler unwound.

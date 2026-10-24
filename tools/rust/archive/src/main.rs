@@ -1,4 +1,4 @@
-//! collabo-archive: xz, zstd, lz4 and 7z for the collaboCore guest in one binary, which acts as the
+//! collabo-archive: xz, zstd, lz4, 7z and zip for the collaboCore guest in one binary, which acts as the
 //! name it is run as (the image links each name to it), or as its first argument's
 //! (`collabo-archive xz -d f.xz`).
 
@@ -8,10 +8,21 @@ mod lz4;
 mod sevenz;
 mod verify;
 mod xz;
+mod zip;
 mod zstd;
 mod xzindex;
 
-const APPLETS: &[&str] = &["xz", "unxz", "xzcat", "lzma", "unlzma", "lzcat", "zstd", "unzstd", "zstdcat", "zstdmt", "lz4", "unlz4", "lz4cat", "7z", "7za", "7zr", "7zz"];
+/// The guest has no fork(), and its musl does not declare it; std's Command (zip -TT runs a
+/// command) only falls back to it when posix_spawn cannot do the job, which it never asks for
+/// here. The symbol is here so that std links; it fails as the kernel would.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn fork() -> libc::pid_t {
+    unsafe { *libc::__errno_location() = libc::ENOSYS };
+    -1
+}
+
+const APPLETS: &[&str] = &["xz", "unxz", "xzcat", "lzma", "unlzma", "lzcat", "zstd", "unzstd", "zstdcat", "zstdmt", "lz4", "unlz4", "lz4cat", "7z", "7za", "7zr", "7zz", "zip"];
 
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
@@ -35,6 +46,7 @@ fn main() {
         "zstd" | "unzstd" | "zstdcat" | "zstdmt" => zstd::main(&name, args),
         "lz4" | "unlz4" | "lz4cat" => lz4::main(&name, args),
         "7z" | "7za" | "7zr" | "7zz" => sevenz::main(&name, args),
+        "zip" => zip::main(&name, args),
         _ => unreachable!(),
     };
     std::process::exit(code);

@@ -2,7 +2,7 @@
 # The guest's tools written in Rust (this workspace, Cargo.toml), part of tools.cpio
 # (tools/build.sh runs this as its `rust` step; it also runs alone). Into tools/stage:
 #
-#   usr/bin/collabo-archive   xz, zstd and 7z in one binary; the image links their names to it
+#   usr/bin/collabo-archive   xz, zstd, lz4, 7z and zip in one binary; the image links their names to it
 #   usr/bin/jq                the JSON processor
 #   usr/bin/git-lfs           Git Large File Storage
 #
@@ -108,6 +108,9 @@ for p in sorted(meta["packages"], key=lambda p: p["name"]):
 # (archive/src/lz4/mod.rs) of programs/, GPL-2.0-or-later.
 cp "$W/jq/COPYING-jq" "$B/licenses/jq.MIT.txt"
 cp "$W/git-lfs/LICENSE-git-lfs.md" "$B/licenses/git-lfs.MIT.txt"
+# archive's zip follows Info-ZIP's Zip 3.0 and carries its help and license texts: Info-ZIP's
+# license, which also asks that it not be passed off as an Info-ZIP release (it says it is not).
+cp "$W/archive/LICENSE-infozip" "$B/licenses/zip-infozip.Info-ZIP.txt"
 cp "$W/archive/LICENSE-lz4-lib" "$B/licenses/lz4-lib.BSD-2-Clause.txt"
 cp "$W/archive/COPYING-lz4-programs" "$B/licenses/lz4-programs.GPL-2.0.txt"
 for bin in "${BINS[@]}"; do echo "== rust tools: $(du -k "$STAGE/usr/bin/$bin" | cut -f1) KiB $bin"; done

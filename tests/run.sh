@@ -72,6 +72,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   python3 "$T/test_traps.py" >"$progs/traps.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/traps.txt" | head -40; echo "FAIL: guest traps (addons/mod/0009, 0010)"; exit 1; }
   tail -1 "$progs/traps.txt"
 
+  echo "== guest boot: a loop without syscalls is preempted: SIGKILL/SIGTERM end it, SIGALRM reaches it (the engine's tick)"
+  python3 "$T/test_preempt.py" >"$progs/preempt.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/preempt.txt" | head -40; echo "FAIL: preemption (kernel/patches/user-interrupt.patch, engine/src/user.rs on_epoch)"; exit 1; }
+  tail -1 "$progs/preempt.txt"
+
   echo "== guest boot: dlopen of a shared library (functions, data, TLS, threads, setjmp)"
   python3 "$T/test_dlopen.py" >"$progs/dlopen.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/dlopen.txt" | head -40; echo "FAIL: dlopen (addons/mod/0019, 0020)"; exit 1; }
   tail -1 "$progs/dlopen.txt"
@@ -161,6 +165,12 @@ if [[ "$MODE" == "--all" ]]; then
   echo "== Subversion: file://, svn:// (svnserve), svn+ssh://, hooks, dump/load, vi in a terminal"
   if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_svn.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: svn"; exit 1
+  fi
+  tail -1 "$log"
+
+  echo "== rg, column, scp, zip, perl: what agents reach for (perl's children without fork), in the guest"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_agent_tools.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: agent tools"; exit 1
   fi
   tail -1 "$log"
 

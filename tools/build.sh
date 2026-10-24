@@ -3,19 +3,22 @@
 # (`python3 build.py tools-image`):
 #
 #   curl      8.21  HTTP(S)/FTP client and libcurl (OpenSSL, zlib); git's http(s) transport uses it
-#   dropbear  2026  `ssh` (dbclient) and dropbearkey; keys can stay in the host's ssh-agent
+#   dropbear  2026  `ssh` (dbclient), scp and dropbearkey; keys can stay in the host's ssh-agent
 #   git       2.55  with the http(s) and ssh transports
 #   screen    5.0   GNU screen, the terminal multiplexer
 #   openssl   3.5   the openssl command (keys, certificates, s_client, enc, dgst, ...)
 #   sqlite    3.51  the sqlite3 shell, the same SQLite (and options) as Python's sqlite3 module
 #   file      5.48  file(1) and its magic database; gzip, bzip2, xz and lzma looked into (-z) in-process
+#   column    2.42  util-linux's column (tables, -t, -J JSON), with libsmartcols
+#   ripgrep   15.2  rg
+#   perl      5.44  perl, its library and scripts (perldoc, prove, cpan, ...), built with perl-cross
 #   svn       1.15  Subversion: svn, svnadmin, svnlook, svnserve, svnsync, svnrdump, svnmucc,
 #                   svndumpfilter, svnfsfs, svnversion (one program, the others links to it),
 #                   over APR 1.7, APR-util 1.6, expat and serf 1.3 (http and https)
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
-#   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, lz4, 7z
-#                   (one binary, collabo-archive, under each name), jq, git-lfs
+#   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, lz4, 7z and
+#                   zip (one binary, collabo-archive, under each name), jq, git-lfs
 #
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image; so do xz, unxz,
 # xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
@@ -24,7 +27,7 @@
 # patches; distro has no screen or Subversion, so their patches are ours (patches/screen-nofork.patch,
 # patches/apr-wasm.patch), and file's fork is ours to replace (patches/file-nofork.patch). OpenSSL, zlib, ncurses and SQLite are the static libraries
 # python/build-deps.sh builds (python/deps), so the python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen openssl sqlite file svn gui rust cpio (gui and rust always run: cargo
+# them.   stages: curl dropbear git screen openssl sqlite file column perl svn gui rust ripgrep cpio (gui and rust always run: cargo
 # and the compiles are incremental)
 set -euo pipefail
 
@@ -101,18 +104,21 @@ if stage curl "$STAGE/usr/bin/curl"; then
   install -D "$B/curl-root/usr/bin/curl" "$STAGE/usr/bin/curl"
 fi
 
-STEP=dropbear  # the client side only: dbclient (installed as ssh too), dropbearkey, dropbearconvert.
-               # distro's patch replaces fork with posix_spawn; localoptions.h compiles out the rest.
-if stage dropbear "$STAGE/usr/bin/dbclient"; then
+STEP=dropbear  # the client side only: dbclient (installed as ssh too), dropbearkey, dropbearconvert,
+               # and scp (with its progress meter), which runs dbclient. distro's patch replaces fork
+               # with posix_spawn; localoptions.h compiles out the rest. distro does not build scp:
+               # patches/scp-posix-spawn.patch starts its children with posix_spawnp.
+if stage dropbear "$STAGE/usr/bin/scp"; then
   S="$(unpack dropbear)"
   (cd "$S" && patch -p1 --quiet < "$DISTRO/dropbear/wasm-posix-spawn.patch")
+  (cd "$S" && patch -p1 --quiet < "$N/patches/scp-posix-spawn.patch")
   cp "$N/patches/dropbear-localoptions.h" "$S/localoptions.h"
   # HAVE_DAEMON: keeps compat.c's fork()-based daemon() fallback out (nothing calls daemon()).
   (cd "$S" && log env ac_cv_func_daemon=yes ./configure "${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
      --prefix=/usr LDFLAGS="$LINK_FLAGS" \
      --disable-zlib --disable-pam --disable-lastlog --disable-wtmp --disable-utmp --disable-loginfunc)
-  log make -C "$S" -j"$JOBS" PROGRAMS="dbclient dropbearkey dropbearconvert"
-  for p in dbclient dropbearkey dropbearconvert; do install -D "$S/$p" "$STAGE/usr/bin/$p"; done
+  log make -C "$S" -j"$JOBS" PROGRAMS="dbclient dropbearkey dropbearconvert scp" SCPPROGRESS=1
+  for p in dbclient dropbearkey dropbearconvert scp; do install -D "$S/$p" "$STAGE/usr/bin/$p"; done
 fi
 
 STEP=git  # distro's flags, each explained in its package.nix; in short: every child goes through
@@ -214,6 +220,89 @@ if stage file "$STAGE/usr/bin/file"; then
   log make -C "$S" -j"$JOBS" FILE_COMPILE="$H/src/file" pkgdatadir=/usr/share/misc
   install -D "$S/src/file" "$STAGE/usr/bin/file"
   install -D -m644 "$S/magic/magic.mgc" "$STAGE/usr/share/misc/magic.mgc"
+fi
+
+STEP=column  # util-linux's column (busybox has none), as distro configures util-linux, with its
+             # libsmartcols. column is one of the programs configure decides on itself (it has
+             # no --enable-column), so --disable-all-programs would drop it: configure everything,
+             # make only column. Of distro's patches it needs the one for libcommon's single fork
+             # (fileutils-callback-clone.patch, a callback-clone child; column never takes it).
+if stage column "$STAGE/usr/bin/column"; then
+  S="$(unpack util-linux)"
+  (cd "$S" && patch -p1 --quiet < "$DISTRO/util-linux/fileutils-callback-clone.patch")
+  (cd "$S" && log ./configure "${HOST[@]}" CC="$CC" AR=llvm-ar-19 RANLIB=llvm-ranlib-19 \
+     --prefix=/usr LDFLAGS="$LINK_FLAGS" --disable-shared --enable-static --disable-nls \
+     --disable-makeinstall-chown --disable-makeinstall-setuid --disable-asciidoc --disable-poman \
+     --without-systemd --without-python --without-udev --without-ncurses --without-tinfo \
+     --without-readline --without-libz --without-libmagic --without-cap-ng --without-selinux \
+     --without-audit --without-btrfs --without-econf --without-user --disable-liblastlog2)
+  log make -C "$S" -j"$JOBS" column
+  install -D "$S/column" "$STAGE/usr/bin/column"
+fi
+
+STEP=perl  # perl 5.44, configured and built by perl-cross (no program runs on the target while
+           # configuring): every extension in the one binary (no dlopen in the guest; DynaLoader
+           # stays, as in a static perl, so XSLoader finds them), 64-bit integers, no PerlIO::mmap
+           # (no mmap) or IPC::SysV (no SysV IPC in the guest's kernel). patches/perl-wasm.patch:
+           # system(), qx// and piped opens through posix_spawn (fork stays unsupported), the re
+           # extension's symbols, perl-cross's static extensions installing their .pm files.
+           # What perl-cross cannot find out without running a program is given: type sizes come
+           # from llvm-nm (a readelf --syms for wasm objects), the byte order, musl's LC_ALL
+           # format (positional, ';') and its printf (%lld for 64 bits, where glibc also takes
+           # perl-cross's %Ld). Encode's sub-extensions (Byte, CN, JP, KR, TW, ...) are added to
+           # the static ones: perl-cross only sees the top Encode. The image leaves out the static
+           # libraries (nothing can link against them here) and the pod pages but perlfunc, perlop,
+           # perlre, perlsyn and perlvar (perldoc -f, -v).
+if stage perl "$STAGE/usr/bin/perl"; then
+  S="$(unpack perl)"
+  untar "$(fetch perl-cross)" -x -C "$S" --strip-components=1
+  chmod -R u+w "$S"
+  (cd "$S" && patch -p1 --quiet < "$N/patches/perl-wasm.patch")
+  cat > "$S/readelf-wasm" <<'SH'
+#!/bin/sh
+# perl-cross reads type sizes from `readelf --syms`; wasm objects are not ELF, llvm-nm -S has them
+for a; do case "$a" in -*) ;; *) obj="$a" ;; esac; done
+n=0
+llvm-nm-19 -S "$obj" | while read -r addr size type name; do
+  [ -n "$name" ] || continue
+  n=$((n + 1))
+  printf '%6d: %s %5d OBJECT  GLOBAL DEFAULT    1 %s\n' "$n" "$addr" "$((0x$size))" "$name"
+done
+SH
+  chmod +x "$S/readelf-wasm"
+  (cd "$S" && CONFIG_SITE= log ./configure --target=wasm32-unknown-linux-musl --prefix=/usr \
+     --with-cc="$CC" --with-ranlib=llvm-ranlib-19 --with-objdump=llvm-objdump-19 --host-cc=clang-19 \
+     -Dar=llvm-ar-19 -Dnm=llvm-nm-19 -Dreadelf="$S/readelf-wasm" \
+     --all-static -Duse64bitint -Dbyteorder=12345678 -Dosname=linux -Darchname=wasm32-linux \
+     -Doptimize=-O2 "-Dldflags=$LINK_FLAGS" \
+     "-Dccflags=-D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -DNO_ENV_ARRAY_IN_MAIN -mllvm -wasm-enable-sjlj" \
+     --disable-mod=ext/PerlIO-mmap,cpan/IPC-SysV \
+     -Dd_perl_lc_all_uses_name_value_pairs=undef -Dd_perl_lc_all_separator=define '-Dperl_lc_all_separator=";"' \
+     -Dd_perl_lc_all_category_positions_init=define \
+     '-Dperl_lc_all_category_positions_init={ LC_CTYPE, LC_NUMERIC, LC_TIME, LC_COLLATE, LC_MONETARY, LC_MESSAGES }' \
+     '-Divdformat="lld"' '-Duvuformat="llu"' '-Duvoformat="llo"' '-Duvxformat="llx"' '-DuvXUformat="llX"' \
+     -Dd_PRId64=define -Dd_PRIi64=define -Dd_PRIu64=define -Dd_PRIo64=define -Dd_PRIx64=define -Dd_PRIXU64=define \
+     '-DsPRId64="lld"' '-DsPRIi64="lli"' '-DsPRIu64="llu"' '-DsPRIo64="llo"' '-DsPRIx64="llx"' '-DsPRIXU64="llX"')
+  ENC="Byte CN EBCDIC JP KR Symbol TW Unicode"
+  mods="$(for e in $ENC; do printf ' Encode/%s' "$e"; done)"
+  paths="$(for e in $ENC; do printf ' cpan/Encode/%s' "$e"; done)"
+  sed -i "s#^static_ext='\(.*\)'#static_ext='\1$mods'#; s#^extensions='\(.*\)'#extensions='\1$mods'#; \
+          s#^fullpath_static_ext='\(.*\)'#fullpath_static_ext='\1$paths'#" "$S/config.sh"
+  (cd "$S" && log ./configure --regenerate)
+  log make -C "$S" -j"$JOBS"
+  chmod +x "$S/perl"   # wasm-ld leaves it without; installperl insists
+  R="$B/perl-root"
+  rm -rf "$R"
+  log make -C "$S" DESTDIR="$R" install
+  PL="$R/usr/lib/perl5/5.44.0"
+  find "$PL" -name '*.a' -delete
+  find "$PL" -name '*.pod' ! -path "$PL/pod/perlfunc.pod" ! -path "$PL/pod/perlop.pod" ! -path "$PL/pod/perlre.pod" \
+    ! -path "$PL/pod/perlsyn.pod" ! -path "$PL/pod/perlvar.pod" -delete
+  rm -rf "$STAGE/usr/lib/perl5" "$STAGE/perl-bin"
+  mkdir -p "$STAGE/usr/lib"
+  cp -a "$R/usr/lib/perl5" "$STAGE/usr/lib/perl5"
+  cp -a "$R/usr/bin" "$STAGE/perl-bin"   # perl and its scripts (perldoc, prove, cpan, ...)
+  mv "$STAGE/perl-bin/perl" "$STAGE/usr/bin/perl"
 fi
 
 STEP=svn  # Subversion and the libraries it needs, which only it uses (so they stay in build/svn-deps):
@@ -318,6 +407,12 @@ STEP=rust
 echo "== rust"
 STAGE="$STAGE" bash "$N/rust/build.sh"
 
+STEP=ripgrep  # rg, the release tag with patches/ripgrep-*.patch (no fork, no mmap), as the node
+              # add-on builds it (build-ripgrep.sh)
+if stage ripgrep "$STAGE/usr/bin/rg"; then
+  STAGE="$STAGE" FORCE="$([[ "$FORCE" == *",ripgrep,"* ]] && echo 1 || true)" bash "$N/build-ripgrep.sh"
+fi
+
 # The image: an overlay after initramfs.cpio (and python.cpio, if present). etc/ssl/cert.pem is the
 # same Mozilla bundle python.cpio carries, so either image alone has a trust store; likewise
 # usr/share/terminfo, which screen needs for the terminal in front of it.
@@ -331,6 +426,7 @@ echo "== cpio"   # always: packing takes a second
     --file usr/bin/dbclient="$STAGE/usr/bin/dbclient" --link usr/bin/ssh=dbclient \
     --file usr/bin/dropbearkey="$STAGE/usr/bin/dropbearkey" \
     --file usr/bin/dropbearconvert="$STAGE/usr/bin/dropbearconvert" \
+    --file usr/bin/scp="$STAGE/usr/bin/scp" \
     --tree usr/libexec/git-core="$STAGE/usr/libexec/git-core" \
     --tree usr/share/git-core="$STAGE/usr/share/git-core" \
     --file usr/bin/screen="$STAGE/usr/bin/screen" \
@@ -338,13 +434,18 @@ echo "== cpio"   # always: packing takes a second
     --file etc/ssl/openssl.cnf="$STAGE/etc/ssl/openssl.cnf" \
     --file usr/bin/sqlite3="$STAGE/usr/bin/sqlite3" \
     --file usr/bin/file="$STAGE/usr/bin/file" \
+    --file usr/bin/column="$STAGE/usr/bin/column" \
+    --file usr/bin/rg="$STAGE/usr/bin/rg" \
+    --file usr/bin/perl="$STAGE/usr/bin/perl" \
+    $(for f in "$STAGE"/perl-bin/*; do echo "--file usr/bin/${f##*/}=$f"; done) \
+    --tree usr/lib/perl5="$STAGE/usr/lib/perl5" \
     --file usr/share/misc/magic.mgc="$STAGE/usr/share/misc/magic.mgc" \
     --file usr/bin/gui="$STAGE/usr/bin/gui" \
     --file usr/bin/gui-demo="$STAGE/usr/bin/gui-demo" \
     --file usr/include/collabo_gui.h="$STAGE/usr/include/collabo_gui.h" \
     --file usr/lib/libcollabo-gui.a="$STAGE/usr/lib/libcollabo-gui.a" \
     --file usr/bin/collabo-archive="$STAGE/usr/bin/collabo-archive" \
-    $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt lz4 unlz4 lz4cat 7z 7za 7zr; do echo "--link usr/bin/$n=collabo-archive"; done) \
+    $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt lz4 unlz4 lz4cat 7z 7za 7zr zip; do echo "--link usr/bin/$n=collabo-archive"; done) \
     --file usr/bin/jq="$STAGE/usr/bin/jq" \
     --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
     --file usr/bin/svn="$STAGE/usr/bin/svn" \

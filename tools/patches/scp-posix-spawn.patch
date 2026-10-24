@@ -1,0 +1,117 @@
+scp without fork(): the guest has none. Its two children (ssh with the transfer's pipes on its
+standard input and output, and the local command of a local or remote-to-remote copy) only exec,
+so they start with posix_spawnp: dup2 and close become file actions, and the ssh arguments are
+built before and popped after, as the DROPBEAR_VFORK path already does.
+
+--- a/src/scp.c
++++ b/src/scp.c
+@@ -76,6 +76,7 @@
+ #include "includes.h"
+ 
+ #include <fnmatch.h>
++#include <spawn.h>
+ 
+ #include "atomicio.h"
+ #include "compat.h"
+@@ -134,22 +135,12 @@
+ 			fprintf(stderr, " %s", a->list[i]);
+ 		fprintf(stderr, "\n");
+ 	}
+-#if DROPBEAR_VFORK
+-	pid = vfork();
+-#else
+-	pid = fork();
+-#endif
+-	if (pid == -1)
+-		fatal("do_local_cmd: fork: %s", strerror(errno));
+-
+-	if (pid == 0) {
+-		execvp(a->list[0], a->list);
++	/* collaboCore: the guest has no fork(); the child only execs, which
++	 * posix_spawnp does on its own. */
++	errno = posix_spawnp(&pid, a->list[0], NULL, NULL, a->list, environ);
++	if (errno != 0) {
+ 		perror(a->list[0]);
+-#if DROPBEAR_VFORK
+-		_exit(1);
+-#else
+-		exit(1);
+-#endif
++		return (-1);
+ 	}
+ 
+ 	do_cmd_pid = pid;
+@@ -213,44 +204,30 @@
+ 	close(reserved[0]);
+ 	close(reserved[1]);
+ 
+-	/* uClinux needs to build the args here before vforking,
+-	   otherwise we do it later on. */
+-#if DROPBEAR_VFORK
++	/* collaboCore: the guest has no fork(). The child's part (the pipes on
++	 * its standard input and output, then exec) is posix_spawnp's file
++	 * actions; the arguments are built first and popped after, as for
++	 * vfork. */
+ 	arg_setup(host, remuser, cmd);
+-#endif
+-
+-	/* Fork a child to execute the command on the remote host using ssh. */
+-#if DROPBEAR_VFORK
+-	do_cmd_pid = vfork();
+-#else
+-	do_cmd_pid = fork();
+-#endif
+-
+-	if (do_cmd_pid == 0) {
+-		/* Child. */
+-		close(pin[1]);
+-		close(pout[0]);
+-		dup2(pin[0], 0);
+-		dup2(pout[1], 1);
+-		close(pin[0]);
+-		close(pout[1]);
+-
+-#if !DROPBEAR_VFORK
+-		arg_setup(host, remuser, cmd);
+-#endif
+-
+-		execvp(ssh_program, args.list);
+-		perror(ssh_program);
+-#if DROPBEAR_VFORK
+-		_exit(1);
+-#else
+-		exit(1);
+-#endif
+-	} else if (do_cmd_pid == -1) {
+-		fatal("fork: %s", strerror(errno));
++	{
++		posix_spawn_file_actions_t actions;
++		pid_t pid;
++
++		posix_spawn_file_actions_init(&actions);
++		posix_spawn_file_actions_addclose(&actions, pin[1]);
++		posix_spawn_file_actions_addclose(&actions, pout[0]);
++		posix_spawn_file_actions_adddup2(&actions, pin[0], 0);
++		posix_spawn_file_actions_adddup2(&actions, pout[1], 1);
++		posix_spawn_file_actions_addclose(&actions, pin[0]);
++		posix_spawn_file_actions_addclose(&actions, pout[1]);
++		errno = posix_spawnp(&pid, ssh_program, &actions, NULL,
++		    args.list, environ);
++		posix_spawn_file_actions_destroy(&actions);
++		if (errno != 0)
++			fatal("%s: %s", ssh_program, strerror(errno));
++		do_cmd_pid = pid;
+ 	}
+ 
+-#if DROPBEAR_VFORK
+ 	/* clean up command */
+ 	/* pop cmd */
+ 	xfree(args.list[args.num-1]);
+@@ -266,7 +243,6 @@
+ 		args.list[args.num-1]=NULL;
+ 		args.num--;
+ 	}
+-#endif
+ 
+ 	/* Parent.  Close the other side, and return the local side. */
+ 	close(pin[0]);

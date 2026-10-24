@@ -11,7 +11,8 @@
 //! reply, exportZip, stop. Events: ready, console, network, execOutput, hostCall, permission,
 //! sshAgent, serial, exit.
 //!
-//! start.config: cpus, python, tools, gui {settings of the display in tools.cpio}, addons {name:
+//! start.config: cpus, preempt (false: no tick interrupting programs, machine.rs), python, tools,
+//! gui {settings of the display in tools.cpio}, addons {name:
 //! settings} (addons.rs), mounts, network {allow,
 //! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
 //! "ask", "allow"), sshAgentSocket, serial {mode: "off"/"ask"/"allow", devices: [path globs or
@@ -238,6 +239,7 @@ impl Server {
         }
         let config = params.get("config").cloned().unwrap_or_else(|| json!({}));
         let cpus = config.get("cpus").and_then(Value::as_u64).unwrap_or(2).clamp(1, 32) as u32;
+        let preempt = config.get("preempt").and_then(Value::as_bool).unwrap_or(true);
         let python = config.get("python").and_then(Value::as_bool).unwrap_or(true);
         let tools = config.get("tools").and_then(Value::as_bool).unwrap_or(true);
         let gui_config = match config.get("gui") {
@@ -618,6 +620,7 @@ impl Server {
                 boot_out.event("console", fields);
             }),
             exec_log: None,
+            preempt,
         })
         .context("booting the kernel")?;
 

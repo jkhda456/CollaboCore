@@ -111,6 +111,9 @@ int main(void)
 	// pairs, whose slave it opens without O_NOCTTY.
 	mnt("devpts", "/dev/pts", "devpts", 0);
 	mnt("tmpfs", "/tmp", "tmpfs", 0);
+	// Sticky and writable by all, as /tmp is elsewhere: this kernel's tmpfs (ramfs) starts at
+	// 0755, which locks out whoever drops root (perldoc runs as nobody).
+	chmod("/tmp", 01777);
 	mkdir("/root", 0700);
 	sethostname("collabo", 7);
 

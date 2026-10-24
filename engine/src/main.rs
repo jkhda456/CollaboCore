@@ -52,6 +52,9 @@ Images:
 
 Machine:
   --cpus N                  virtual CPUs (default 2)
+  --no-preempt              no tick interrupting a program in its own code: up to ~15% faster
+                            interpreters (Python, shells), but a loop without syscalls then
+                            keeps its CPU and cannot be stopped, not even by SIGKILL
   --mount HOST:GUEST[:ro]   share a host folder at an absolute guest path (repeatable)
   --cwd PATH                the guest directory to run the command in (exec)
   --arg TEXT                an extra kernel command line argument (repeatable; a bare word
@@ -497,6 +500,7 @@ fn main() -> Result<()> {
     let mut command_kinds = CommandKinds::default();
     let mut log_limits = log::Limits::default();
     let mut raw = true;
+    let mut preempt = true;
     let mut serial_devices: Vec<String> = Vec::new();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -563,6 +567,7 @@ fn main() -> Result<()> {
                 log_limits.rotate = count.parse().with_context(|| format!("--log-rotate {count}: a number of files"))?;
             }
             "--no-raw" => raw = false,
+            "--no-preempt" => preempt = false,
             "--serial" => serial_devices.push(argv.next().context("--serial needs a device (a path, a glob, usb:VID:PID[:SERIAL], or '*')")?),
             "--cwd" => cwd = argv.next(),
             "--arg" => args.extend(argv.next()),
@@ -740,6 +745,7 @@ fn main() -> Result<()> {
         initcpio,
         boot_console: writer(console_to_stderr),
         exec_log,
+        preempt,
     })
     .context("booting the kernel")?;
 

@@ -1,0 +1,51 @@
+An interrupt from user mode, for the host to take on its tick: WebAssembly has no asynchronous
+trap, so a task enters the kernel only through syscalls, and a loop that makes none kept its cpu
+for good and never saw a signal, not even SIGKILL. The `user_interrupt` export does what an
+interrupt from user mode does elsewhere (expired timers and the scheduler tick, signals, a
+reschedule if wanted), between two instructions of the program; the engine calls it from
+wasmtime's epoch callback (engine/src/user.rs on_epoch).
+
+diff --git a/arch/wasm/kernel/syscall.c b/arch/wasm/kernel/syscall.c
+index 6de7190ce4a5..f4e3d5b4864b 100644
+--- a/arch/wasm/kernel/syscall.c
++++ b/arch/wasm/kernel/syscall.c
+@@ -70,6 +70,39 @@ wasm_syscall(long nr, unsigned long arg0, unsigned long arg1,
+ 	}
+ }
+ 
++/*
++ * An interrupt taken in user mode. WebAssembly has no asynchronous trap, so a task otherwise
++ * enters the kernel only through syscalls, and a loop that makes none keeps its cpu for good
++ * and never sees a signal, not even SIGKILL. The host calls this from between two instructions
++ * of such a program, on its periodic tick: what an interrupt from user mode does elsewhere.
++ * Expired timers fire (the scheduler tick with them), a pending signal is delivered (a fatal
++ * one ends the task here, and this never returns), and the task gives up its cpu if the
++ * scheduler wants it. The program is in no syscall: its pt_regs, which a signal handler's
++ * nested syscalls also use, are as they were afterwards.
++ */
++__attribute__((export_name("user_interrupt"))) void wasm_user_interrupt(void)
++{
++	struct pt_regs *regs = current_pt_regs();
++	struct pt_regs saved = *regs;
++
++	local_irq_disable();
++	rcu_note_context_switch(false);
++	regs->user_mode = 0;
++	regs->syscall_nr = -1;
++	regs->syscall_return = 0;
++	regs->restart_syscall_nr = -1;
++	irqentry_enter_from_user_mode(regs);
++
++	wasm_timer_check();
++	wasm_service_remote_request(current);
++	/* run what that made pending: the timer interrupt itself */
++	local_irq_enable();
++	local_irq_disable();
++
++	irqentry_exit_to_user_mode(regs);
++	*regs = saved;
++}
++
+ /*
+  * The generic implementation queries the unavailable wasm userspace stack
+  * pointer and traps. Until alternate signal stacks are implementable, expose

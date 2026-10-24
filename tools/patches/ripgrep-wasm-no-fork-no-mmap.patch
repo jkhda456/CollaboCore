@@ -1,0 +1,77 @@
+diff --git a/crates/core/main.rs b/crates/core/main.rs
+index c74e645..5dce910 100644
+--- a/crates/core/main.rs
++++ b/crates/core/main.rs
+@@ -39,6 +39,57 @@ mod search;
+ #[global_allocator]
+ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 
++/// collaboCore: the guest (WebAssembly Linux) has no fork() and no mmap(). std starts programs
++/// with posix_spawn (`--pre`, `-z` decompressors) and names fork only in fallbacks ripgrep never
++/// takes; memmap2 is linked in but never used (MmapChoice::auto() is "never" on wasm32). These
++/// stubs complete the link and fail like a kernel without the calls would.
++#[cfg(target_arch = "wasm32")]
++mod wasm_stubs {
++    use std::ffi::c_void;
++
++    unsafe extern "C" {
++        fn __errno_location() -> *mut i32;
++    }
++
++    const ENOSYS: i32 = 38;
++
++    fn enosys() {
++        // SAFETY: errno is this thread's own.
++        unsafe { *__errno_location() = ENOSYS };
++    }
++
++    #[unsafe(no_mangle)]
++    extern "C" fn fork() -> i32 {
++        enosys();
++        -1
++    }
++
++    #[unsafe(no_mangle)]
++    extern "C" fn mmap(
++        _addr: *mut c_void,
++        _len: usize,
++        _prot: i32,
++        _flags: i32,
++        _fd: i32,
++        _offset: i64,
++    ) -> *mut c_void {
++        enosys();
++        usize::MAX as *mut c_void // MAP_FAILED
++    }
++
++    #[unsafe(no_mangle)]
++    extern "C" fn munmap(_addr: *mut c_void, _len: usize) -> i32 {
++        enosys();
++        -1
++    }
++
++    #[unsafe(no_mangle)]
++    extern "C" fn madvise(_addr: *mut c_void, _len: usize, _advice: i32) -> i32 {
++        enosys();
++        -1
++    }
++}
++
+ /// Then, as it was, then again it will be.
+ fn main() -> ExitCode {
+     match run(flags::parse()) {
+diff --git a/crates/searcher/src/searcher/mmap.rs b/crates/searcher/src/searcher/mmap.rs
+index cf20533..7fb5eaf 100644
+--- a/crates/searcher/src/searcher/mmap.rs
++++ b/crates/searcher/src/searcher/mmap.rs
+@@ -47,6 +47,10 @@ impl MmapChoice {
+     /// take the risk of, say, a `SIGBUS` occurring while attempting to read a
+     /// memory map.
+     pub unsafe fn auto() -> MmapChoice {
++        // collaboCore: WebAssembly Linux has no mmap; read instead.
++        if cfg!(target_arch = "wasm32") {
++            return MmapChoice::never();
++        }
+         MmapChoice(MmapChoiceImpl::Auto)
+     }
+ 

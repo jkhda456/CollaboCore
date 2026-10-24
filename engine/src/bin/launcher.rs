@@ -38,7 +38,7 @@ const VALUE_KEYS: &[&str] = &[
     "log-exec-kinds", "log-max-size", "log-rotate", "serial",
 ];
 /// Engine options that are flags.
-const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "skip-tls-verify", "log-requests", "no-raw"];
+const FLAG_KEYS: &[&str] = &["no-network", "allow-loopback", "skip-tls-verify", "log-requests", "no-raw", "no-preempt"];
 /// The keys whose value is a host path, relative to the runtime folder.
 const PATH_KEYS: &[&str] =
     &["kernel", "initramfs", "python-image", "tools-image", "addon-dir", "log-network", "log-exec", "log-file"];
@@ -62,7 +62,7 @@ Usage:
 
 launcher.conf (beside this program): `key = value` per line, `#` for comments.
   <option> = VALUE    an engine option without its dashes, e.g. mount = work:/work (repeatable)
-  <flag> = yes|no     no-network, allow-loopback, skip-tls-verify, log-requests, no-raw
+  <flag> = yes|no     no-network, allow-loopback, skip-tls-verify, log-requests, no-raw, no-preempt
   python = off        leave out the CPython overlay; tools = off: curl, ssh, git
   command = CMD...    run one command in the guest instead of the shell
   bin = DIR           the folder collabo-core-engine is in (default: bin beside this program)

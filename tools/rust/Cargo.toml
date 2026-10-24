@@ -1,7 +1,7 @@
 # The guest's tools written in Rust, one workspace (tools/rust/build.sh builds it for the guest):
 #
-#   archive   xz, zstd, lz4 and 7z (with their unxz/xzcat/lzma/..., unzstd/zstdcat and unlz4/lz4cat
-#             names), one binary
+#   archive   xz, zstd, lz4, 7z and zip (with their unxz/xzcat/lzma/..., unzstd/zstdcat and
+#             unlz4/lz4cat names), one binary
 #   jq        the JSON processor
 #   git-lfs   Git Large File Storage
 #

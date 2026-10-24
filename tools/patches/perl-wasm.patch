@@ -1,0 +1,403 @@
+perl 5.44.0 (with perl-cross 1.6.5 laid over it) for the collaboCore guest, which has no fork():
+
+- doio.c, util.c, perl.h: system(), qx// and piped opens (list and string forms) start their
+  children with posix_spawn. pp_system's non-fork path calls do_aspawn and do_spawn, as it does on
+  Windows and VMS; my_popen and my_popen_list spawn instead of forking. Which program runs is
+  decided as do_exec3 and do_aexec5 decide what to exec (the shell only for shell metacharacters,
+  a trailing 2>&1 kept as a dup2, ENOEXEC falling back to the shell); a failed spawn warns "Can't
+  exec" and returns -1 with errno, as the fork path reports a failed exec. fork itself stays
+  unsupported ("The fork function is unimplemented"), and so does open(FH, "-|"). system(1, LIST)
+  spawns without waiting and returns the pid, as on Windows.
+- ext/re/re_top.h: regcomp's helpers that are not static since 5.43 renamed in the re extension's
+  copy, as the others there are; a static link (all extensions in perl) otherwise has them twice.
+- Makefile (perl-cross's): a static extension's make also runs pm_to_blib; MakeMaker's static
+  target no longer does, so its .pm files (POSIX.pm, List/Util.pm, ...) were never put in lib/.
+- ext/IPC-Open3: open3 and open2 spawn as on Windows where perl has no fork (system(1, LIST));
+  pp_sys.c keeps system's numeric arguments numeric for it, as on Windows.
+--- a/doio.c
++++ b/doio.c
+@@ -2449,6 +2449,228 @@
+     return FALSE;
+ }
+ 
++#ifdef __wasm__
++/* collaboCore: the guest (WebAssembly Linux) has no fork(). The children of system(), qx// and
++ * piped opens start with posix_spawn instead: which program runs, with which arguments, is
++ * decided as do_exec3 and do_aexec5 decide what to exec (the command line itself unless it needs
++ * the shell; ENOEXEC falls back to the shell), and what the child would do between fork and exec
++ * (its end of a pipe on standard input or output, 2>&1) is posix_spawn's file actions. A spawn
++ * that fails warns "Can't exec" here, where the child would have, and returns -1 with errno set.
++ * fork itself stays unsupported ("Unsupported function fork"), as on a system without one. */
++
++static Pid_t
++S_wasm_spawnv(pTHX_ const char *file, const char **argv, posix_spawn_file_actions_t *fa)
++{
++    Pid_t pid;
++    const int e = posix_spawnp(&pid, file, fa, NULL, (char *const *)argv, environ);
++    if (e) {
++        errno = e;
++        return -1;
++    }
++    return pid;
++}
++
++static Pid_t
++S_wasm_spawn_sh(pTHX_ const char *cmd, posix_spawn_file_actions_t *fa)
++{
++    const char *argv[] = { "sh", "-c", cmd, NULL };
++    Pid_t pid;
++    const int e = posix_spawn(&pid, PL_sh_path, fa, NULL, (char *const *)argv, environ);
++    if (e) {
++        errno = e;
++        ck_warner(packWARN(WARN_EXEC), "Can't exec \"%s\": %s", PL_sh_path, Strerror(e));
++        return -1;
++    }
++    return pid;
++}
++
++/* do_exec3's choice for the command line `incmd`, spawned with `fa` */
++Pid_t
++Perl_wasm_spawn3(pTHX_ const char *incmd, posix_spawn_file_actions_t *fa)
++{
++    const char **argv, **a;
++    char *s;
++    char *cmd;
++    const Size_t cmdlen = strlen(incmd) + 1;
++    Pid_t pid = -1;
++    posix_spawn_file_actions_t own;
++    int have_own = 0;
++
++    ENTER;
++    Newx(cmd, cmdlen, char);
++    SAVEFREEPV(cmd);
++    memcpy(cmd, incmd, cmdlen);
++    while (*cmd && isSPACE(*cmd))
++        cmd++;
++
++    if (*cmd == '.' && isSPACE(cmd[1]))
++        goto doshell;
++    if (strBEGINs(cmd,"exec") && isSPACE(cmd[4]))
++        goto doshell;
++    s = cmd;
++    while (isWORDCHAR(*s))
++        s++;	/* catch VAR=val gizmo */
++    if (*s == '=')
++        goto doshell;
++
++    for (s = cmd; *s; s++) {
++        if (*s != ' ' && !isALPHA(*s) &&
++            memCHRs("$&*(){}[]'\";\\|?<>~`\n",*s)) {
++            if (*s == '\n' && !s[1]) {
++                *s = '\0';
++                break;
++            }
++            /* the 2>&1 construct at the end: the child's dup2 */
++            if (*s == '>' && s[1] == '&' && s[2] == '1'
++                && s > cmd + 1 && s[-1] == '2' && isSPACE(s[-2])
++                && (!s[3] || isSPACE(s[3])))
++            {
++                const char *t = s + 3;
++
++                while (*t && isSPACE(*t))
++                    ++t;
++                if (!*t) {
++                    if (!fa) {
++                        posix_spawn_file_actions_init(&own);
++                        have_own = 1;
++                        fa = &own;
++                    }
++                    posix_spawn_file_actions_adddup2(fa, 1, 2);
++                    s[-2] = '\0';
++                    break;
++                }
++            }
++          doshell:
++            pid = S_wasm_spawn_sh(aTHX_ cmd, fa);
++            goto leave;
++        }
++    }
++
++    Newx(argv, (s - cmd) / 2 + 2, const char*);
++    SAVEFREEPV(argv);
++    cmd = savepvn(cmd, s-cmd);
++    SAVEFREEPV(cmd);
++    a = argv;
++    for (s = cmd; *s;) {
++        while (isSPACE(*s))
++            s++;
++        if (*s)
++            *(a++) = s;
++        while (*s && !isSPACE(*s))
++            s++;
++        if (*s)
++            *s++ = '\0';
++    }
++    *a = NULL;
++    if (argv[0]) {
++        pid = S_wasm_spawnv(aTHX_ argv[0], argv, fa);
++        if (pid == -1 && errno == ENOEXEC) {
++            pid = S_wasm_spawn_sh(aTHX_ incmd, fa);
++            goto leave;
++        }
++        if (pid == -1)
++            ck_warner(packWARN(WARN_EXEC), "Can't exec \"%s\": %s", argv[0], Strerror(errno));
++    }
++    else
++        errno = ENOENT;
++  leave:
++    if (have_own)
++        posix_spawn_file_actions_destroy(&own);
++    LEAVE;
++    return pid;
++}
++
++/* do_aexec5's: the list (mark, sp], `really` the program to run if given */
++Pid_t
++Perl_wasm_aspawn(pTHX_ SV *really, SV **mark, SV **sp, posix_spawn_file_actions_t *fa)
++{
++    const char **argv, **a;
++    const char *tmps = NULL;
++    Pid_t pid = -1;
++
++    ENTER;
++    Newx(argv, sp - mark + 1, const char*);
++    SAVEFREEPV(argv);
++    a = argv;
++    while (++mark <= sp) {
++        if (*mark) {
++            char *arg = savepv(SvPV_nolen_const(*mark));
++            SAVEFREEPV(arg);
++            *a++ = arg;
++        } else
++            *a++ = "";
++    }
++    *a = NULL;
++    if (really) {
++        tmps = savepv(SvPV_nolen_const(really));
++        SAVEFREEPV(tmps);
++    }
++    if ((!really && argv[0] && *argv[0] != '/') ||
++        (really && *tmps != '/'))		/* will execvp use PATH? */
++        TAINT_ENV();
++    if (really && *tmps)
++        pid = S_wasm_spawnv(aTHX_ tmps, argv, fa);
++    else if (argv[0])
++        pid = S_wasm_spawnv(aTHX_ argv[0], argv, fa);
++    else
++        SETERRNO(ENOENT,RMS_FNF);
++    if (pid == -1)
++        ck_warner(packWARN(WARN_EXEC), "Can't exec \"%s\": %s",
++                  really ? tmps : argv[0] ? argv[0] : "", Strerror(errno));
++    LEAVE;
++    return pid;
++}
++
++/* system()'s wait, as its fork path waits: SIGINT and SIGQUIT ignored meanwhile */
++static int
++S_wasm_system_wait(pTHX_ Pid_t pid)
++{
++    Sigsave_t ihand, qhand;
++    int status;
++    I32 result;
++
++    if (pid == -1) {
++        PL_statusvalue = -1;	/* pp_system returns it as is */
++        return -1;
++    }
++    rsignal_save(SIGINT,  (Sighandler_t) SIG_IGN, &ihand);
++    rsignal_save(SIGQUIT, (Sighandler_t) SIG_IGN, &qhand);
++    do {
++        result = wait4pid(pid, &status, 0);
++    } while (result == -1 && errno == EINTR);
++    (void)rsignal_restore(SIGINT, &ihand);
++    (void)rsignal_restore(SIGQUIT, &qhand);
++    return result == -1 ? -1 : status;
++}
++
++/* pp_system's non-fork path calls these, as it does Windows' and VMS' own. system(1, LIST)
++ * is Windows' P_NOWAIT, which IPC::Open3 spawns with where there is no fork: the child is not
++ * waited for, and system returns its pid; a single command line goes through do_exec3's rules
++ * (the shell if it needs one), as system's does. */
++int
++do_aspawn(SV *really, void **mark, void **sp)
++{
++    dTHX;
++    SV **m = (SV **)mark;
++
++    if ((SV **)sp - m > 1 && SvNIOKp(m[1]) && !SvPOKp(m[1]) && SvIV(m[1]) == 1) {
++        const Pid_t pid = (SV **)sp - m == 2 && !really
++            ? Perl_wasm_spawn3(aTHX_ SvPV_nolen(m[2]), NULL)
++            : Perl_wasm_aspawn(aTHX_ really, m + 1, (SV **)sp, NULL);
++        PL_statusvalue = -1;	/* pp_system returns it as is */
++        return pid;
++    }
++    return S_wasm_system_wait(aTHX_ Perl_wasm_aspawn(aTHX_ really, m, (SV **)sp, NULL));
++}
++
++int
++do_spawn(char *cmd)
++{
++    dTHX;
++    return S_wasm_system_wait(aTHX_ Perl_wasm_spawn3(aTHX_ cmd, NULL));
++}
++#endif /* __wasm__ */
++
+ #ifdef PERL_DEFAULT_DO_EXEC3_IMPLEMENTATION
+ 
+ bool
+--- a/util.c
++++ b/util.c
+@@ -2440,6 +2440,54 @@
+   #endif
+ #endif
+ 
++#ifdef __wasm__
++/* collaboCore: my_popen and my_popen_list without fork() (see doio.c): the child starts with
++ * posix_spawn, its end of the pipe on its standard output ('r') or input ('w'); the parent
++ * keeps the lower of the two descriptors and records the pid for my_pclose, as after a fork. */
++static PerlIO *
++S_wasm_popen(pTHX_ const char *cmd, int n, SV **args, const char *mode)
++{
++    int p[2];
++    const I32 This = (*mode == 'w');
++    const I32 that = !This;
++    posix_spawn_file_actions_t fa;
++    Pid_t pid;
++    SV *sv;
++
++    PERL_FLUSHALL_FOR_CHILD;
++    if (TAINTING_get) {
++        taint_env();
++        taint_proper("Insecure %s%s", "EXEC");
++    }
++    if (PerlProc_pipe_cloexec(p) < 0)
++        return NULL;
++    posix_spawn_file_actions_init(&fa);
++    posix_spawn_file_actions_adddup2(&fa, p[that], *mode == 'r');
++    pid = cmd ? Perl_wasm_spawn3(aTHX_ cmd, &fa)
++              : Perl_wasm_aspawn(aTHX_ NULL, args - 1, args - 1 + n, &fa);
++    posix_spawn_file_actions_destroy(&fa);
++    if (pid == -1) {
++        const int e = errno;
++        PerlLIO_close(p[0]);
++        PerlLIO_close(p[1]);
++        errno = e;
++        return NULL;
++    }
++    if (p[that] < p[This]) {
++        PerlLIO_dup2_cloexec(p[This], p[that]);
++        PerlLIO_close(p[This]);
++        p[This] = p[that];
++    }
++    else
++        PerlLIO_close(p[that]);
++    sv = *av_fetch(PL_fdpid,p[This],TRUE);
++    SvUPGRADE(sv,SVt_IV);
++    SvIV_set(sv, pid);
++    PL_forkprocess = pid;
++    return PerlIO_fdopen(p[This], mode);
++}
++#endif /* __wasm__ */
++
+ /*
+ =for apidoc my_popen_list
+ 
+@@ -2453,6 +2501,10 @@
+ {
+     PERL_ARGS_ASSERT_MY_POPEN_LIST;
+ 
++#ifdef __wasm__
++    return S_wasm_popen(aTHX_ NULL, n, args, mode);
++#endif
++
+ #if (!defined(DOSISH) || defined(HAS_FORK)) && !defined(OS2) && !defined(VMS) && !defined(__LIBCATAMOUNT__) && !defined(__amigaos4__)
+     int p[2];
+     I32 This, that;
+@@ -2601,6 +2653,13 @@
+ {
+     PERL_ARGS_ASSERT_MY_POPEN;
+ 
++#ifdef __wasm__
++    if (!(*cmd == '-' && cmd[1] == '\0'))
++        return S_wasm_popen(aTHX_ cmd, 0, NULL, mode);
++    /* open(FH, "-|"): a forked perl, which there is no way to make */
++    croak("Can't fork: %s", Strerror(ENOSYS));
++#endif
++
+     int p[2];
+     I32 This, that;
+     Pid_t pid;
+--- a/perl.h
++++ b/perl.h
+@@ -8436,6 +8436,14 @@
+ 
+ #define do_open(g, n, l, a, rm, rp, sf) \
+         do_openn(g, n, l, a, rm, rp, sf, (SV **) NULL, 0)
++#ifdef __wasm__
++/* collaboCore: system(), qx// and piped opens without fork() (doio.c, util.c) */
++#include <spawn.h>
++int do_aspawn(SV *really, void **mark, void **sp);
++int do_spawn(char *cmd);
++Pid_t Perl_wasm_spawn3(pTHX_ const char *incmd, posix_spawn_file_actions_t *fa);
++Pid_t Perl_wasm_aspawn(pTHX_ SV *really, SV **mark, SV **sp, posix_spawn_file_actions_t *fa);
++#endif
+ #ifdef PERL_DEFAULT_DO_EXEC3_IMPLEMENTATION
+ #  define do_exec(cmd)			do_exec3(cmd,0,0)
+ #endif
+--- a/pp_sys.c
++++ b/pp_sys.c
+@@ -4627,8 +4627,8 @@
+         STRLEN len;
+         char *pv;
+         SvGETMAGIC(origsv);
+-#if defined(WIN32) || defined(__VMS)
+-        /*
++#if defined(WIN32) || defined(__VMS) || defined(__wasm__)
++        /* collaboCore: the guest too, for system(1, LIST) (do_aspawn in doio.c)
+          * Because of a nasty platform-specific variation on the meaning
+          * of arguments to this op, we must preserve numeric arguments
+          * as numeric, not just retain the string value.
+--- a/ext/re/re_top.h
++++ b/ext/re/re_top.h
+@@ -50,6 +50,16 @@
+ #define Perl_construct_ahocorasick_from_trie    my_construct_ahocorasick_from_trie
+ #define Perl_make_trie                          my_make_trie
+ 
++/* collaboCore: regcomp's helpers that are not static since 5.43 clash with the core's in a
++ * static (-Uusedl) link the same way. */
++#define Perl_reg_add_data                       my_reg_add_data
++#define Perl_release_RExC_state                 my_release_RExC_state
++#define Perl_populate_anyof_bitmap_from_invlist my_populate_anyof_bitmap_from_invlist
++#define Perl_set_ANYOF_arg                      my_set_ANYOF_arg
++#define Perl_add_above_Latin1_folds             my_add_above_Latin1_folds
++#define Perl_get_ANYOFM_contents                my_get_ANYOFM_contents
++#define Perl_get_ANYOFHbbm_contents             my_get_ANYOFHbbm_contents
++
+ #define PERL_NO_GET_CONTEXT
+ 
+ /*
+--- a/ext/IPC-Open3/lib/IPC/Open3.pm
++++ b/ext/IPC-Open3/lib/IPC/Open3.pm
+@@ -241,7 +241,10 @@
+ }
+ 
+ use constant FORCE_DEBUG_SPAWN => 0;
+-use constant DO_SPAWN => $^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;
++# collaboCore: also where perl has no fork (the WebAssembly guest), whose system(1, LIST)
++# spawns without waiting, as on Windows.
++use constant DO_SPAWN => $^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN
++    || do { require Config; !$Config::Config{d_fork} };
+ 
+ sub _open3 {
+     local $Me = shift;
+--- a/Makefile
++++ b/Makefile
+@@ -241,7 +241,7 @@
+ ext/DynaLoader/Makefile: config.h | dist/lib/pm_to_blib
+ 
+ $(static_modules): %/pm_to_blib: | %/Makefile $(nonxs_tgt)
+-	$(MAKE) -C $(dir $@) PERL_CORE=1 LIBPERL=$(LIBPERL) LINKTYPE=static static
++	$(MAKE) -C $(dir $@) PERL_CORE=1 LIBPERL=$(LIBPERL) LINKTYPE=static pm_to_blib static
+ 	@touch $@
+ 
+ $(dynamic_modules) $(disabled_dynamic): %/pm_to_blib: | %/Makefile
