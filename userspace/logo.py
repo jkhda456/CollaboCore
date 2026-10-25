@@ -4,7 +4,15 @@ its `# logo:` and `# logo end` lines: a 24-bit BMP beside the word CollaboCore i
 as terminal text. Two pixel rows per line, as half blocks (U+2580, the top pixel its foreground,
 the bottom one its background) in 24-bit colour, `\\e` for ESC; the letters in the colours of the
 logo, on the terminal's own background. A 32x32 image is 32 columns by 16 lines, the letters 45
-columns beside it (79 in all). Run it again when the image changes:
+columns beside it (79 in all).
+
+The half blocks (and the ▄ and █ of the letters) are East Asian "ambiguous" characters, which a
+terminal set to draw those wide (Terminal.app's and iTerm2's option, often on in Korean, Chinese
+and Japanese setups) gives two columns: every line then wraps half way. So the script also carries
+the logo in coloured spaces only (`logo_cells`), which `version` draws when the terminal says a
+half block took two columns: each column of the image one cell, the two pixels of a cell
+averaged; the letters a cell per pixel (taller than in half blocks). Same 79 columns, 16 lines.
+Run it again when the image changes:
 
     python3 userspace/logo.py CollaboCore32.bmp userspace/rootfs/version
 """
@@ -65,6 +73,23 @@ def image_lines(rows):
     return lines
 
 
+def image_cells(rows):
+    """The image in background colours: a cell per column, two pixel rows averaged in it."""
+    if len(rows) % 2:
+        rows = rows + [rows[-1]]
+    lines = []
+    for top, bottom in zip(rows[0::2], rows[1::2]):
+        line, last = [], None
+        for a, b in zip(top, bottom):
+            colour = tuple((a[c] + b[c] + 1) // 2 for c in range(3))
+            if colour != last:
+                line.append("\\e[48;2;%d;%d;%dm" % colour)
+                last = colour
+            line.append(" ")
+        lines.append("".join(line) + "\\e[0m")
+    return lines
+
+
 def mix(x, width):
     t = x / max(width - 1, 1) * (len(GRADIENT) - 1)
     i = min(int(t), len(GRADIENT) - 2)
@@ -91,9 +116,30 @@ def word_lines():
     return lines
 
 
-def block(bmp):
-    image = image_lines(read_bmp(bmp))
-    word = word_lines()
+def word_cells():
+    """The word in background colours, a cell per pixel."""
+    pixels = ["" for _ in range(7)]
+    for i, letter in enumerate(WORD):
+        for y in range(7):
+            pixels[y] += ("." if i else "") + GLYPHS[letter][y]
+    width = len(pixels[0])
+    lines = []
+    for row in pixels:
+        line, on = [], False
+        for x, p in enumerate(row):
+            if p == "#":
+                line.append("\\e[48;2;%d;%d;%dm" % mix(x, width))
+                on = True
+            elif on:
+                line.append("\\e[49m")
+                on = False
+            line.append(" ")
+        lines.append("".join(line) + "\\e[0m")
+    return lines
+
+
+def layout(name, image, word):
+    """`name='...'` with the word beside the image, and where the lines `version` adds go."""
     # The word and the lines `version` adds (four) in the middle of the image's height, a line
     # apart.
     top = (len(image) - (len(word) + 1 + 4)) // 2
@@ -104,13 +150,19 @@ def block(bmp):
         lines.append(line)
     # A quoted string, not a function with a here-document: the guest's ash fails to run such a
     # function in a pipeline ("unexpected EOF in here document").
-    lines[0] = "logo='" + lines[0]
+    lines[0] = f"{name}='" + lines[0]
     lines[-1] += "'"
+    return [f"{name}_info={top + len(word) + 2}", *lines]
+
+
+def block(bmp):
+    rows = read_bmp(bmp)
     return [
         "# logo: the image and the word, by userspace/logo.py from CollaboCore32.bmp (run it again,",
-        "# not an editor); \\e is ESC. The lines from logo_info on get the info beside them.",
-        f"logo_info={top + len(word) + 2}",
-        *lines,
+        "# not an editor); \\e is ESC. The lines from logo_info on get the info beside them. In half",
+        "# blocks; logo_cells in coloured spaces, for terminals that draw the half blocks two wide.",
+        *layout("logo", image_lines(rows), word_lines()),
+        *layout("logo_cells", image_cells(rows), word_cells()),
         "# logo end",
     ]
 

@@ -179,16 +179,22 @@ if stage openssl "$STAGE/usr/bin/openssl"; then
 fi
 
 STEP=sqlite  # the shell (shell.c) over the amalgamation compiled as python/build-deps.sh does for
-             # _sqlite3 (no WAL and no mmap I/O, which need shared mappings; FTS4/5, R*Tree, math,
-             # dbstat), so both see the same SQLite. Line editing from libedit, as for Python's
+             # _sqlite3 (WAL through python/patches/sqlite-shm.c, the wal-index without shared
+             # mappings; no mmap I/O; FTS4/5, R*Tree, math, dbstat), so both see the same SQLite. Line editing from libedit, as for Python's
              # readline. `.system`, `.shell` and `.once |cmd` go through system()/popen(), which
              # musl does with posix_spawn.
+[[ "$ROOT/python/patches/sqlite-shm.c" -nt "$STAGE/usr/bin/sqlite3" ]] && FORCE="$FORCE,sqlite,"
 if stage sqlite "$STAGE/usr/bin/sqlite3"; then
   S="$(unpack sqlite)"
-  (cd "$S" && log "$CC" -O2 -o sqlite3 shell.c sqlite3.c -I"$DEPS/include" \
-     -DSQLITE_OMIT_WAL=1 -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION=1 \
-     -DSQLITE_ENABLE_FTS4=1 -DSQLITE_ENABLE_FTS5=1 -DSQLITE_ENABLE_RTREE=1 -DSQLITE_ENABLE_MATH_FUNCTIONS=1 \
-     -DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT=1 \
+  FLAGS=(-DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION=1
+         -DSQLITE_ENABLE_FTS4=1 -DSQLITE_ENABLE_FTS5=1 -DSQLITE_ENABLE_RTREE=1 -DSQLITE_ENABLE_MATH_FUNCTIONS=1
+         -DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT=1)
+  # The library as python/build-deps.sh compiles it (SQLITE_WASI: os_unix.c without mmap); the
+  # shell without that, so that it finds the home folder as before (getpwuid).
+  (cd "$S" && log "$CC" -O2 -c sqlite3.c -o sqlite3.o "${FLAGS[@]}" \
+     -DSQLITE_WASI=1 -DSQLITE_DEFAULT_UNIX_VFS='"unix"' -DSQLITE_EXTRA_INIT=collabo_shm_init &&
+     log "$CC" -O2 -c "$ROOT/python/patches/sqlite-shm.c" -o sqlite-shm.o -I. &&
+     log "$CC" -O2 -o sqlite3 shell.c sqlite3.o sqlite-shm.o -I"$DEPS/include" "${FLAGS[@]}" \
      -DHAVE_EDITLINE=1 -L"$DEPS/lib" -ledit -lncursesw $LINK_FLAGS)
   install -D "$S/sqlite3" "$STAGE/usr/bin/sqlite3"
   install -D -m644 "$S/sqlite3.1" "$STAGE/usr/share/man/man1/sqlite3.1"

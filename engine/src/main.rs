@@ -699,6 +699,15 @@ fn main() -> Result<()> {
     let raw = raw && !exec && host_tty::enter();
     let (columns, rows) = if raw { host_tty::size().unwrap_or((100, 30)) } else { (100, 30) };
     if raw {
+        // Which terminal program this is (macOS sets TERM_PROGRAM: Apple_Terminal, iTerm.app),
+        // for what the guest draws: `version`'s logo avoids block characters on terminals that
+        // draw them from the font, short of the cell height (a gap between every two lines).
+        if let Ok(program) = std::env::var("TERM_PROGRAM") {
+            let program: String = program.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(32).collect();
+            if !program.is_empty() {
+                args.push(format!("collabo.term={program}"));
+            }
+        }
         // The guest's agent sets its tty to this terminal's size when the window changes.
         args.push("collabo.agent=1".into());
         let vsock = vsock.clone();

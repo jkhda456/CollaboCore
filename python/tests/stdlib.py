@@ -72,6 +72,75 @@ def _():
     return sqlite3.sqlite_version
 
 
+WAL_WORKER = r"""
+import random, sqlite3, sys, threading
+path, worker = sys.argv[1], int(sys.argv[2])
+errors = []
+def run(thread):
+    rng = random.Random(worker * 100 + thread)
+    db = sqlite3.connect(path, timeout=60, isolation_level=None)
+    db.execute("pragma wal_autocheckpoint=10")
+    seen = 0
+    for i in range(120):
+        r = rng.random()
+        if r < 0.6:
+            a, b, x = rng.randrange(20), rng.randrange(20), rng.randrange(30)
+            db.execute("begin immediate")
+            db.execute("update acct set bal = bal - ? where id = ?", (x, a))
+            db.execute("update acct set bal = bal + ? where id = ?", (x, b))
+            db.execute("insert into log values (?, ?, ?, randomblob(300))", (worker, thread, i))
+            db.execute("commit")
+        elif r < 0.95:
+            db.execute("begin")
+            total = db.execute("select sum(bal) from acct").fetchone()[0]
+            n1 = db.execute("select count(*) from log").fetchone()[0]
+            n2 = db.execute("select count(*) from log").fetchone()[0]
+            db.execute("commit")
+            if total != 20000 or n1 != n2 or n1 < seen:
+                errors.append((total, n1, n2, seen))
+            seen = n1
+        else:
+            db.execute("pragma wal_checkpoint(" + rng.choice(["PASSIVE", "FULL", "RESTART", "TRUNCATE"]) + ")")
+    db.close()
+threads = [threading.Thread(target=run, args=(t,)) for t in range(2)]
+[t.start() for t in threads]
+[t.join() for t in threads]
+print(errors or "ok")
+sys.exit(1 if errors else 0)
+"""
+
+
+@check("sqlite3: WAL, several processes with threads at once; a writer that died, recovered")
+def _():
+    # The guest has no shared mappings: python/patches/sqlite-shm.c keeps the wal-index in each
+    # process and syncs it with the -shm file at SQLite's locks.
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "wal.db")
+        db = sqlite3.connect(path, isolation_level=None)
+        assert db.execute("pragma journal_mode=wal").fetchone()[0] == "wal"
+        db.execute("create table acct (id integer primary key, bal integer)")
+        db.execute("create table log (worker, thread, n, pad)")
+        db.executemany("insert into acct values (?, 1000)", [(i,) for i in range(20)])
+        workers = [subprocess.Popen([sys.executable, "-c", WAL_WORKER, path, str(w)], stdout=subprocess.PIPE, text=True) for w in range(3)]
+        outs = [(w.communicate(timeout=500)[0].strip(), w.returncode) for w in workers]
+        assert all(o == ("ok", 0) for o in outs), outs
+        assert db.execute("select sum(bal) from acct").fetchone()[0] == 20000
+        moves = db.execute("select count(*) from log").fetchone()[0]
+        assert db.execute("select count(*) from (select 1 from log group by worker, thread, n having count(*) > 1)").fetchone()[0] == 0
+        assert db.execute("pragma integrity_check").fetchone()[0] == "ok"
+        db.close()
+        # A writer that dies without closing: its commits are only in the -wal (no checkpoint).
+        died = "import os, sqlite3, sys\ndb = sqlite3.connect(sys.argv[1], isolation_level=None)\ndb.execute('pragma wal_autocheckpoint=0')\n" \
+               "db.executemany('insert into acct values (?, 0)', [(i,) for i in range(100, 150)])\nos._exit(0)"
+        subprocess.run([sys.executable, "-c", died, path], check=True, timeout=120)
+        assert os.path.getsize(path + "-wal") > 0
+        db = sqlite3.connect(path)
+        assert db.execute("select count(*) from acct").fetchone()[0] == 70
+        db.close()
+    return f"{moves} moves by 3 processes x 2 threads"
+
+
 @check("readline and curses (terminfo)")
 def _():
     import curses, readline

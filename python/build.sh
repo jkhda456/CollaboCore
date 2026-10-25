@@ -140,7 +140,9 @@ if stage configure "$P/build-wasm/Makefile" "$P/build.sh"; then
   cd "$P"
 fi
 
-if stage build "$P/build-wasm/python" "$D/lib/libpydantic_core.a" "$D/lib/libjiter.a" "$D/lib/libssl.a" "$D/lib/libedit.a"; then
+if stage build "$P/build-wasm/python" "$D/lib/libpydantic_core.a" "$D/lib/libjiter.a" "$D/lib/libssl.a" "$D/lib/libedit.a" "$D/lib/libsqlite3.a"; then
+  # The libraries are not in CPython's Makefile: without the interpreter, make links it again.
+  rm -f "$P/build-wasm/python"
   make -C "$P/build-wasm" -j"$(nproc)" > "$P/build.log" 2>&1 || { grep -E "error|Error" "$P/build.log" | head -20; tail -15 "$P/build.log"; exit 1; }
   # A module whose library did not link is only a warning in CPython's build; here it is an error.
   missing="$(grep -A3 "The necessary bits to build these optional modules were not found" "$P/build.log" | tail -n +2 || true)"

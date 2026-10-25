@@ -126,15 +126,24 @@ if stage libedit "$D/lib/libedit.a"; then
   log make -C "$S" install
 fi
 
-STEP=sqlite  # the amalgamation, compiled directly. No WAL and no mmap I/O: both need shared memory
-             # mappings this platform does not have (distro builds it the same way).
+STEP=sqlite  # the amalgamation, compiled directly, with WAL: the guest has no shared mappings (each
+             # process its own wasm memory), so patches/sqlite-shm.c keeps the wal-index in each
+             # process's memory and syncs it with the -shm file at SQLite's shm locks
+             # (SQLITE_EXTRA_INIT makes it the default VFS). The C library has no mmap at all:
+             # SQLITE_WASI is os_unix.c's build without it (no mmap I/O, no shared-memory methods of
+             # its own), with POSIX locks kept (SQLITE_DEFAULT_UNIX_VFS "unix", not "unix-dotfile").
+             # tools/build.sh builds the sqlite3 shell over the same.
+[[ "$P/patches/sqlite-shm.c" -nt "$D/lib/libsqlite3.a" ]] && FORCE="$FORCE,sqlite,"
 if stage sqlite "$D/lib/libsqlite3.a"; then
   S="$(unpack sqlite)"
   (cd "$S" && log "$CC" -O2 -c sqlite3.c -o sqlite3.o \
-     -DSQLITE_OMIT_WAL=1 -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION=1 \
+     -DSQLITE_WASI=1 -DSQLITE_DEFAULT_UNIX_VFS='"unix"' -DSQLITE_EXTRA_INIT=collabo_shm_init \
+     -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION=1 \
      -DSQLITE_ENABLE_FTS4=1 -DSQLITE_ENABLE_FTS5=1 -DSQLITE_ENABLE_RTREE=1 -DSQLITE_ENABLE_MATH_FUNCTIONS=1 \
-     -DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT=1)
-  llvm-ar-19 rcs "$D/lib/libsqlite3.a" "$S/sqlite3.o"
+     -DSQLITE_ENABLE_DBSTAT_VTAB=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT=1 &&
+     log "$CC" -O2 -c "$P/patches/sqlite-shm.c" -o sqlite-shm.o -I.)
+  rm -f "$D/lib/libsqlite3.a"
+  llvm-ar-19 rcs "$D/lib/libsqlite3.a" "$S/sqlite3.o" "$S/sqlite-shm.o"
   cp "$S/sqlite3.h" "$S/sqlite3ext.h" "$D/include/"
 fi
 
