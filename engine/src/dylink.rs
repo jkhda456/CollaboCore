@@ -51,9 +51,6 @@ use wasmtime::{
 
 use crate::machine::HostState;
 
-/// Libraries of at least this size are kept compiled on disk too (program_cache.rs); a few
-/// megabytes take the host a noticeable fraction of a second, every machine again.
-const LIBRARY_LARGE: usize = 1 << 20;
 const TABLE: &str = "__indirect_function_table";
 
 /// What a library's `dylink.0` section says.
@@ -332,7 +329,8 @@ fn rebind(bytes: &[u8], funcs: &HashMap<u32, u32>, tags: &HashMap<u32, u32>) -> 
     Ok(module.finish())
 }
 
-/// Compiles a library (cached by its bytes, as programs are; on disk too from a megabyte).
+/// Compiles a library (cached by its bytes, as programs are, and on disk as they are:
+/// program_cache.rs).
 fn compile(caller: &Caller<'_, HostState>, bytes: &[u8]) -> Result<Module> {
     let engine = caller.data().shared.engine.clone();
     let key = {
@@ -345,7 +343,7 @@ fn compile(caller: &Caller<'_, HostState>, bytes: &[u8]) -> Result<Module> {
     if let Some(module) = caller.data().shared.programs.lock().unwrap().get(&key).cloned() {
         return Ok(module);
     }
-    let module = crate::program_cache::load_or_compile_at(&engine, bytes, LIBRARY_LARGE)
+    let module = crate::program_cache::load_or_compile(&engine, bytes)
         .map_err(|error| anyhow!("it does not compile: {error}"))?;
     caller.data().shared.programs.lock().unwrap().insert(key, module.clone());
     Ok(module)

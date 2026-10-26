@@ -2,17 +2,22 @@
 //!
 //! Compiling a large guest program takes the host tens of seconds and gigabytes of memory (the wpe
 //! add-on's browser is 170 MB of WebAssembly: about 20 s and 2.5 GB), and every new machine did it
-//! again. A program of at least [`LARGE`] bytes is compiled once and kept, serialized, in the cache
-//! directory, named by the SHA-256 of its bytes; later machines map that file instead, which takes
-//! milliseconds, and its code is file-backed: shared by the machines that run it, and pages the
-//! kernel can drop and read again. wasmtime checks that a file was made by the same wasmtime with
-//! the same settings; one that was not is compiled again and replaced.
+//! again. Even a mid-sized one is worth keeping: python3 (16 MB) took 10 s at its first start in
+//! every machine, and the kernel itself (6 MB) was compiled at every boot. A program (or library,
+//! or the kernel) of at least [`LARGE`] bytes is compiled once and kept, serialized, in the cache
+//! directory, named by the SHA-256 of its bytes and a hash of the engine's compile settings; later
+//! machines map that file instead, which takes milliseconds, and its code is file-backed: shared
+//! by the machines that run it, and pages the kernel can drop and read again. With the settings in
+//! the name, engines that differ (`--no-preempt`) keep a file each instead of replacing each
+//! other's; wasmtime still checks that a file was made by the same wasmtime with the same
+//! settings, and one that was not is compiled again and replaced.
 //!
 //! The directory: `$COLLABO_PROGRAM_CACHE`, else `$XDG_CACHE_HOME/collabo-core/programs`, else
 //! `~/.cache/collabo-core/programs` (`%LOCALAPPDATA%\collabo-core\programs` on Windows).
 //! `COLLABO_PROGRAM_CACHE=off` turns it off. Files are only ever written by the engine; the oldest
 //! unused ones go when the directory grows past [`BUDGET`].
 
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -20,27 +25,23 @@ use anyhow::Result;
 use wasmtime::{Engine, Module};
 
 /// Smaller programs compile in well under a second; they stay in memory only.
-pub const LARGE: usize = 32 << 20;
+pub const LARGE: usize = 1 << 20;
 /// What the directory may hold before the least recently used files are deleted.
 const BUDGET: u64 = 2 << 30;
 
 /// Compiles `bytes`, or maps what an earlier machine compiled from the same bytes.
 pub fn load_or_compile(engine: &Engine, bytes: &[u8]) -> Result<Module> {
-    load_or_compile_at(engine, bytes, LARGE)
-}
-
-/// [`load_or_compile`], kept on disk from `large` bytes on (shared libraries: from a megabyte,
-/// since a process loads them every time it starts, after the program itself).
-pub fn load_or_compile_at(engine: &Engine, bytes: &[u8], large: usize) -> Result<Module> {
-    if bytes.len() < large {
-        return Module::new(engine, bytes);
+    if bytes.len() < LARGE {
+        return compile(engine, bytes);
     }
     let Some(dir) = cache_dir() else {
-        return compile_large(engine, bytes);
+        return compile(engine, bytes);
     };
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     let name: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-    let path = dir.join(format!("{name}.cwasm"));
+    let mut settings = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut settings);
+    let path = dir.join(format!("{name}-{:016x}.cwasm", settings.finish()));
     if path.is_file() {
         // SAFETY: the file is the engine's own serialization (written below, renamed into place
         // whole), in the user's own cache directory; wasmtime refuses one made by another
@@ -53,7 +54,7 @@ pub fn load_or_compile_at(engine: &Engine, bytes: &[u8], large: usize) -> Result
             Err(error) => eprintln!("[collabo-core] compiling again ({}: {error})", path.display()),
         }
     }
-    let module = compile_large(engine, bytes)?;
+    let module = compile(engine, bytes)?;
     match store(&module, &dir, &path) {
         // the mapped file instead of the compiled copy in memory
         Ok(()) => match unsafe { Module::deserialize_file(engine, &path) } {
@@ -71,7 +72,9 @@ pub fn load_or_compile_at(engine: &Engine, bytes: &[u8], large: usize) -> Result
     }
 }
 
-fn compile_large(engine: &Engine, bytes: &[u8]) -> Result<Module> {
+/// Every compile, small ones too: what the compiler freed stays with the allocator otherwise (the
+/// kernel and busybox at boot left ~150 MB, python3's first start ~350 MB).
+fn compile(engine: &Engine, bytes: &[u8]) -> Result<Module> {
     let module = Module::new(engine, bytes);
     give_back_freed_memory();
     module

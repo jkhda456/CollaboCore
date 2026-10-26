@@ -80,6 +80,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   python3 "$T/test_dlopen.py" >"$progs/dlopen.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/dlopen.txt" | head -40; echo "FAIL: dlopen (addons/mod/0019, 0020)"; exit 1; }
   tail -1 "$progs/dlopen.txt"
 
+  echo "== guest boot: the boot images served by the engine and laid over the initramfs (the unpacked tree, what changes them)"
+  python3 "$T/test_images.py" >"$progs/images.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/images.txt" | head -40; echo "FAIL: served boot images (engine/src/image_fs.rs, userspace/rootfs/init.c, kernel/patches/ramfs-xattr.patch)"; exit 1; }
+  tail -1 "$progs/images.txt"
+
   echo "== engine logs: network log, command log (every exec in the guest), line limit, size limit, rotation"
   python3 "$T/test_logs.py" >"$progs/logs.txt" 2>&1 || { grep -A2 "^FAIL" "$progs/logs.txt"; echo "FAIL: engine logs"; exit 1; }
   tail -1 "$progs/logs.txt"

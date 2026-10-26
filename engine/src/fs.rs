@@ -17,42 +17,42 @@ use wasmtime::SharedMemory;
 use crate::virtio::{write_bytes, Device, Queue};
 
 const IN_HEADER_SIZE: usize = 40;
-const OUT_HEADER_SIZE: usize = 16;
-const ATTR_SIZE: usize = 88;
-const ENTRY_OUT_SIZE: usize = 40 + ATTR_SIZE;
-const ATTR_OUT_SIZE: usize = 16 + ATTR_SIZE;
-const OPEN_OUT_SIZE: usize = 16;
+pub(crate) const OUT_HEADER_SIZE: usize = 16;
+pub(crate) const ATTR_SIZE: usize = 88;
+pub(crate) const ENTRY_OUT_SIZE: usize = 40 + ATTR_SIZE;
+pub(crate) const ATTR_OUT_SIZE: usize = 16 + ATTR_SIZE;
+pub(crate) const OPEN_OUT_SIZE: usize = 16;
 const INIT_OUT_SIZE: usize = 64;
 const WRITE_OUT_SIZE: usize = 8;
-const STATFS_OUT_SIZE: usize = 80;
+pub(crate) const STATFS_OUT_SIZE: usize = 80;
 
-const OP_LOOKUP: u32 = 1;
-const OP_FORGET: u32 = 2;
-const OP_GETATTR: u32 = 3;
-const OP_SETATTR: u32 = 4;
-const OP_READLINK: u32 = 5;
-const OP_SYMLINK: u32 = 6;
-const OP_MKDIR: u32 = 9;
-const OP_UNLINK: u32 = 10;
-const OP_RMDIR: u32 = 11;
-const OP_RENAME: u32 = 12;
-const OP_OPEN: u32 = 14;
-const OP_READ: u32 = 15;
-const OP_WRITE: u32 = 16;
-const OP_STATFS: u32 = 17;
-const OP_RELEASE: u32 = 18;
-const OP_FSYNC: u32 = 20;
-const OP_FLUSH: u32 = 25;
-const OP_INIT: u32 = 26;
-const OP_OPENDIR: u32 = 27;
-const OP_READDIR: u32 = 28;
-const OP_RELEASEDIR: u32 = 29;
-const OP_FSYNCDIR: u32 = 30;
-const OP_ACCESS: u32 = 34;
-const OP_CREATE: u32 = 35;
-const OP_INTERRUPT: u32 = 36;
-const OP_DESTROY: u32 = 38;
-const OP_BATCH_FORGET: u32 = 42;
+pub(crate) const OP_LOOKUP: u32 = 1;
+pub(crate) const OP_FORGET: u32 = 2;
+pub(crate) const OP_GETATTR: u32 = 3;
+pub(crate) const OP_SETATTR: u32 = 4;
+pub(crate) const OP_READLINK: u32 = 5;
+pub(crate) const OP_SYMLINK: u32 = 6;
+pub(crate) const OP_MKDIR: u32 = 9;
+pub(crate) const OP_UNLINK: u32 = 10;
+pub(crate) const OP_RMDIR: u32 = 11;
+pub(crate) const OP_RENAME: u32 = 12;
+pub(crate) const OP_OPEN: u32 = 14;
+pub(crate) const OP_READ: u32 = 15;
+pub(crate) const OP_WRITE: u32 = 16;
+pub(crate) const OP_STATFS: u32 = 17;
+pub(crate) const OP_RELEASE: u32 = 18;
+pub(crate) const OP_FSYNC: u32 = 20;
+pub(crate) const OP_FLUSH: u32 = 25;
+pub(crate) const OP_INIT: u32 = 26;
+pub(crate) const OP_OPENDIR: u32 = 27;
+pub(crate) const OP_READDIR: u32 = 28;
+pub(crate) const OP_RELEASEDIR: u32 = 29;
+pub(crate) const OP_FSYNCDIR: u32 = 30;
+pub(crate) const OP_ACCESS: u32 = 34;
+pub(crate) const OP_CREATE: u32 = 35;
+pub(crate) const OP_INTERRUPT: u32 = 36;
+pub(crate) const OP_DESTROY: u32 = 38;
+pub(crate) const OP_BATCH_FORGET: u32 = 42;
 
 const INIT_ASYNC_READ: u32 = 1;
 const INIT_BIG_WRITES: u32 = 1 << 5;
@@ -66,30 +66,30 @@ const SETATTR_ATIME: u32 = 1 << 4;
 const SETATTR_MTIME: u32 = 1 << 5;
 const SETATTR_FH: u32 = 1 << 6;
 
-const S_IFMT: u32 = 0o170000;
-const S_IFDIR: u32 = 0o040000;
-const S_IFREG: u32 = 0o100000;
-const S_IFLNK: u32 = 0o120000;
+pub(crate) const S_IFMT: u32 = 0o170000;
+pub(crate) const S_IFDIR: u32 = 0o040000;
+pub(crate) const S_IFREG: u32 = 0o100000;
+pub(crate) const S_IFLNK: u32 = 0o120000;
 
 const EPERM: i32 = 1;
-const ENOENT: i32 = 2;
-const EIO: i32 = 5;
-const EBADF: i32 = 9;
+pub(crate) const ENOENT: i32 = 2;
+pub(crate) const EIO: i32 = 5;
+pub(crate) const EBADF: i32 = 9;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
-const ENOTDIR: i32 = 20;
-const EISDIR: i32 = 21;
-const EINVAL: i32 = 22;
+pub(crate) const ENOTDIR: i32 = 20;
+pub(crate) const EISDIR: i32 = 21;
+pub(crate) const EINVAL: i32 = 22;
 const ENOSPC: i32 = 28;
-const EROFS: i32 = 30;
+pub(crate) const EROFS: i32 = 30;
 const ENOTEMPTY: i32 = 39;
-const ENOSYS: i32 = 38;
+pub(crate) const ENOSYS: i32 = 38;
 
 /// A failure the guest should see as an errno rather than a broken device.
 #[derive(Debug)]
-struct FsError(i32);
+pub(crate) struct FsError(pub(crate) i32);
 
-type FsResult<T> = std::result::Result<T, FsError>;
+pub(crate) type FsResult<T> = std::result::Result<T, FsError>;
 
 impl From<std::io::Error> for FsError {
     fn from(error: std::io::Error) -> FsError {
@@ -114,37 +114,37 @@ impl From<std::io::Error> for FsError {
 }
 
 /// Reads little-endian fields out of a request.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
         Reader { bytes, at: 0 }
     }
 
-    fn take(&mut self, length: usize) -> FsResult<&'a [u8]> {
+    pub(crate) fn take(&mut self, length: usize) -> FsResult<&'a [u8]> {
         let end = self.at.checked_add(length).ok_or(FsError(EINVAL))?;
         let slice = self.bytes.get(self.at..end).ok_or(FsError(EINVAL))?;
         self.at = end;
         Ok(slice)
     }
 
-    fn u32(&mut self) -> FsResult<u32> {
+    pub(crate) fn u32(&mut self) -> FsResult<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    fn u64(&mut self) -> FsResult<u64> {
+    pub(crate) fn u64(&mut self) -> FsResult<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    fn skip(&mut self, length: usize) -> FsResult<()> {
+    pub(crate) fn skip(&mut self, length: usize) -> FsResult<()> {
         self.take(length).map(|_| ())
     }
 
     /// The next NUL-terminated string, as FUSE writes path components.
-    fn cstring(&mut self) -> FsResult<String> {
+    pub(crate) fn cstring(&mut self) -> FsResult<String> {
         let rest = self.bytes.get(self.at..).ok_or(FsError(EINVAL))?;
         let end = rest.iter().position(|byte| *byte == 0).ok_or(FsError(EINVAL))?;
         let text = std::str::from_utf8(&rest[..end]).map_err(|_| FsError(EINVAL))?.to_string();
@@ -155,57 +155,60 @@ impl<'a> Reader<'a> {
 
 /// Builds a response payload (everything after `fuse_out_header`).
 #[derive(Default)]
-struct Writer {
-    bytes: Vec<u8>,
+pub(crate) struct Writer {
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Writer {
-    fn u32(&mut self, value: u32) -> &mut Writer {
+    pub(crate) fn u32(&mut self, value: u32) -> &mut Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }
 
-    fn u64(&mut self, value: u64) -> &mut Writer {
+    pub(crate) fn u64(&mut self, value: u64) -> &mut Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }
 
-    fn i32(&mut self, value: i32) -> &mut Writer {
+    pub(crate) fn i32(&mut self, value: i32) -> &mut Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }
 
-    fn u16(&mut self, value: u16) -> &mut Writer {
+    pub(crate) fn u16(&mut self, value: u16) -> &mut Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }
 
-    fn bytes(&mut self, value: &[u8]) -> &mut Writer {
+    pub(crate) fn bytes(&mut self, value: &[u8]) -> &mut Writer {
         self.bytes.extend_from_slice(value);
         self
     }
 
-    fn zeros(&mut self, length: usize) -> &mut Writer {
+    pub(crate) fn zeros(&mut self, length: usize) -> &mut Writer {
         self.bytes.resize(self.bytes.len() + length, 0);
         self
     }
 
     /// FUSE dirents are padded to a multiple of 8 bytes.
-    fn pad8(&mut self) {
+    pub(crate) fn pad8(&mut self) {
         let padding = self.bytes.len().wrapping_neg() & 7;
         self.zeros(padding);
     }
 }
 
 /// What the guest is told about a file.
-struct Attributes {
-    ino: u64,
-    size: u64,
-    mode: u32,
-    nlink: u32,
-    atime: (u64, u32),
-    mtime: (u64, u32),
-    ctime: (u64, u32),
+pub(crate) struct Attributes {
+    pub(crate) ino: u64,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) rdev: u32,
+    pub(crate) atime: (u64, u32),
+    pub(crate) mtime: (u64, u32),
+    pub(crate) ctime: (u64, u32),
 }
 
 fn seconds(time: std::io::Result<SystemTime>) -> (u64, u32) {
@@ -246,13 +249,17 @@ fn attributes(ino: u64, metadata: &std::fs::Metadata) -> Attributes {
         size: metadata.len(),
         mode,
         nlink,
+        // the guest runs as root, and the host's ids mean nothing to it
+        uid: 0,
+        gid: 0,
+        rdev: 0,
         atime: seconds(metadata.accessed()),
         mtime: seconds(metadata.modified()),
         ctime: seconds(metadata.modified()),
     }
 }
 
-fn write_attr(out: &mut Writer, attributes: &Attributes) {
+pub(crate) fn write_attr(out: &mut Writer, attributes: &Attributes) {
     out.u64(attributes.ino)
         .u64(attributes.size)
         .u64(attributes.size.div_ceil(512))
@@ -264,14 +271,14 @@ fn write_attr(out: &mut Writer, attributes: &Attributes) {
         .u32(attributes.ctime.1)
         .u32(attributes.mode)
         .u32(attributes.nlink)
-        .u32(0) // uid: the guest runs as root, and the host's ids mean nothing to it
-        .u32(0) // gid
-        .u32(0) // rdev
+        .u32(attributes.uid)
+        .u32(attributes.gid)
+        .u32(attributes.rdev)
         .u32(4096) // blksize
         .u32(0); // flags
 }
 
-fn dirent_type(mode: u32) -> u32 {
+pub(crate) fn dirent_type(mode: u32) -> u32 {
     match mode & S_IFMT {
         0o010000 => 1,
         0o020000 => 2,
@@ -503,36 +510,7 @@ impl FsDevice {
         const VALIDITY: u64 = 1;
 
         match opcode {
-            OP_INIT => {
-                let major = body.u32()?;
-                let minor = body.u32()?;
-                let max_readahead = body.u32()?;
-                let flags = body.u32()?;
-                if major != 7 {
-                    if major < 7 {
-                        return Err(FsError(EIO));
-                    }
-                    // A newer guest retries with our major; only the version answers.
-                    out.u32(7).u32(45);
-                    return Ok(Some(out));
-                }
-                let supported = INIT_ASYNC_READ | INIT_BIG_WRITES | INIT_AUTO_INVAL_DATA | INIT_MAX_PAGES | INIT_EXT;
-                let flags = flags & supported;
-                out.u32(7)
-                    .u32(minor.min(45))
-                    .u32(max_readahead.min(1024 * 1024))
-                    .u32(flags)
-                    .u16(12) // max_background
-                    .u16(9) // congestion_threshold
-                    .u32(1024 * 1024) // max_write
-                    .u32(1) // time_gran
-                    .u16(if flags & INIT_MAX_PAGES == 0 { 0 } else { 16 })
-                    .u16(0) // map_alignment
-                    .u32(0) // flags2
-                    .u32(0) // max_stack_depth
-                    .u16(0) // request_timeout
-                    .zeros(22);
-            }
+            OP_INIT => out = init(body, 0)?,
             OP_LOOKUP => {
                 let name = body.cstring()?;
                 let path = self.child(nodeid, &name)?;
@@ -822,6 +800,41 @@ impl FsDevice {
     }
 }
 
+/// The answer to FUSE_INIT: what every server does, and the `extra` flags a server also wants
+/// when the guest offers them.
+pub(crate) fn init(body: &mut Reader, extra: u32) -> FsResult<Writer> {
+    let mut out = Writer::default();
+    let major = body.u32()?;
+    let minor = body.u32()?;
+    let max_readahead = body.u32()?;
+    let flags = body.u32()?;
+    if major != 7 {
+        if major < 7 {
+            return Err(FsError(EIO));
+        }
+        // A newer guest retries with our major; only the version answers.
+        out.u32(7).u32(45);
+        return Ok(out);
+    }
+    let supported = INIT_ASYNC_READ | INIT_BIG_WRITES | INIT_AUTO_INVAL_DATA | INIT_MAX_PAGES | INIT_EXT | extra;
+    let flags = flags & supported;
+    out.u32(7)
+        .u32(minor.min(45))
+        .u32(max_readahead.min(1024 * 1024))
+        .u32(flags)
+        .u16(12) // max_background
+        .u16(9) // congestion_threshold
+        .u32(1024 * 1024) // max_write
+        .u32(1) // time_gran
+        .u16(if flags & INIT_MAX_PAGES == 0 { 0 } else { 16 })
+        .u16(0) // map_alignment
+        .u32(0) // flags2
+        .u32(0) // max_stack_depth
+        .u16(0) // request_timeout
+        .zeros(22);
+    Ok(out)
+}
+
 #[cfg(unix)]
 fn libc_o_nofollow() -> i32 {
     0o400000 // O_NOFOLLOW on Linux; harmless elsewhere on unix where it differs
@@ -872,79 +885,99 @@ impl Device for FsDevice {
     }
 
     fn config(&self) -> Vec<u8> {
-        // struct virtio_fs_config { char tag[36]; u32 num_request_queues; }
-        let mut config = vec![0u8; 40];
-        let tag = self.share.tag.as_bytes();
-        config[..tag.len()].copy_from_slice(tag);
-        config[36..40].copy_from_slice(&1u32.to_le_bytes());
-        config
+        config(&self.share.tag)
     }
 
     fn notify(&mut self, _queue_index: u16, queue: &mut Queue, memory: &SharedMemory) -> Result<Vec<u32>> {
-        let mut irqs = Vec::new();
-        while let Some(chain) = queue.pop()? {
-            let mut request = Vec::new();
-            let mut capacity = 0usize;
-            let mut targets = Vec::new();
-            for buffer in &chain.buffers {
-                if buffer.writable {
-                    capacity += buffer.length as usize;
-                    targets.push((buffer.address, buffer.length as usize));
-                } else {
-                    match crate::machine::guest_bytes(memory, buffer.address as u32, buffer.length) {
-                        Some(bytes) => request.extend_from_slice(&bytes),
-                        None => bail!("virtio-fs request buffer outside guest memory"),
-                    }
-                }
-            }
-
-            let (unique, response) = self.answer(&request, capacity);
-            let written = match capacity >= OUT_HEADER_SIZE {
-                true => {
-                    let mut bytes = Vec::with_capacity(OUT_HEADER_SIZE + response.1.len());
-                    bytes.extend_from_slice(&((OUT_HEADER_SIZE + response.1.len()) as u32).to_le_bytes());
-                    bytes.extend_from_slice(&response.0.to_le_bytes());
-                    bytes.extend_from_slice(&unique.to_le_bytes());
-                    bytes.extend_from_slice(&response.1);
-                    scatter(memory, &targets, &bytes)?
-                }
-                false => 0,
-            };
-            irqs.push(queue.release(chain, written as u32)?);
-        }
-        Ok(irqs)
+        serve(self, queue, memory)
     }
 }
 
-impl FsDevice {
-    /// Parses one request and produces `(unique, (error, payload))`.
-    fn answer(&mut self, request: &[u8], capacity: usize) -> (u64, (i32, Vec<u8>)) {
-        let mut body = Reader::new(request);
-        let header = (|| -> FsResult<(u32, u32, u64, u64)> {
-            let length = body.u32()?;
-            let opcode = body.u32()?;
-            let unique = body.u64()?;
-            let nodeid = body.u64()?;
-            body.skip(IN_HEADER_SIZE - 24)?;
-            if length as usize != request.len() || (length as usize) < IN_HEADER_SIZE {
-                return Err(FsError(EINVAL));
-            }
-            Ok((length, opcode, unique, nodeid))
-        })();
+impl Server for FsDevice {
+    fn process(&mut self, opcode: u32, nodeid: u64, body: &mut Reader, capacity: usize) -> FsResult<Option<Writer>> {
+        FsDevice::process(self, opcode, nodeid, body, capacity)
+    }
+}
 
-        let (opcode, unique, nodeid) = match header {
-            Ok((_, opcode, unique, nodeid)) => (opcode, unique, nodeid),
-            Err(error) => return (0, (-error.0, Vec::new())),
+/// What answers the guest's FUSE requests: a host folder ([`FsDevice`]), or the boot images
+/// (image_fs.rs). `process` returns the payload that follows `fuse_out_header`, or `None` for
+/// the requests that have no reply.
+pub(crate) trait Server {
+    fn process(&mut self, opcode: u32, nodeid: u64, body: &mut Reader, capacity: usize) -> FsResult<Option<Writer>>;
+}
+
+/// `struct virtio_fs_config { char tag[36]; u32 num_request_queues; }`
+pub(crate) fn config(tag: &str) -> Vec<u8> {
+    let mut config = vec![0u8; 40];
+    let tag = tag.as_bytes();
+    config[..tag.len()].copy_from_slice(tag);
+    config[36..40].copy_from_slice(&1u32.to_le_bytes());
+    config
+}
+
+/// Answers every request waiting on the queue.
+pub(crate) fn serve(server: &mut impl Server, queue: &mut Queue, memory: &SharedMemory) -> Result<Vec<u32>> {
+    let mut irqs = Vec::new();
+    while let Some(chain) = queue.pop()? {
+        let mut request = Vec::new();
+        let mut capacity = 0usize;
+        let mut targets = Vec::new();
+        for buffer in &chain.buffers {
+            if buffer.writable {
+                capacity += buffer.length as usize;
+                targets.push((buffer.address, buffer.length as usize));
+            } else {
+                match crate::machine::guest_bytes(memory, buffer.address as u32, buffer.length) {
+                    Some(bytes) => request.extend_from_slice(&bytes),
+                    None => bail!("virtio-fs request buffer outside guest memory"),
+                }
+            }
+        }
+
+        let (unique, response) = answer(server, &request, capacity);
+        let written = match capacity >= OUT_HEADER_SIZE {
+            true => {
+                let mut bytes = Vec::with_capacity(OUT_HEADER_SIZE + response.1.len());
+                bytes.extend_from_slice(&((OUT_HEADER_SIZE + response.1.len()) as u32).to_le_bytes());
+                bytes.extend_from_slice(&response.0.to_le_bytes());
+                bytes.extend_from_slice(&unique.to_le_bytes());
+                bytes.extend_from_slice(&response.1);
+                scatter(memory, &targets, &bytes)?
+            }
+            false => 0,
         };
-        if capacity < minimum_capacity(opcode) {
-            return (unique, (-EINVAL, Vec::new()));
+        irqs.push(queue.release(chain, written as u32)?);
+    }
+    Ok(irqs)
+}
+
+/// Parses one request and produces `(unique, (error, payload))`.
+fn answer(server: &mut impl Server, request: &[u8], capacity: usize) -> (u64, (i32, Vec<u8>)) {
+    let mut body = Reader::new(request);
+    let header = (|| -> FsResult<(u32, u32, u64, u64)> {
+        let length = body.u32()?;
+        let opcode = body.u32()?;
+        let unique = body.u64()?;
+        let nodeid = body.u64()?;
+        body.skip(IN_HEADER_SIZE - 24)?;
+        if length as usize != request.len() || (length as usize) < IN_HEADER_SIZE {
+            return Err(FsError(EINVAL));
         }
-        match self.process(opcode, nodeid, &mut body, capacity) {
-            Ok(Some(payload)) => (unique, (0, payload.bytes)),
-            // FORGET and INTERRUPT have no reply at all.
-            Ok(None) => (unique, (0, Vec::new())),
-            Err(error) => (unique, (-error.0, Vec::new())),
-        }
+        Ok((length, opcode, unique, nodeid))
+    })();
+
+    let (opcode, unique, nodeid) = match header {
+        Ok((_, opcode, unique, nodeid)) => (opcode, unique, nodeid),
+        Err(error) => return (0, (-error.0, Vec::new())),
+    };
+    if capacity < minimum_capacity(opcode) {
+        return (unique, (-EINVAL, Vec::new()));
+    }
+    match server.process(opcode, nodeid, &mut body, capacity) {
+        Ok(Some(payload)) => (unique, (0, payload.bytes)),
+        // FORGET and INTERRUPT have no reply at all.
+        Ok(None) => (unique, (0, Vec::new())),
+        Err(error) => (unique, (-error.0, Vec::new())),
     }
 }
 

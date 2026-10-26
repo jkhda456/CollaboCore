@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{addons, agent, console, fs, hostfn, http, intercept, machine, net, serial, sshagent, virtio, vsock, zip};
+use crate::{addons, agent, console, fs, hostfn, http, image_fs, intercept, machine, net, serial, sshagent, virtio, vsock, zip};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -581,28 +581,40 @@ impl Server {
             })?));
         }
 
-        let mut initcpio = Vec::new();
-        for path in &self.images.initramfs {
-            initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?);
+        // The first initramfs (the one with /init) is unpacked into the guest's memory; the
+        // archives over it are served from here when they can be (image_fs.rs).
+        let mut initramfs = Vec::new();
+        let mut layers = Vec::new();
+        for (index, path) in self.images.initramfs.iter().enumerate() {
+            match index {
+                0 => initramfs = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+                _ => layers.push(image_fs::Layer::File(path.clone())),
+            }
         }
         if python {
             match &self.images.python {
-                Some(path) => initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+                Some(path) => layers.push(image_fs::Layer::File(path.clone())),
                 None => return failed("bad-request", "this runtime has no Python image; start with python: false"),
             }
         }
         if tools {
             match &self.images.tools {
-                Some(path) => initcpio.extend(std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+                Some(path) => layers.push(image_fs::Layer::File(path.clone())),
                 None => return failed("bad-request", "this runtime has no tools image; start with tools: false"),
             }
         }
-        initcpio.extend_from_slice(&addons.initcpio);
+        layers.extend(addons.layers);
         if let Some(settings) = &gui_config {
-            initcpio.extend(gui_settings(settings));
+            layers.push(image_fs::Layer::Bytes(gui_settings(settings)));
         }
         if let Some(pem) = &session_ca {
-            initcpio.extend(cpio_overlay(&[("etc", None), ("etc/ssl", None), ("etc/ssl/collabo-ca.pem", Some(pem.as_bytes()))]));
+            layers.push(image_fs::Layer::Bytes(cpio_overlay(&[("etc", None), ("etc/ssl", None), ("etc/ssl/collabo-ca.pem", Some(pem.as_bytes()))])));
+        }
+        let (initcpio, images) = image_fs::arrange(initramfs, layers)?;
+        // /init lays the images over the initramfs.
+        if let Some(images) = images {
+            args.push(format!("collabo.images={}", image_fs::TAG));
+            devices.push(Box::new(images));
         }
         let kernel = std::fs::read(&self.images.kernel)
             .with_context(|| format!("reading {}", self.images.kernel.display()))?;

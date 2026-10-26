@@ -10,6 +10,7 @@ mod fs;
 mod hostfn;
 mod http;
 mod icmp;
+mod image_fs;
 mod intercept;
 mod log;
 mod machine;
@@ -596,23 +597,30 @@ fn main() -> Result<()> {
         .serve();
     }
     let kernel = std::fs::read(&kernel_path).with_context(|| format!("reading {kernel_path}"))?;
-    let mut initcpio = Vec::new();
-    for path in &initramfs_paths {
-        initcpio.extend(std::fs::read(path).with_context(|| format!("reading {path}"))?);
+    // The first initramfs (the one with /init) is unpacked into the guest's memory; the archives
+    // over it are served from here when they can be (image_fs.rs).
+    let mut initramfs = Vec::new();
+    let mut layers = Vec::new();
+    for (index, path) in initramfs_paths.iter().enumerate() {
+        match index {
+            0 => initramfs = std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            _ => layers.push(image_fs::Layer::File(path.into())),
+        }
     }
     // The overlays --stdio adds unless the app turns them off, here only when named.
     for path in python_image.iter().chain(&tools_image) {
-        initcpio.extend(std::fs::read(path).with_context(|| format!("reading {path}"))?);
+        layers.push(image_fs::Layer::File(path.into()));
     }
     let addons = match addon_settings.is_empty() {
         true => addons::Resolved::default(),
         false => addons::resolve(addon_dir.as_deref().map(std::path::Path::new), Some(&serde_json::Value::Object(addon_settings)))
             .map_err(anyhow::Error::msg)?,
     };
-    initcpio.extend_from_slice(&addons.initcpio);
+    layers.extend(addons.layers);
     if let Some(serde_json::Value::Object(settings)) = gui_settings.get("gui") {
-        initcpio.extend(protocol::gui_settings(settings));
+        layers.push(image_fs::Layer::Bytes(protocol::gui_settings(settings)));
     }
+    let (initcpio, images) = image_fs::arrange(initramfs, layers)?;
     policy.addon_headers = addons.headers;
     policy.addon_secrets = addons.secrets;
 
@@ -744,6 +752,11 @@ fn main() -> Result<()> {
         let option = if share.read_only { ":ro" } else { "" };
         args.push(format!("collabo.mount={}:{}{option}", share.tag, share.guest_path));
         devices.push(Box::new(fs::FsDevice::new(share)?));
+    }
+    // /init lays the images over the initramfs.
+    if let Some(images) = images {
+        args.push(format!("collabo.images={}", image_fs::TAG));
+        devices.push(Box::new(images));
     }
 
     let mut machine = machine::Machine::boot(machine::BootOptions {

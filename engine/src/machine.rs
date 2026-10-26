@@ -573,7 +573,8 @@ impl Machine {
                 }
             })?;
         }
-        let module = Module::new(&engine, &options.kernel).context("compiling the kernel")?;
+        // kept compiled on disk as large programs are (program_cache.rs): no compile at boot
+        let module = crate::program_cache::load_or_compile(&engine, &options.kernel).context("compiling the kernel")?;
 
         let (memory_type, kernel_pages) = crate::module_info::memory_import(&options.kernel)?;
         let initcpio_address = kernel_pages * PAGE_SIZE;

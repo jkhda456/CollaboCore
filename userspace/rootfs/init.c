@@ -7,8 +7,10 @@
 // (arch/wasm machine_power_off). The engine cannot restart a machine, so reboot also ends it.
 //
 // No fork() on wasm Linux; children are created with posix_spawn().
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -72,6 +74,84 @@ static void mnt(const char *src, const char *dst, const char *type, unsigned lon
 		fprintf(stderr, "init: mount %s on %s: %s\n", type, dst, strerror(errno));
 }
 
+// The boot images over the initramfs (python, tools, add-ons), which the engine serves read-only
+// instead of having them unpacked into memory (engine/src/image_fs.rs): with collabo.images=TAG
+// on the kernel command line, each of their top-level directories is laid over the initramfs's
+// own with overlayfs before anything else runs. Changes stay in memory (/run/collabo/upper), as
+// they did when everything was unpacked, and only what is read of the images comes into it.
+static void overlay_images(void)
+{
+	char cmdline[4096], tag[64] = "";
+	int fd = open("/proc/cmdline", O_RDONLY);
+	if (fd < 0)
+		return;
+	ssize_t length = read(fd, cmdline, sizeof cmdline - 1);
+	close(fd);
+	if (length <= 0)
+		return;
+	cmdline[length] = 0;
+	for (char *word = strtok(cmdline, " \n"); word; word = strtok(NULL, " \n")) {
+		if (!strncmp(word, "collabo.images=", 15) && strlen(word + 15) < sizeof tag)
+			strcpy(tag, word + 15);
+	}
+	if (!tag[0])
+		return;
+
+	const char *images = "/run/collabo/images", *changes = "/run/collabo/upper";
+	mkdir("/run", 0755);
+	mkdir("/run/collabo", 0755);
+	mkdir(images, 0755);
+	mkdir(changes, 0755);
+	if (mount(tag, images, "virtiofs", MS_RDONLY, NULL) < 0 || mount("tmpfs", changes, "tmpfs", 0, NULL) < 0) {
+		fprintf(stderr, "init: the boot images (%s): %s\n", tag, strerror(errno));
+		return;
+	}
+	DIR *top = opendir(images);
+	if (!top) {
+		fprintf(stderr, "init: %s: %s\n", images, strerror(errno));
+		return;
+	}
+	struct dirent *entry;
+	while ((entry = readdir(top))) {
+		const char *name = entry->d_name;
+		char lower[PATH_MAX], target[PATH_MAX], upper[PATH_MAX], work[PATH_MAX], options[3 * PATH_MAX + 64];
+		struct stat image, own;
+		if (!strcmp(name, ".") || !strcmp(name, ".."))
+			continue;
+		// covered by their pseudo filesystems (unpacked, these were hidden as well)
+		if (!strcmp(name, "proc") || !strcmp(name, "sys") || !strcmp(name, "dev"))
+			continue;
+		// what overlayfs's options cannot name
+		if (strpbrk(name, ",:\\")) {
+			fprintf(stderr, "init: /%s of the boot images is left out (its name)\n", name);
+			continue;
+		}
+		snprintf(lower, sizeof lower, "%s/%s", images, name);
+		snprintf(target, sizeof target, "/%s", name);
+		if (stat(lower, &image) < 0 || !S_ISDIR(image.st_mode))
+			continue;
+		// where the initramfs has none, the images' own mode
+		if (mkdir(target, 0700) == 0)
+			chmod(target, image.st_mode & 07777);
+		if (lstat(target, &own) < 0 || !S_ISDIR(own.st_mode)) {
+			fprintf(stderr, "init: /%s of the boot images is left out (not a directory here)\n", name);
+			continue;
+		}
+		// the merged directory takes its upper directory's mode
+		snprintf(upper, sizeof upper, "%s/%s", changes, name);
+		mkdir(upper, 0755);
+		snprintf(upper, sizeof upper, "%s/%s/upper", changes, name);
+		mkdir(upper, 0700);
+		chmod(upper, own.st_mode & 07777);
+		snprintf(work, sizeof work, "%s/%s/work", changes, name);
+		mkdir(work, 0700);
+		snprintf(options, sizeof options, "lowerdir=%s:%s,upperdir=%s,workdir=%s", lower, target, upper, work);
+		if (mount("overlay", target, "overlay", 0, options) < 0)
+			fprintf(stderr, "init: overlay on %s: %s\n", target, strerror(errno));
+	}
+	closedir(top);
+}
+
 // Run a program to completion. Used for /etc/rc before the interactive shell.
 static void run(const char *path, char *const argv[])
 {
@@ -114,6 +194,7 @@ int main(void)
 	// Sticky and writable by all, as /tmp is elsewhere: this kernel's tmpfs (ramfs) starts at
 	// 0755, which locks out whoever drops root (perldoc runs as nobody).
 	chmod("/tmp", 01777);
+	overlay_images();
 	mkdir("/root", 0700);
 	sethostname("collabo", 7);
 

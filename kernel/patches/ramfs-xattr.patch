@@ -1,0 +1,233 @@
+Extended attributes and RENAME_WHITEOUT for ramfs, which is also tmpfs here (shmem needs an MMU),
+both as tmpfs has them: trusted.* and user.* attributes kept in memory with the simple_xattr
+helpers, and a rename that leaves a whiteout behind. overlayfs needs the attributes on its upper
+layer to make a directory opaque: without them, removing a directory of a lower layer and making
+one of the same name failed with EIO (`pip install -U` of a preinstalled package, once the boot
+images are laid over the initramfs: engine/src/image_fs.rs, userspace/rootfs/init.c). Without
+RENAME_WHITEOUT it only warned at every mount and took two steps for a whiteout.
+
+diff --git a/fs/ramfs/file-mmu.c b/fs/ramfs/file-mmu.c
+index c3ed1c5117b2..7449a9495e47 100644
+--- a/fs/ramfs/file-mmu.c
++++ b/fs/ramfs/file-mmu.c
+@@ -52,4 +52,5 @@ const struct file_operations ramfs_file_operations = {
+ const struct inode_operations ramfs_file_inode_operations = {
+ 	.setattr	= simple_setattr,
+ 	.getattr	= simple_getattr,
++	.listxattr	= ramfs_listxattr,
+ };
+diff --git a/fs/ramfs/file-nommu.c b/fs/ramfs/file-nommu.c
+index 2f79bcb89d2e..501ff47a3ad5 100644
+--- a/fs/ramfs/file-nommu.c
++++ b/fs/ramfs/file-nommu.c
+@@ -51,6 +51,7 @@ const struct file_operations ramfs_file_operations = {
+ const struct inode_operations ramfs_file_inode_operations = {
+ 	.setattr		= ramfs_nommu_setattr,
+ 	.getattr		= simple_getattr,
++	.listxattr		= ramfs_listxattr,
+ };
+ 
+ /*****************************************************************************/
+diff --git a/fs/ramfs/inode.c b/fs/ramfs/inode.c
+index 3987639ed132..06c0cbdab536 100644
+--- a/fs/ramfs/inode.c
++++ b/fs/ramfs/inode.c
+@@ -39,6 +39,7 @@
+ #include <linux/fs_context.h>
+ #include <linux/fs_parser.h>
+ #include <linux/seq_file.h>
++#include <linux/xattr.h>
+ #include "internal.h"
+ 
+ struct ramfs_mount_opts {
+@@ -47,6 +48,7 @@ struct ramfs_mount_opts {
+ 
+ struct ramfs_fs_info {
+ 	struct ramfs_mount_opts mount_opts;
++	struct simple_xattr_cache xattr_cache;
+ };
+ 
+ #define RAMFS_DEFAULT_MODE	0755
+@@ -54,6 +56,97 @@ struct ramfs_fs_info {
+ static const struct super_operations ramfs_ops;
+ static const struct inode_operations ramfs_dir_inode_operations;
+ 
++/*
++ * Extended attributes, kept in memory as tmpfs keeps them. Without them overlayfs cannot make a
++ * directory of its upper layer opaque, so removing a lower directory and creating one of the
++ * same name failed with EIO (tmpfs is ramfs without an MMU). An inode's list is allocated with
++ * its first attribute and hangs off i_private, which ramfs does not otherwise use; setting one
++ * holds the inode lock, reading one does not.
++ */
++static struct list_head *ramfs_xattrs(struct inode *inode)
++{
++	return smp_load_acquire((struct list_head **)&inode->i_private);
++}
++
++static int ramfs_xattr_get(const struct xattr_handler *handler,
++			   struct dentry *unused, struct inode *inode,
++			   const char *suffix, void *value, size_t size)
++{
++	struct ramfs_fs_info *fsi = inode->i_sb->s_fs_info;
++	struct list_head *xattrs = ramfs_xattrs(inode);
++
++	if (!xattrs)
++		return -ENODATA;
++	return simple_xattr_get(&fsi->xattr_cache, xattrs,
++				xattr_full_name(handler, suffix), value, size);
++}
++
++static int ramfs_xattr_set(const struct xattr_handler *handler,
++			   struct mnt_idmap *idmap, struct dentry *unused,
++			   struct inode *inode, const char *suffix,
++			   const void *value, size_t size, int flags)
++{
++	struct ramfs_fs_info *fsi = inode->i_sb->s_fs_info;
++	struct list_head *xattrs = ramfs_xattrs(inode);
++	struct simple_xattr *old_xattr;
++
++	if (!xattrs) {
++		if (!value)
++			return (flags & XATTR_REPLACE) ? -ENODATA : 0;
++		xattrs = kmalloc_obj(*xattrs);
++		if (!xattrs)
++			return -ENOMEM;
++		INIT_LIST_HEAD(xattrs);
++		smp_store_release((struct list_head **)&inode->i_private, xattrs);
++	}
++	old_xattr = simple_xattr_set(&fsi->xattr_cache, xattrs,
++				     xattr_full_name(handler, suffix), value,
++				     size, flags);
++	if (IS_ERR(old_xattr))
++		return PTR_ERR(old_xattr);
++	simple_xattr_free_rcu(old_xattr);
++	inode_set_ctime_current(inode);
++	return 0;
++}
++
++static const struct xattr_handler ramfs_trusted_xattr_handler = {
++	.prefix = XATTR_TRUSTED_PREFIX,
++	.get = ramfs_xattr_get,
++	.set = ramfs_xattr_set,
++};
++
++static const struct xattr_handler ramfs_user_xattr_handler = {
++	.prefix = XATTR_USER_PREFIX,
++	.get = ramfs_xattr_get,
++	.set = ramfs_xattr_set,
++};
++
++static const struct xattr_handler * const ramfs_xattr_handlers[] = {
++	&ramfs_trusted_xattr_handler,
++	&ramfs_user_xattr_handler,
++	NULL
++};
++
++ssize_t ramfs_listxattr(struct dentry *dentry, char *buffer, size_t size)
++{
++	struct inode *inode = d_inode(dentry);
++
++	return simple_xattr_list(inode, ramfs_xattrs(inode), buffer, size);
++}
++
++static void ramfs_evict_inode(struct inode *inode)
++{
++	struct ramfs_fs_info *fsi = inode->i_sb->s_fs_info;
++	struct list_head *xattrs = inode->i_private;
++
++	truncate_inode_pages_final(&inode->i_data);
++	clear_inode(inode);
++	if (xattrs) {
++		simple_xattrs_free(&fsi->xattr_cache, xattrs, NULL);
++		kfree(xattrs);
++	}
++}
++
+ struct inode *ramfs_get_inode(struct super_block *sb,
+ 				const struct inode *dir, umode_t mode, dev_t dev)
+ {
+@@ -186,6 +279,34 @@ static int ramfs_tmpfile(struct mnt_idmap *idmap,
+ 	return finish_open_simple(file, error);
+ }
+ 
++/*
++ * RENAME_WHITEOUT, as tmpfs has it: overlayfs leaves a whiteout (a 0/0 character device) where
++ * the name was in the same step, rather than making one in its work directory and renaming it.
++ */
++static int ramfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
++			struct dentry *old_dentry, struct inode *new_dir,
++			struct dentry *new_dentry, unsigned int flags)
++{
++	struct dentry *whiteout;
++	int error;
++
++	if (!(flags & RENAME_WHITEOUT))
++		return simple_rename(idmap, old_dir, old_dentry, new_dir,
++				     new_dentry, flags);
++	if (!simple_empty(new_dentry))
++		return -ENOTEMPTY;
++	whiteout = d_alloc(old_dentry->d_parent, &old_dentry->d_name);
++	if (!whiteout)
++		return -ENOMEM;
++	error = ramfs_mknod(idmap, old_dir, whiteout, S_IFCHR | WHITEOUT_MODE,
++			    WHITEOUT_DEV);
++	dput(whiteout);
++	if (error)
++		return error;
++	return simple_rename(idmap, old_dir, old_dentry, new_dir, new_dentry,
++			     flags & ~RENAME_WHITEOUT);
++}
++
+ static const struct inode_operations ramfs_dir_inode_operations = {
+ 	.create		= ramfs_create,
+ 	.lookup		= simple_lookup,
+@@ -195,8 +316,9 @@ static const struct inode_operations ramfs_dir_inode_operations = {
+ 	.mkdir		= ramfs_mkdir,
+ 	.rmdir		= simple_rmdir,
+ 	.mknod		= ramfs_mknod,
+-	.rename		= simple_rename,
++	.rename		= ramfs_rename,
+ 	.tmpfile	= ramfs_tmpfile,
++	.listxattr	= ramfs_listxattr,
+ };
+ 
+ /*
+@@ -214,6 +336,7 @@ static int ramfs_show_options(struct seq_file *m, struct dentry *root)
+ static const struct super_operations ramfs_ops = {
+ 	.statfs		= simple_statfs,
+ 	.drop_inode	= inode_just_drop,
++	.evict_inode	= ramfs_evict_inode,
+ 	.show_options	= ramfs_show_options,
+ };
+ 
+@@ -267,6 +390,7 @@ static int ramfs_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	sb->s_blocksize_bits	= PAGE_SHIFT;
+ 	sb->s_magic		= RAMFS_MAGIC;
+ 	sb->s_op		= &ramfs_ops;
++	sb->s_xattr		= ramfs_xattr_handlers;
+ 	sb->s_d_flags		= DCACHE_DONTCACHE;
+ 	sb->s_time_gran		= 1;
+ 
+@@ -310,8 +434,12 @@ int ramfs_init_fs_context(struct fs_context *fc)
+ 
+ void ramfs_kill_sb(struct super_block *sb)
+ {
+-	kfree(sb->s_fs_info);
++	struct ramfs_fs_info *fsi = sb->s_fs_info;
++
++	/* the inodes, and with them their attributes, go first */
+ 	kill_anon_super(sb);
++	simple_xattr_cache_cleanup(&fsi->xattr_cache);
++	kfree(fsi);
+ }
+ 
+ static struct file_system_type ramfs_fs_type = {
+diff --git a/fs/ramfs/internal.h b/fs/ramfs/internal.h
+index 3257fc1809d9..6d8b71f70cd6 100644
+--- a/fs/ramfs/internal.h
++++ b/fs/ramfs/internal.h
+@@ -7,3 +7,4 @@
+ 
+ 
+ extern const struct inode_operations ramfs_file_inode_operations;
++ssize_t ramfs_listxattr(struct dentry *dentry, char *buffer, size_t size);

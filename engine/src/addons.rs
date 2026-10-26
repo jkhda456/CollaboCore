@@ -27,7 +27,7 @@ use crate::http;
 pub struct Resolved {
     pub names: Vec<String>,
     /// The add-ons' images followed by one overlay with their settings.
-    pub initcpio: Vec<u8>,
+    pub layers: Vec<crate::image_fs::Layer>,
     pub headers: Vec<String>,
     pub secrets: Vec<http::Secret>,
 }
@@ -96,7 +96,7 @@ pub fn resolve(dir: Option<&Path>, requested: Option<&Value>) -> Result<Resolved
                 }
             }
         }
-        resolved.initcpio.extend(std::fs::read(&image).map_err(|error| format!("reading {}: {error}", image.display()))?);
+        resolved.layers.push(crate::image_fs::Layer::File(image));
         let text = serde_json::to_vec_pretty(&Value::Object(settings)).expect("settings serialize");
         settings_files.push((format!("etc/collabo/addons/{name}.json"), text));
         resolved.names.push(name);
@@ -104,7 +104,7 @@ pub fn resolve(dir: Option<&Path>, requested: Option<&Value>) -> Result<Resolved
 
     let mut entries: Vec<(&str, Option<&[u8]>)> = vec![("etc", None), ("etc/collabo", None), ("etc/collabo/addons", None)];
     entries.extend(settings_files.iter().map(|(path, data)| (path.as_str(), Some(data.as_slice()))));
-    resolved.initcpio.extend(crate::protocol::cpio_overlay(&entries));
+    resolved.layers.push(crate::image_fs::Layer::Bytes(crate::protocol::cpio_overlay(&entries)));
     Ok(resolved)
 }
 
