@@ -1,0 +1,373 @@
+--- a/shell/hush.c
++++ b/shell/hush.c
+@@ -339,9 +339,11 @@
+  * therefore we don't show them either.
+  */
+ //usage:#define hush_trivial_usage
+-//usage:	"[-enxl] [-c 'SCRIPT' [ARG0 ARGS] | FILE ARGS | -s ARGS]"
++//usage:	"[-enuxl] [-c 'SCRIPT' [ARG0 ARGS] | FILE ARGS | -s ARGS]"
+ //usage:#define hush_full_usage "\n\n"
+ //usage:	"Unix shell interpreter"
++//usage:     "\n\nbusybox's hush, with what POSIX scripts (configure, libtool) need of a"
++//usage:     "\nshell added by collaboCore; not bash. In the shell: help"
+ 
+ #if !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
+ 	|| defined(__APPLE__) \
+@@ -358,6 +360,14 @@
+ 
+ #include "busybox.h"  /* for APPLET_IS_NOFORK/NOEXEC */
+ #include "unicode.h"
++
++/* tombl's NOMMU port starts hush's children as callback clones (bb_clone and
++ * xclone without CLONE_VM: the parent's memory copied, as by fork). So a child
++ * runs a ( group ), a function or a builtin of a pipeline as MMU builds run it
++ * in a forked child, rather than execing the shell again with its whole state in
++ * argv — every variable and function, which for libtool's ( cd ... && ... ) went
++ * past what execve takes (E2BIG: "can't re-execute the shell"). */
++#define HUSH_CLONED_CHILD (!BB_MMU)
+ #include "shell_common.h"
+ #include "math.h"
+ #include "match.h"
+@@ -553,6 +563,9 @@
+ } o_string;
+ enum {
+ 	EXP_FLAG_SINGLEWORD     = 0x80, /* must be 0x80 */
++	/* A pattern (case's): what an unquoted expansion gives keeps its glob
++	 * chars, unsplit; a quoted one's are protected (EXP_FLAG_ESC_GLOB_CHARS) */
++	EXP_FLAG_PATTERN        = 0x4,
+ 	EXP_FLAG_GLOB           = 0x2,
+ 	/* Protect newly added chars against globbing
+ 	 * by prepending \ to *, ?, [, \ */
+@@ -629,6 +642,7 @@
+ 	REDIRECT_HEREDOC   = 4,
+ 	REDIRECT_HEREDOC2  = 5, /* REDIRECT_HEREDOC after heredoc is loaded */
+ 
++	REDIRFD_TO_WORD    = -4, /* N>&WORD: WORD (in rd_filename) expanded when run */
+ 	REDIRFD_CLOSE      = -3,
+ 	REDIRFD_SYNTAX_ERR = -2,
+ 	REDIRFD_TO_FILE    = -1,
+@@ -829,6 +843,7 @@
+ 	"pipefail\0"
+ 	"noexec\0"
+ 	"errexit\0"
++	"nounset\0"
+ #if ENABLE_HUSH_MODE_X
+ 	"xtrace\0"
+ #endif
+@@ -837,6 +852,7 @@
+ 	OPT_O_PIPEFAIL,
+ 	OPT_O_NOEXEC,
+ 	OPT_O_ERREXIT,
++	OPT_O_NOUNSET,
+ #if ENABLE_HUSH_MODE_X
+ 	OPT_O_XTRACE,
+ #endif
+@@ -1030,7 +1046,7 @@
+ # define GROUPINFO_INIT /* nothing */
+ #endif
+ 	struct sigaction sa;
+-	char optstring_buf[sizeof("eixcs")];
++	char optstring_buf[sizeof("euixcs")];
+ #if BASH_EPOCH_VARS
+ 	char epoch_buf[sizeof("%llu.nnnnnn") + sizeof(long long)*3];
+ #endif
+@@ -4342,7 +4358,7 @@
+  * as in "2>&1", that represents duplicating a file descriptor.
+  * Return:
+  * REDIRFD_CLOSE if >&- "close fd" construct is seen,
+- * REDIRFD_SYNTAX_ERR if syntax error,
++ * REDIRFD_TO_WORD if & is followed by a word that is not a number,
+  * REDIRFD_TO_FILE if no & was seen,
+  * or the number found.
+  */
+@@ -4377,10 +4393,12 @@
+ 	}
+ 	if (ok) return d;
+ 
+-//TODO: this is the place to catch ">&file" bashism (redirect both fd 1 and 2)
+-
+-	bb_simple_error_msg("ambiguous redirect");
+-	return REDIRFD_SYNTAX_ERR;
++	/* ">&$fd", ">&${fd}", "<&$(cmd)": POSIX's "[n]>&word" takes any word,
++	 * expanded when the redirection is made: to a file descriptor's number,
++	 * or "-" to close it. autoconf's configure writes to the descriptor its
++	 * caller names (as_fn_error: printf ... >&$4), so a shell that refuses it
++	 * here cannot run a configure at all. The word is the next one parsed. */
++	return REDIRFD_TO_WORD;
+ }
+ 
+ /* Return code is 0 normal, 1 if a syntax error is detected
+@@ -4438,7 +4456,7 @@
+ 				redir_table[style].descrip);
+ 
+ 	redir->rd_dup = dup_num;
+-	if (style != REDIRECT_HEREDOC && dup_num != REDIRFD_TO_FILE) {
++	if (style != REDIRECT_HEREDOC && dup_num != REDIRFD_TO_FILE && dup_num != REDIRFD_TO_WORD) {
+ 		/* Erik had a check here that the file descriptor in question
+ 		 * is legit; I postpone that to "run time"
+ 		 * A "-" representation of "close me" shows up as a -3 here */
+@@ -4675,8 +4693,10 @@
+ 			return -1;
+ 		}
+ 		/* it is "word(..." or "word (..." */
++		/* A backslash-newline here joins lines, as anywhere outside
++		 * quotes: automake's "result_count () \<newline>{ \" */
+ 		do
+-			ch = i_getch(input);
++			ch = i_getch_and_eat_bkslash_nl(input);
+ 		while (ch == ' ' || ch == '\t');
+ 		if (ch != ')') {
+ 			syntax_error_unexpected_ch(ch);
+@@ -4684,7 +4704,7 @@
+ 		}
+ 		nommu_addchr(&ctx->as_string, ch);
+ 		do
+-			ch = i_getch(input);
++			ch = i_getch_and_eat_bkslash_nl(input);
+ 		while (ch == ' ' || ch == '\t' || ch == '\n');
+ 		if (ch != '{' && ch != '(') {
+ 			syntax_error_unexpected_ch(ch);
+@@ -4722,7 +4742,7 @@
+ 			command->cmd_type = CMD_SUBSHELL;
+ 	} else {
+ 		/* bash does not allow "{echo...", requires whitespace */
+-		ch = i_peek(input);
++		ch = i_peek_and_eat_bkslash_nl(input);
+ 		if (ch != ' ' && ch != '\t' && ch != '\n'
+ 		 && ch != '('	/* but "{(..." is allowed (without whitespace) */
+ 		) {
+@@ -6609,7 +6629,13 @@
+ static int append_str_maybe_ifs_split(o_string *output, int n,
+ 		int first_ch, const char *val)
+ {
+-	if (!(first_ch & 0x80)) { /* unquoted $VAR */
++	if (!(first_ch & 0x80) && (output->o_expflags & EXP_FLAG_PATTERN)) {
++		/* unquoted $VAR in a pattern: POSIX's "case x in $pat)", where
++		 * pat='/*' matches /a/b (configure scripts keep patterns in
++		 * variables). Not split, and its chars are pattern chars */
++		if (val && val[0])
++			o_addstr(output, val);
++	} else if (!(first_ch & 0x80)) { /* unquoted $VAR */
+ 		debug_printf_expand("unquoted '%s', output->o_escape:%d\n", val,
+ 				!!(output->o_expflags & EXP_FLAG_ESC_GLOB_CHARS));
+ 		if (val && val[0])
+@@ -6713,6 +6739,8 @@
+ 			val = cp = G.optstring_buf;
+ 			if (G.o_opt[OPT_O_ERREXIT])
+ 				*cp++ = 'e';
++			if (G.o_opt[OPT_O_NOUNSET])
++				*cp++ = 'u';
+ 			if (G_interactive_fd)
+ 				*cp++ = 'i';
+ 			if (G_x_mode)
+@@ -6733,6 +6761,18 @@
+ 		}
+ 	}
+ 
++	/* set -u: an unset parameter is an error where its value is used:
++	 * $var, ${var}, ${#var}, ${var%pat}, ${var:1}..., not where one
++	 * of "-=+?" says what to do without it. $@ and $* are exempt (an
++	 * empty list is not unset; bash 4+, dash and POSIX say so) */
++	if (!val && G.o_opt[OPT_O_NOUNSET]
++	 && (!exp_op || !strchr("-=+?", exp_op))
++	 && var[0] != '@' && var[0] != '*'
++	) {
++		/* mimic bash message */
++		msg_and_die_if_script("%s: unbound variable", var);
++	}
++
+ 	/* Handle any expansions */
+ 	if (exp_op == 'L') {
+ 		reinit_unicode_for_hush();
+@@ -6973,8 +7013,17 @@
+ 							/*handle_squotes:*/ !(arg0 & 0x80),
+ 							/*unbackslash:*/ 0
+ 					);
+-					if (to_be_freed)
++					if (to_be_freed) {
++						/* The word as the variable's value (and the
++						 * message's): without the backslashes that
++						 * protect its quoted glob chars, which
++						 * append_str_maybe_ifs_split below puts back as
++						 * the expansion's quoting wants. Kept, they went
++						 * into the variable: ": ${MV="mv -f"}" set MV to
++						 * 'mv \-f' (libtool's), "${A="x*y"}" A to 'x\*y' */
++						unbackslash(to_be_freed);
+ 						exp_word = to_be_freed;
++					}
+ 					if (exp_op == '?') {
+ 						/* mimic bash message */
+ 						msg_and_die_if_script("%s: %s",
+@@ -7059,6 +7108,9 @@
+ 		 * and quote bit, force the bit on if singleword expansion -
+ 		 * important for not getting v=$@ expand to many words. */
+ 		first_ch = arg[0] | (output->o_expflags & EXP_FLAG_SINGLEWORD);
++		/* A pattern's single word: unquoted expansions stay unquoted */
++		if ((output->o_expflags & EXP_FLAG_PATTERN) && (first_ch & 0x7f) != '@' && (first_ch & 0x7f) != '*')
++			first_ch = arg[0];
+ 
+ 		/* Is this variable quoted and thus expansion can't be null?
+ 		 * "$@" is special. Even if quoted, it can still
+@@ -8074,7 +8126,10 @@
+ 	int i;
+ 
+ #if ENABLE_HUSH_INTERACTIVE
+-	if (fd == G_interactive_fd)
++	/* (G_interactive_fd is 0 in a shell that is not interactive: fd#0 is
++	 * then not the shell's own, and "exec 5<&0 <file" — libtool's, reading
++	 * a .lo — must not fail with "fd#0 is not open") */
++	if (G_interactive_fd && fd == G_interactive_fd)
+ 		return 1;
+ #endif
+ 	/* If this one of script's fds? */
+@@ -8113,7 +8168,39 @@
+ 			continue;
+ 		}
+ 
+-		if (redir->rd_dup == REDIRFD_TO_FILE) {
++		if (redir->rd_dup == REDIRFD_TO_WORD) {
++			/* "rd_fd>&word", "rd_fd<&word": the word expanded now, to
++			 * a number (dup it) or "-" (close rd_fd); else, as bash
++			 * says, "word: ambiguous redirect" */
++			char *p, *q;
++
++			if (redir->rd_filename == NULL) {
++				syntax_error("invalid redirect");
++				return 1;
++			}
++			p = expand_string_to_string(redir->rd_filename,
++				EXP_FLAG_ESC_GLOB_CHARS, /*unbackslash:*/ 1);
++			newfd = -1;
++			if (strcmp(p, "-") == 0) {
++				newfd = REDIRFD_CLOSE;
++			} else if (p[0] && strlen(p) <= 9) {
++				newfd = 0;
++				for (q = p; *q; q++) {
++					if (!isdigit((unsigned char)*q)) {
++						newfd = -1;
++						break;
++					}
++					newfd = newfd * 10 + (*q - '0');
++				}
++			}
++			if (newfd == -1) {
++				/* the expanded word: the stored one has hush's own markers */
++				bb_error_msg("%s: ambiguous redirect", p[0] ? p : "''");
++				free(p);
++				return 1;
++			}
++			free(p);
++		} else if (redir->rd_dup == REDIRFD_TO_FILE) {
+ 			/* "rd_fd<*>file" case (<*> is <,>,>>,<>) */
+ 			char *p;
+ 			int mode;
+@@ -8444,7 +8531,7 @@
+ 		const struct function *funcp,
+ 		char **argv)
+ {
+-# if BB_MMU
++# if BB_MMU || HUSH_CLONED_CHILD
+ 	int n;
+ 
+ 	argv[0] = G.global_argv[0];
+@@ -8470,7 +8557,14 @@
+ 	enter_var_nest_level();
+ 	IF_HUSH_LOCAL(G.func_nest_level++;)
+ 
+-	/* On MMU, funcp->body is always non-NULL */
++#  if !BB_MMU
++	/* On MMU, funcp->body is always non-NULL; in a cloned child too, but
++	 * for a function a re-executed shell got as "-F name body" */
++	if (!funcp->body) {
++		parse_and_run_string(funcp->body_as_string);
++		_exit(G.last_exitcode);
++	}
++#  endif
+ 	n = run_list(funcp->body);
+ 	_exit(n);
+ # else
+@@ -8532,7 +8626,7 @@
+ #if BB_MMU
+ #define exec_builtin(to_free, x, argv) \
+ 	exec_builtin(x, argv)
+-#else
++#elif !HUSH_CLONED_CHILD
+ #define exec_builtin(to_free, x, argv) \
+ 	exec_builtin(to_free, argv)
+ #endif
+@@ -8543,7 +8637,7 @@
+ 		const struct built_in_command *x,
+ 		char **argv)
+ {
+-#if BB_MMU
++#if BB_MMU || HUSH_CLONED_CHILD
+ 	int rcode;
+ //?	close_saved_fds_and_FILE_fds();
+ 	rcode = x->b_function(argv);
+@@ -8868,7 +8962,7 @@
+ 		 * ... | ( list ) | ...
+ 		 * ... | { list } | ...
+ 		 */
+-#if BB_MMU
++#if BB_MMU || HUSH_CLONED_CHILD
+ 		int rcode;
+ 		debug_printf_exec("pseudo_exec: run_list\n");
+ 		reset_traps_to_defaults();
+@@ -10008,7 +10102,7 @@
+ 				char *pattern;
+ 				debug_printf_exec("expand_string_to_string('%s')\n", *argv);
+ 				pattern = expand_string_to_string(*argv,
+-						EXP_FLAG_ESC_GLOB_CHARS,
++						EXP_FLAG_ESC_GLOB_CHARS | EXP_FLAG_PATTERN,
+ 						/*unbackslash:*/ 0
+ 				);
+ 				/* TODO: which FNM_xxx flags to use? */
+@@ -10312,6 +10406,9 @@
+ 	case 'e':
+ 		G.o_opt[OPT_O_ERREXIT] = state;
+ 		break;
++	case 'u':
++		G.o_opt[OPT_O_NOUNSET] = state;
++		break;
+ 	case 'o':
+ 		if (!o_opt) {
+ 			/* "set -o" or "set +o" without parameter.
+@@ -10500,7 +10597,7 @@
+ 	flags = (argv[0] && argv[0][0] == '-') ? OPT_login : 0;
+ 	while (1) {
+ 		int opt = getopt(argc, argv, "+" /* stop at 1st non-option */
+-				"cexinsl"
++				"cexinslu"
+ #if !BB_MMU
+ 				"$:R:V:"
+ # if ENABLE_HUSH_LINENO_VAR
+@@ -10624,6 +10721,7 @@
+ 		/*case 'n':*/
+ 		/*case 'x':*/
+ 		/*case 'e':*/
++		/*case 'u':*/
+ 		default:
+ 			if (set_mode(1, opt, NULL) == 0) /* no error */
+ 				break;
+@@ -10938,6 +11036,21 @@
+ 		if (x->b_descr)
+ 			printf("%-10s%s\n", x->b_cmd, x->b_descr);
+ 	}
++	/* collaboCore: what this hush has that busybox's has not, and what it
++	 * still has not of bash, which scripts written for bash need */
++	printf(
++		"\n"
++		"This /bin/sh is busybox's hush. For POSIX scripts (autoconf's configure,\n"
++		"libtool) collaboCore added:\n"
++		"  [n]>&WORD [n]<&WORD  WORD expanded when run: a number, or - (>&$fd)\n"
++		"  exec 5<&0            fd 0 duplicated in a shell that is not interactive\n"
++		"  case W in $PAT)      an unquoted expansion in a pattern is a pattern\n"
++		"  ${VAR=\"WORD\"}        a quoted WORD assigned as it reads (\"mv -f\")\n"
++		"  set -u, -o nounset   an unset variable's expansion is an error\n"
++		"  f () \\<newline>{     backslash-newline in a function definition\n"
++		"It is not bash: no arrays, declare, let, ((...)), <<<, <(...), select,\n"
++		"coproc, function NAME {...}, trap ERR, printf -v, read -a.\n"
++	);
+ 	return EXIT_SUCCESS;
+ }
+ #endif

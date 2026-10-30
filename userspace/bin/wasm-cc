@@ -73,7 +73,10 @@ fi
 # them in the withdrawn "phase 3" encoding (`try`/`catch`). Browsers and V8 accept both, but
 # the native engine's compiler (wasmtime/cranelift) only implements the standard one, so
 # rewrite the linked program to `try_table`/`exnref`. Programs without setjmp pass unchanged.
+# Then executable, as a linker leaves a program on Linux (wasm-ld does not; nor does wasm-opt,
+# which writes a new file): a program in a build tree, CMake's tests, could not be run otherwise.
 out=a.out
 for ((i = 1; i <= $#; i++)); do [[ "${!i}" == -o ]] && { j=$((i + 1)); out="${!j}"; }; done
 [[ -f "$out" ]] || exit 0
-"$U/../.tools/binaryen/bin/wasm-opt" -all --translate-to-exnref "$out" -o "$out.exnref" && mv "$out.exnref" "$out"
+"$U/../.tools/binaryen/bin/wasm-opt" -all --translate-to-exnref "$out" -o "$out.exnref" \
+  && mv "$out.exnref" "$out" && chmod +x "$out"

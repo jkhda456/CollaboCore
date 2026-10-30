@@ -1,0 +1,20 @@
+diff --git a/src/env/wasm32/__main_argc_argv.c b/src/env/wasm32/__main_argc_argv.c
+index 7967b8c..6444362 100644
+--- a/src/env/wasm32/__main_argc_argv.c
++++ b/src/env/wasm32/__main_argc_argv.c
+@@ -7,3 +7,15 @@ weak int __main_argc_argv(int argc, char **argv)
+ {
+ 	return __main_argc_argv_envp(argc, argv, __wasm_process_args->envp);
+ }
++
++/* A main with three parameters, main(argc, argv, envp): tombl's clang names it
++ * __main_argc_argv_envp, which this calls; upstream clang (clang-19 on the host, the llvm
++ * add-on's in the guest) keeps it `main`, a function of three parameters, and names only a
++ * two-parameter main (__main_argc_argv, which then replaces the weak one above, so that this is
++ * not linked). Not in libc.exports (the build leaves the __main_ stubs out). */
++int main(int, char **, char **);
++
++weak int __main_argc_argv_envp(int argc, char **argv, char **envp)
++{
++	return main(argc, argv, envp);
++}

@@ -1,0 +1,132 @@
+diff --git a/editors/diff.c b/editors/diff.c
+index 1adc4cb..f09858c 100644
+--- a/editors/diff.c
++++ b/editors/diff.c
+@@ -100,13 +100,15 @@
+ //kbuild:lib-$(CONFIG_DIFF) += diff.o
+ 
+ //usage:#define diff_trivial_usage
+-//usage:       "[-abBdiNqrTstw] [-L LABEL] [-S FILE] [-U LINES] FILE1 FILE2"
++//usage:       "[-abBcdiNqrTstw] [-C LINES] [-L LABEL] [-S FILE] [-U LINES] FILE1 FILE2"
+ //usage:#define diff_full_usage "\n\n"
+ //usage:       "Compare files line by line and output the differences between them.\n"
+-//usage:       "This implementation supports unified diffs only.\n"
++//usage:       "This implementation supports unified and context diffs.\n"
+ //usage:     "\n	-a	Treat all files as text"
+ //usage:     "\n	-b	Ignore changes in the amount of whitespace"
+ //usage:     "\n	-B	Ignore changes whose lines are all blank"
++//usage:     "\n	-c	Context diff (3 lines of context)"
++//usage:     "\n	-C	Context diff with LINES lines of context"
+ //usage:     "\n	-d	Try hard to find a smaller set of changes"
+ //usage:     "\n	-i	Ignore case differences"
+ //usage:     "\n	-L	Use LABEL instead of the filename in the unified header"
+@@ -154,6 +156,8 @@ enum {                  /* Commandline flags */
+ 	FLAG_p,         /* not implemented */
+ 	FLAG_B,
+ 	FLAG_E,         /* not implemented */
++	FLAG_c,         /* the context format, not the unified one */
++	FLAG_C,         /* -c with LINES of context (opt_U_context) */
+ };
+ #define FLAG(x) (1 << FLAG_##x)
+ 
+@@ -414,6 +418,8 @@ static void fetch(FILE_and_pos_t *ft, const off_t *ix, int a, int b, int ch)
+ 	for (i = a; i <= b; i++) {
+ 		seek_ft(ft, ix[i - 1]);
+ 		putchar(ch);
++		if (option_mask32 & (FLAG(c) | FLAG(C)))
++			putchar(' ');   /* the context format's "  ", "- ", "+ ", "! " */
+ 		if (option_mask32 & FLAG(T))
+ 			putchar('\t');
+ 		for (j = 0, col = 0; j < ix[i] - ix[i - 1]; j++) {
+@@ -593,12 +599,55 @@ start:
+ 	return J;
+ }
+ 
++typedef struct { int a, b; } vec_t[2];
++
++/* A range of the context format's hunk header: "a,b", or the last line alone ("b") when the
++ * range has one line or none, as GNU diff prints it */
++static void print_context_range(const char *mark, int a, int b, const char *end)
++{
++	if (b <= a)
++		printf("%s %d %s\n", mark, b, end);
++	else
++		printf("%s %d,%d %s\n", mark, a, b, end);
++}
++
++/* One hunk in the context format (-c, -C): the changes vec[0..idx] with their context, the
++ * old file's lines ("- " deleted, "! " changed) and then the new file's ("+ " added, "! "
++ * changed); a side none of the changes has lines on is its header alone. */
++static void print_context_hunk(FILE_and_pos_t ft[2], off_t *ix[2], const int nlen[2],
++		vec_t *vec, int idx)
++{
++	int j, k, low;
++	int span_a[2], span_b[2];
++
++	puts("***************");
++	for (j = 0; j < 2; j++) {
++		span_a[j] = MAX(1, vec[0][j].a - opt_U_context);
++		span_b[j] = MIN(nlen[j], vec[idx][j].b + opt_U_context);
++	}
++	for (j = 0; j < 2; j++) {
++		bool lines = false;
++		print_context_range(j ? "---" : "***", span_a[j], span_b[j], j ? "----" : "****");
++		for (k = 0; k <= idx; k++)
++			lines |= vec[k][j].a <= vec[k][j].b;
++		if (!lines)
++			continue;
++		low = span_a[j];
++		for (k = 0; k <= idx; k++) {
++			bool both = vec[k][0].a <= vec[k][0].b && vec[k][1].a <= vec[k][1].b;
++			fetch(&ft[j], ix[j], low, vec[k][j].a - 1, ' ');
++			fetch(&ft[j], ix[j], vec[k][j].a, vec[k][j].b, both ? '!' : j ? '+' : '-');
++			low = vec[k][j].b + 1;
++		}
++		fetch(&ft[j], ix[j], low, span_b[j], ' ');
++	}
++}
++
+ static bool diff(FILE* fp[2], char *file[2])
+ {
+ 	int nlen[2];
+ 	off_t *ix[2];
+ 	FILE_and_pos_t ft[2];
+-	typedef struct { int a, b; } vec_t[2];
+ 	vec_t *vec = NULL;
+ 	int i = 1, j, k, idx = -1;
+ 	bool anychange = false;
+@@ -662,6 +711,14 @@ static bool diff(FILE* fp[2], char *file[2])
+ 			int lowa;
+ 			vec_t span, *cvp = vec;
+ 
++			if (option_mask32 & (FLAG(c) | FLAG(C))) {
++				if (!anychange) {
++					printf("*** %s\n", label[0] ? label[0] : file[0]);
++					printf("--- %s\n", label[1] ? label[1] : file[1]);
++				}
++				print_context_hunk(ft, ix, nlen, vec, idx);
++				goto printed;
++			}
+ 			if (!anychange) {
+ 				/* Print the context/unidiff header first time through */
+ 				printf("--- %s\n", label[0] ? label[0] : file[0]);
+@@ -692,6 +749,7 @@ static bool diff(FILE* fp[2], char *file[2])
+ 					fetch(&ft[j], ix[j], (*cvp)[j].a, (*cvp)[j].b, j ? '+' : '-');
+ 			}
+ 		}
++ printed:
+ 		anychange = true;
+  cont:
+ 		idx = -1;
+@@ -982,9 +1040,9 @@ int diff_main(int argc UNUSED_PARAM, char **argv)
+ 	INIT_G();
+ 
+ 	/* exactly 2 params; collect multiple -L <label>; -U N */
+-	GETOPT32(argv, "^" "abdiL:*NqrsS:tTU:+wupBE" "\0" "=2"
++	GETOPT32(argv, "^" "abdiL:*NqrsS:tTU:+wupBEcC:+" "\0" "=2"
+ 			LONGOPTS,
+-			&L_arg, &s_start, &opt_U_context);
++			&L_arg, &s_start, &opt_U_context, &opt_U_context);
+ 	argv += optind;
+ 	while (L_arg)
+ 		label[!!label[0]] = llist_pop(&L_arg);

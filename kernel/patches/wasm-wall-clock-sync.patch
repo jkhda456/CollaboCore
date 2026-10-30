@@ -1,0 +1,26 @@
+diff --git a/arch/wasm/kernel/time.c b/arch/wasm/kernel/time.c
+index 151b78b42319..df887074fe12 100644
+--- a/arch/wasm/kernel/time.c
++++ b/arch/wasm/kernel/time.c
+@@ -68,6 +68,21 @@ void read_persistent_clock64(struct timespec64 *ts)
+ 	*ts = ns_to_timespec64(wasm_kernel_get_now_nsec());
+ }
+ 
++/*
++ * The wall clock again from the host's, once the "wasm" clocksource has taken over: from
++ * timekeeping_init (read_persistent_clock64) to the switch at fs_initcall the kernel counts
++ * with jiffies, 10 ms a tick at HZ=100, and what that loses stays in CLOCK_REALTIME: the
++ * guest's clock ran some milliseconds behind the host's, so a file just written to a shared
++ * folder (whose times are the host's) was "in the future" for make.
++ */
++static int __init wasm_sync_wall_clock(void)
++{
++	struct timespec64 now = ns_to_timespec64(wasm_kernel_get_now_nsec());
++
++	return do_settimeofday64(&now);
++}
++late_initcall(wasm_sync_wall_clock);
++
+ static DEFINE_PER_CPU(struct clock_event_device, clockevent);
+ 
+ static irqreturn_t timer_interrupt(int irq, void *dev)

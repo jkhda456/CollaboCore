@@ -65,6 +65,8 @@ const SETATTR_SIZE: u32 = 1 << 3;
 const SETATTR_ATIME: u32 = 1 << 4;
 const SETATTR_MTIME: u32 = 1 << 5;
 const SETATTR_FH: u32 = 1 << 6;
+const SETATTR_ATIME_NOW: u32 = 1 << 7;
+const SETATTR_MTIME_NOW: u32 = 1 << 8;
 
 pub(crate) const S_IFMT: u32 = 0o170000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
@@ -315,6 +317,9 @@ struct HandleRecord {
     node: u64,
     directory: bool,
     file: Option<File>,
+    /// A directory's listing as its first READDIR read it (names and paths, "." and ".." first),
+    /// which the later ones continue: see OP_READDIR.
+    listing: Option<Vec<(String, PathBuf)>>,
 }
 
 /// A host folder shared with the guest.
@@ -422,7 +427,7 @@ impl FsDevice {
     fn add_handle(&mut self, node: u64, directory: bool, file: Option<File>) -> u64 {
         let fh = self.next_handle;
         self.next_handle += 1;
-        self.handles.insert(fh, HandleRecord { node, directory, file });
+        self.handles.insert(fh, HandleRecord { node, directory, file, listing: None });
         if let Some(record) = self.nodes.get_mut(&node) {
             record.handles += 1;
         }
@@ -545,14 +550,16 @@ impl FsDevice {
                 let fh = body.u64()?;
                 let size = body.u64()?;
                 body.skip(8)?; // lock_owner
-                let atime = (body.u64()?, 0);
-                let mtime = (body.u64()?, 0);
+                let atime_sec = body.u64()?;
+                let mtime_sec = body.u64()?;
                 body.skip(8)?; // ctime
-                body.skip(12)?; // the *nsec fields
+                let atime_nsec = body.u32()?;
+                let mtime_nsec = body.u32()?;
+                body.skip(4)?; // ctimensec
                 let mode = body.u32()?;
                 let path = self.path(nodeid)?;
 
-                if valid & (SETATTR_SIZE | SETATTR_MODE) != 0 {
+                if valid & (SETATTR_SIZE | SETATTR_MODE | SETATTR_ATIME | SETATTR_MTIME) != 0 {
                     self.writable()?;
                 }
                 if valid & SETATTR_SIZE != 0 {
@@ -569,9 +576,20 @@ impl FsDevice {
                 }
                 #[cfg(not(unix))]
                 let _ = mode;
-                // Times: the guest sets them, the host keeps what it can (mtime only).
-                if valid & (SETATTR_ATIME | SETATTR_MTIME) != 0 && !self.share.read_only {
-                    let _ = (atime, mtime);
+                // Times (utimensat, touch, cp -p, tar): the ones given, or the host's now (the
+                // guest's UTIME_NOW, as the files' other times are the host's), on the file itself
+                // rather than a symlink's target.
+                if valid & (SETATTR_ATIME | SETATTR_MTIME) != 0 {
+                    let time = |set: u32, now: u32, sec: u64, nsec: u32| match (valid & set != 0, valid & now != 0) {
+                        (false, _) => SetTime::Omit,
+                        (true, true) => SetTime::Now,
+                        (true, false) => SetTime::At(sec, nsec),
+                    };
+                    set_times(
+                        &path,
+                        time(SETATTR_ATIME, SETATTR_ATIME_NOW, atime_sec, atime_nsec),
+                        time(SETATTR_MTIME, SETATTR_MTIME_NOW, mtime_sec, mtime_nsec),
+                    )?;
                 }
                 let metadata = std::fs::symlink_metadata(&path)?;
                 out.u64(VALIDITY).u32(0).u32(0);
@@ -729,21 +747,43 @@ impl FsDevice {
                 let path = self.path(node)?;
                 let limit = size.min(room);
 
-                // The guest resumes by index, so the listing is rebuilt each time: "." and
-                // ".." first, then the directory in whatever order the host gives.
+                // The guest resumes by index, into the listing this handle's first READDIR read
+                // ("." and ".." first, then the directory in whatever order the host gives),
+                // which it keeps: a listing read again would shift under entries removed in
+                // between, as `rm -rf` removes them while it reads, and skip some (it then
+                // found the directory not empty). Offset 0 (a rewinddir) reads it anew.
                 let parent = self.node(node)?.parent;
-                let mut entries: Vec<(String, u64, PathBuf)> = vec![
-                    (".".into(), node, path.clone()),
-                    ("..".into(), parent, self.path(parent)?),
-                ];
-                for entry in std::fs::read_dir(&path)? {
-                    let entry = entry?;
-                    let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
-                    if validate_name(&name).is_err() {
-                        continue;
+                let cached = match self.handles.get(&fh) {
+                    Some(HandleRecord { listing: Some(listing), .. }) if offset > 0 => Some(listing.clone()),
+                    _ => None,
+                };
+                let listing = match cached {
+                    Some(listing) => listing,
+                    None => {
+                        let mut listing: Vec<(String, PathBuf)> =
+                            vec![(".".into(), path.clone()), ("..".into(), self.path(parent)?)];
+                        for entry in std::fs::read_dir(&path)? {
+                            let entry = entry?;
+                            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+                            if validate_name(&name).is_err() {
+                                continue;
+                            }
+                            listing.push((name, entry.path()));
+                        }
+                        if let Some(record) = self.handles.get_mut(&fh) {
+                            record.listing = Some(listing.clone());
+                        }
+                        listing
                     }
-                    let child = entry.path();
-                    let id = self.intern(child.clone(), node);
+                };
+                let mut entries: Vec<(String, u64, PathBuf)> = Vec::with_capacity(listing.len());
+                for (index, (name, child)) in listing.into_iter().enumerate() {
+                    let id = match index {
+                        0 => node,
+                        1 => parent,
+                        _ if index < offset => 0, // given already: keeps its place, not interned
+                        _ => self.intern(child.clone(), node),
+                    };
                     entries.push((name, id, child));
                 }
 
@@ -868,6 +908,57 @@ fn sync(file: &std::fs::File, data_only: bool) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         result => result,
     }
+}
+
+/// A time SETATTR sets: left as it is, the host's now, or the one given (seconds, nanoseconds
+/// since the epoch).
+#[derive(Clone, Copy)]
+enum SetTime {
+    Omit,
+    Now,
+    At(u64, u32),
+}
+
+#[cfg(unix)]
+fn set_times(path: &Path, atime: SetTime, mtime: SetTime) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let spec = |time: SetTime| match time {
+        SetTime::Omit => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ },
+        SetTime::Now => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW as _ },
+        SetTime::At(sec, nsec) => libc::timespec { tv_sec: sec as _, tv_nsec: nsec as _ },
+    };
+    let times = [spec(atime), spec(mtime)];
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: a NUL-terminated path and two timespecs, which utimensat only reads.
+    match unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(windows)]
+fn set_times(path: &Path, atime: SetTime, mtime: SetTime) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES};
+    let at = |time: SetTime| match time {
+        SetTime::Omit => None,
+        SetTime::Now => Some(SystemTime::now()),
+        SetTime::At(sec, nsec) => Some(UNIX_EPOCH + std::time::Duration::new(sec, nsec)),
+    };
+    let mut times = std::fs::FileTimes::new();
+    if let Some(time) = at(atime) {
+        times = times.set_accessed(time);
+    }
+    if let Some(time) = at(mtime) {
+        times = times.set_modified(time);
+    }
+    // FILE_WRITE_ATTRIBUTES is all SetFileTime needs (a read-only file too); backup semantics
+    // open a directory, the reparse point flag the link itself
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    file.set_times(times)
 }
 
 #[cfg(unix)]

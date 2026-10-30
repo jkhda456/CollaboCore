@@ -18,14 +18,20 @@ find "$LIB" -name '*.pyc' -delete
 # Sandbox-specific modules (the client for the host request bridge) sit next to the stdlib.
 cp "$P"/lib/*.py "$LIB/"
 
-# The sysconfig snapshot records the build tree (Makefile variables, dependency lists). The guest
-# has no compiler, so none of those paths mean anything there: map them to neutral ones, so the
-# archive does not carry the layout of the machine it was built on.
+# The sysconfig snapshot records the build tree (Makefile variables, dependency lists). None of
+# those paths mean anything in the guest: map them to neutral ones, so the archive does not carry
+# the layout of the machine it was built on. The compilers are the guest's `cc` and `c++` (the
+# llvm add-on's): the build had no C++ compiler, which left CXX empty and LDCXXSHARED without
+# one, so setuptools could not compile or link a C++ extension module. The interpreter's own
+# libraries (python/deps: MODULE_*_CFLAGS, LIBS) are where a guest would keep them, /usr.
 for f in "$LIB"/_sysconfigdata_*.py; do
   sed -i -e "s#$HOSTPY#/usr/bin/python3#g" \
          -e "s#$BUILD_ROOT/userspace/bin/wasm-cc#cc#g" \
+         -e "s#^\( *'CXX': \)''#\1'c++'#" \
+         -e "s#^\( *'LDCXXSHARED': '\)-shared#\1c++ -shared#" \
          -e "s#llvm-\(ar\|ranlib\|readelf\)-19#\1#g" \
          -e "s# *-[IL]$P/zlib[^ '\"]*##g" \
+         -e "s#$P/deps#/usr#g" \
          -e "s#${PY_SRC:-$P/src/Python-3.13.14}#/usr/src/python#g" \
          -e "s#$P/build-wasm#/usr/src/python/build#g" \
          -e "s#$P/host/bin/python3.13#/usr/bin/python3#g" "$f"

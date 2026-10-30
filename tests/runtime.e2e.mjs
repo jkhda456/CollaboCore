@@ -5,7 +5,7 @@
 // Linux, macOS and Windows. COLLABO_CORE_RUNTIME may point at the runtime folder (or its parent).
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir, platform, arch, userInfo, networkInterfaces } from "node:os";
@@ -261,6 +261,13 @@ describe("exec", () => {
     const r = await c.call("exec", { argv: ["cat"], stdinBase64: bytes.toString("base64") });
     assert.ok(Buffer.from(r.stdoutBase64, "base64").equals(bytes));
   });
+  test("a command starts with SIGPIPE at its default (the agent ignores it): yes | head ends", async () => {
+    const r = await c.sh("sed -n 's/^SigIgn:[[:space:]]*//p' /proc/self/status; yes 123456789 | head -3000 | wc -l", { timeoutMs: 30_000 });
+    assert.equal(r.timedOut, false, "an ignored SIGPIPE leaves busybox's yes writing for ever");
+    const [sigign, lines] = r.stdout.trim().split("\n");
+    assert.equal(BigInt("0x" + sigign) & (1n << 12n), 0n, `SIGPIPE (13) not ignored: SigIgn ${sigign}`);
+    assert.equal(lines.trim(), "3000");
+  });
   test("a missing program is an error, not a hang", async () => {
     await assert.rejects(c.call("exec", { argv: ["no-such-program"] }), /cannot run no-such-program/);
   });
@@ -332,6 +339,27 @@ describe("files and local disk", () => {
     assert.notEqual(r.exitCode, 0);
     assert.match(r.stderr, /Read-only file system/);
     assert.equal(existsSync(join(docs, "new.txt")), false);
+  });
+  test("times the guest sets on a mounted folder reach the host (utime to the nanosecond, touch, cp -p); not on a read-only one", async () => {
+    // multiples of 100 ns: what NTFS keeps
+    const r = await c.sh("cd /work && echo t > times.txt && echo c > copy.txt && python3 -c \"import os\nfor f in ('times.txt', 'copy.txt'): os.utime(f, ns=(1500000000987654300, 1600000000123456700))\ns = os.stat('times.txt'); print(s.st_atime_ns, s.st_mtime_ns)\" && cp -p copy.txt times-copy.txt && echo n > now.txt && sleep 1 && touch -d '2001-02-03 04:05:06' now.txt && touch now.txt");
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(r.stdout, "1500000000987654300 1600000000123456700\n");   // as the guest sees them
+    const times = statSync(join(work, "times.txt"), { bigint: true });
+    assert.equal(times.mtimeNs, 1600000000123456700n);
+    assert.equal(times.atimeNs, 1500000000987654300n);
+    // busybox cp -p keeps the seconds (it sets them with utimes, to the microsecond)
+    assert.equal(statSync(join(work, "times-copy.txt"), { bigint: true }).mtimeNs / 1000000000n, 1600000000n);
+    // touch: the host's now, after the explicit time
+    assert.ok(Math.abs(statSync(join(work, "now.txt")).mtimeMs - Date.now()) < 60000, `now.txt: ${r.stdout}`);
+    const ro = await c.sh("touch /docs/readme.md");
+    assert.notEqual(ro.exitCode, 0);
+    assert.match(ro.stderr, /Read-only file system/);
+  });
+  test("a large directory on a mounted folder: listed whole, removed by rm -rf (it reads while it removes)", async () => {
+    const r = await c.sh("cd /work && mkdir -p big/sub && i=0; while [ $i -lt 600 ]; do : > big/f$i; : > big/sub/g$i; i=$((i+1)); done; ls big | wc -l; ls -a big/sub | wc -l; rm -rf big; echo \"rm $?\"");
+    assert.equal(r.stdout, "601\n602\nrm 0\n", r.stderr);
+    assert.equal(existsSync(join(work, "big")), false);
   });
   test("python works on the mounted folder", async () => {
     const r = await c.sh("cd /work && python3 -c \"import pathlib; p = pathlib.Path('py.txt'); p.write_text('héllo'); print(sorted(x.name for x in pathlib.Path('.').iterdir()))\"");

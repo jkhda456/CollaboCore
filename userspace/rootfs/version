@@ -39,6 +39,7 @@ done
 info="collaboCore ${v:-(unknown: an engine older than collabo.version)}
 kernel      $(uname -sr) ($(uname -m))
 busybox     $(busybox 2>&1 | sed -n '1s/^BusyBox \(v[^ ]*\).*/\1/p')
+shell       /bin/sh: busybox hush, with what configure needs (help)
 add-ons    ${addons:- none}"
 
 # logo: the image and the word, by userspace/logo.py from CollaboCore32.bmp (run it again,

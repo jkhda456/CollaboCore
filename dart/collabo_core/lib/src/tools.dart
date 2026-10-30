@@ -980,3 +980,193 @@ class TermTools {
     return 'Error (exit ${r.exitCode}): ${out.replaceFirst('c-sh: ', '')}';
   }
 }
+
+/// Tools for verified command-line cheat sheets, with the guided-arrow add-on
+/// (`addons: {'guided-arrow': {}}`, bundled with the runtime): tldr pages and the sheets cheat.sh
+/// serves, offline, from reviewed upstream repositories at a pinned commit — examples to trust
+/// rather than to find with a web search. `cheat_lookup` shows a command's pages (only the
+/// examples that mention some words, if given), `cheat_search` finds examples by task across every
+/// sheet, `cheat_info` says where a page came from (upstream URL at the commit, license).
+///
+/// ```dart
+/// final cheat = CheatTools(sandbox);
+/// // request body: {"tools": [...cheat.definitions, ...]}
+/// // for each tool_use block whose name cheat.handles(name):
+/// final text = await cheat.call(block['name'], block['input']);  // tool_result content
+/// ```
+///
+/// Commands come back as the sheets write them: in tldr's, `{{...}}` marks a value to fill in.
+/// The pages are English (the add-on's archive carries tldr's English pages only).
+///
+/// With [allowEdits] the model also gets `cheat_add` and `cheat_remove`, to keep examples it
+/// found to work as sheets of its own: shown marked `[local]`, before the verified ones. They
+/// are files in the add-on's `sheets` folder; to keep them past the sandbox, mount a folder and
+/// name it there:
+///
+/// ```dart
+/// mounts: [Mount(hostPath: 'cheat-sheets', guestPath: '/sheets')],
+/// addons: {'guided-arrow': {'sheets': '/sheets'}},
+/// ```
+///
+/// Without that they are in the sandbox's home, gone when it stops (`cheat_add` says so).
+class CheatTools {
+  CheatTools(this.sandbox, {this.allowEdits = false, this.maxOutputChars = 20000});
+
+  final CollaboCore sandbox;
+
+  /// Offer `cheat_add` and `cheat_remove` too.
+  final bool allowEdits;
+
+  /// Longer output is cut at the end (pages are in order of relevance).
+  final int maxOutputChars;
+
+  static const _names = {'cheat_lookup', 'cheat_search', 'cheat_info'};
+  static const _editNames = {'cheat_add', 'cheat_remove'};
+
+  bool handles(String name) => _names.contains(name) || (allowEdits && _editNames.contains(name));
+
+  static const _common = {
+    'platform': {
+      'type': 'string',
+      'description': 'tldr platform looked in first: linux (the default), osx, windows, freebsd, ... (then common).',
+    },
+    'source': {
+      'type': 'string',
+      'enum': ['tldr', 'cheat.sheets', 'cheatsheets', 'local'],
+      'description': 'Only this source (default: all of them; local: the sheets added with cheat_add, shown first).',
+    },
+  };
+
+  List<Map<String, Object?>> get definitions => [
+        {
+          'name': 'cheat_lookup',
+          'description': 'Show verified cheat sheets for a command-line tool: its tldr page and cheat.sh\'s sheets '
+              '(each headed "=== NAME [SOURCE: PLATFORM] ==="; descriptions are # comments, commands plain lines). '
+              'With "words", only the examples that mention them. "git commit" finds git-commit; "python/lambda" is a '
+              'programming language sheet ("python/" lists them). An unknown name returns the closest names and '
+              'the best matching examples instead.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': {'type': 'string', 'description': 'The command, e.g. "tar", "git commit", "python/lambda".'},
+              'words': {'type': 'string', 'description': 'Only examples mentioning these words, e.g. "extract gz".'},
+              ..._common,
+            },
+            'required': ['name'],
+          },
+        },
+        {
+          'name': 'cheat_search',
+          'description': 'Find the best verified command examples for a task across every cheat sheet (tldr, '
+              'cheat.sh\'s), e.g. "find files modified in the last day", "convert video to gif". Returns the '
+              'examples grouped by page, best first; look a command up with cheat_lookup for all of its page.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'query': {'type': 'string', 'description': 'What to do, in words.'},
+              'limit': {'type': 'integer', 'description': 'How many examples (default 10).'},
+              ..._common,
+            },
+            'required': ['query'],
+          },
+        },
+        {
+          'name': 'cheat_info',
+          'description': 'Where a cheat sheet came from, to cite or check it: for each of the command\'s pages its '
+              'upstream repository, path, commit, URL at that commit, license and git blob id. Without a name: the '
+              'sources, their commits and licenses, and the archive\'s size.',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'name': {'type': 'string', 'description': 'The command (optional).'},
+            },
+          },
+        },
+        if (allowEdits) ...[
+          {
+            'name': 'cheat_add',
+            'description': 'Keep a command example that worked as a cheat sheet of your own: from then on it is shown '
+                '(marked [local]) before the verified sheets whenever that command is looked up, and found by '
+                'cheat_search. Add only what you have run and checked, one example per call; the same command '
+                'twice is kept once.',
+            'input_schema': {
+              'type': 'object',
+              'properties': {
+                'name': {'type': 'string', 'description': 'The sheet: the command, e.g. "kubectl-secret", "az keyvault", "tar".'},
+                'description': {'type': 'string', 'description': 'What the example does, e.g. "Read a secret\'s value:".'},
+                'command': {'type': 'string', 'description': 'The command line(s), with {{...}} around values to fill in.'},
+              },
+              'required': ['name', 'description', 'command'],
+            },
+          },
+          {
+            'name': 'cheat_remove',
+            'description': 'Remove a cheat sheet of your own (added with cheat_add), or with "words" only its examples '
+                'that mention them all (a wrong or outdated one). The verified sheets cannot be removed.',
+            'input_schema': {
+              'type': 'object',
+              'properties': {
+                'name': {'type': 'string', 'description': 'The sheet, as given to cheat_add.'},
+                'words': {'type': 'string', 'description': 'Only the examples mentioning these words (optional).'},
+              },
+              'required': ['name'],
+            },
+          },
+        ],
+      ];
+
+  /// Runs one tool call and returns the text for the tool_result block. Failures come back as
+  /// text starting with "Error:"; a name or task that matched nothing says so, with what came
+  /// closest.
+  Future<String> call(String name, Map<String, Object?> input) async {
+    try {
+      final opts = <String>[
+        if (input['platform'] case final String p when p.isNotEmpty) ...['--platform', p],
+        if (input['source'] case final String s when s.isNotEmpty) ...['--from', s],
+      ];
+      List<String> words(String? text) => (text ?? '').split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
+      switch (name) {
+        case 'cheat_lookup':
+          final topic = words(input['name'] as String?);
+          if (topic.isEmpty) throw _GuiError('cheat_lookup needs a name');
+          return await _run([...opts, '--', ...topic, ...words(input['words'] as String?)]);
+        case 'cheat_search':
+          final query = words(input['query'] as String?);
+          if (query.isEmpty) throw _GuiError('cheat_search needs a query');
+          final limit = input['limit'] as int?;
+          return await _run([...opts, '-n', '${limit ?? 10}', '-s', '--', ...query]);
+        case 'cheat_info':
+          return await _run([...opts, '--info', '--', ...words(input['name'] as String?)]);
+        case 'cheat_add' when allowEdits:
+          final fields = [for (final k in ['name', 'description', 'command']) ((input[k] as String?) ?? '').trim()];
+          if (fields.any((f) => f.isEmpty)) throw _GuiError('cheat_add needs a name, a description and a command');
+          return await _run(['--add', '--', ...fields]);
+        case 'cheat_remove' when allowEdits:
+          final sheet = ((input['name'] as String?) ?? '').trim();
+          if (sheet.isEmpty) throw _GuiError('cheat_remove needs a name');
+          return await _run(['--remove', '--', sheet, ...words(input['words'] as String?)]);
+        default:
+          return 'Error: unknown tool "$name"';
+      }
+    } on _GuiError catch (e) {
+      return 'Error: ${e.message}';
+    } catch (e) {
+      return 'Error: $e';
+    }
+  }
+
+  Future<String> _run(List<String> args) async {
+    final r = await sandbox.exec(['guided-arrow', '--color', 'never', ...args], timeout: const Duration(minutes: 2));
+    final out = r.stdoutText.trimRight();
+    final note = r.stderrText.trim().replaceAll('guided-arrow: ', '');
+    if (r.ok) return _cut(note.isEmpty ? out : '$note\n\n$out');
+    // 1: nothing by that name or for those words; what came closest follows.
+    if (r.exitCode == 1) return _cut('Not found: $note${out.isEmpty ? '' : '\n\n$out'}');
+    return 'Error (exit ${r.exitCode}): ${note.isEmpty ? out : note}';
+  }
+
+  String _cut(String text) {
+    if (text.length <= maxOutputChars) return text;
+    return '${text.substring(0, maxOutputChars)}\n… [${text.length - maxOutputChars} more characters]';
+  }
+}

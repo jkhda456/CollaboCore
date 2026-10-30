@@ -281,6 +281,87 @@ void main() {
     });
   });
 
+  // The guided-arrow add-on is bundled; without it in the runtime's app/images/addons these are
+  // skipped.
+  group('cheat tools', () {
+    final hasGa = File('${CollaboRuntime.locate().directory}/app/images/addons/guided-arrow.cpio').existsSync();
+    late CollaboCore cs;
+    late CheatTools cheat;
+    setUpAll(() async {
+      if (!hasGa) return;
+      cs = await CollaboCore.start(CollaboConfig(
+          cpus: 2, quiet: true, python: false, networkEnabled: false, addons: const {'guided-arrow': {}}));
+      cheat = CheatTools(cs);
+    });
+    tearDownAll(() async {
+      if (hasGa) await cs.stop();
+    });
+
+    test('definitions are Anthropic tool schemas', () {
+      final t = CheatTools(sandbox);
+      expect(t.definitions.map((d) => d['name']), containsAll(['cheat_lookup', 'cheat_search', 'cheat_info']));
+      for (final d in t.definitions) {
+        expect(d['input_schema'], isA<Map>());
+        expect(t.handles(d['name'] as String), isTrue);
+      }
+    });
+
+    test('lookup, only some examples, a platform, search, provenance, a name that is not there', () async {
+      if (!hasGa) {
+        markTestSkipped('no guided-arrow add-on in the runtime');
+        return;
+      }
+      final tar = await cheat.call('cheat_lookup', {'name': 'tar'});
+      expect(tar, contains('=== tar [tldr: common] ==='));
+      expect(tar, contains('tar xvf {{path/to/source.tar.ext}}'));
+      expect(tar, contains('=== tar [cheat.sheets] ==='));
+      final gz = await cheat.call('cheat_lookup', {'name': 'tar', 'words': 'extract gz'});
+      expect(gz, contains('tar -xzvf /path/to/foo.tgz'));
+      expect(gz, isNot(contains('tar cf ')));
+      final commit = await cheat.call('cheat_lookup', {'name': 'git commit', 'source': 'tldr'});
+      expect(commit, startsWith('=== git-commit [tldr: common] ==='));
+      expect(await cheat.call('cheat_lookup', {'name': 'cal', 'platform': 'osx'}), contains('=== cal [tldr: osx] ==='));
+      final found = await cheat.call('cheat_search', {'query': 'find files modified in the last day', 'limit': 5});
+      expect(found, contains('-mtime'));
+      final info = await cheat.call('cheat_info', {'name': 'tar'});
+      expect(info, contains('path:     pages/common/tar.md'));
+      expect(info, contains('license:  CC-BY-4.0'));
+      expect(await cheat.call('cheat_info', {}), contains('tldr-pages/tldr at '));
+      final none = await cheat.call('cheat_lookup', {'name': 'tarr'});
+      expect(none, startsWith('Not found: no page named "tarr"'));
+      expect(none, contains('close: tar'));
+      expect(await cheat.call('cheat_search', {'query': 'qqqqzzzz'}), startsWith('Not found:'));
+      expect(await cheat.call('cheat_lookup', {}), startsWith('Error:'));
+    });
+
+    test('allowEdits: an example of its own, shown first, then removed', () async {
+      expect(CheatTools(sandbox).handles('cheat_add'), isFalse);
+      expect(CheatTools(sandbox).definitions.map((d) => d['name']), isNot(contains('cheat_add')));
+      expect(CheatTools(sandbox, allowEdits: true).definitions.map((d) => d['name']), containsAll(['cheat_add', 'cheat_remove']));
+      if (!hasGa) {
+        markTestSkipped('no guided-arrow add-on in the runtime');
+        return;
+      }
+      final edit = CheatTools(cs, allowEdits: true);
+      final add = {
+        'name': 'az keyvault',
+        'description': "Read a secret's value:",
+        'command': 'az keyvault secret show --vault-name {{vault}} --name {{name}} --query value -o tsv',
+      };
+      expect(await cheat.call('cheat_add', add), startsWith('Error: unknown tool'));
+      final added = await edit.call('cheat_add', add);
+      expect(added, contains('added 1 example to az-keyvault (a new sheet)'));
+      expect(added, contains('is gone when the sandbox stops'));
+      expect(await edit.call('cheat_add', add), contains('already in az-keyvault'));
+      expect(await edit.call('cheat_lookup', {'name': 'az keyvault'}), startsWith('=== az-keyvault [local] ==='));
+      expect(await edit.call('cheat_search', {'query': 'key vault secret value', 'limit': 5}), contains('=== az-keyvault [local] ==='));
+      expect(await edit.call('cheat_remove', {'name': 'az keyvault', 'words': 'nothing-like-this'}), startsWith('Not found:'));
+      expect(await edit.call('cheat_remove', {'name': 'az keyvault'}), contains('removed the sheet az-keyvault'));
+      expect(await edit.call('cheat_lookup', {'name': 'az keyvault'}), startsWith('Not found:'));
+      expect(await edit.call('cheat_add', {'name': 'x'}), startsWith('Error:'));
+    });
+  });
+
   // The wpe add-on is not bundled: these run with a runtime that has it in app/images/addons
   // (addons/wpe/README.md), and are skipped otherwise.
   group('term tools', () {

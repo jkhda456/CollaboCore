@@ -190,7 +190,13 @@ static void *serve(void *arg)
 	posix_spawnattr_t attr;
 	posix_spawnattr_init(&attr);
 	// A new session: the child is not in the agent's process group, and kill(-pid) reaches its children.
-	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+	// SIGPIPE back to its default: the agent ignores it (main), and an ignored signal stays ignored
+	// across exec; a command's `yes | head` must end with yes killed, as everywhere else.
+	sigset_t def;
+	sigemptyset(&def);
+	sigaddset(&def, SIGPIPE);
+	posix_spawnattr_setsigdefault(&attr, &def);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF);
 
 	char **env = merge_env(&extra_env);
 	pid_t pid;

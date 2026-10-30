@@ -154,6 +154,12 @@ if [[ "$MODE" == "--all" ]]; then
   fi
   tail -1 "$log"
 
+  echo "== busybox for builds: diff -c/-C as GNU diff prints it, scripts without #! (patches/busybox-diff-context.patch, busybox-exec-script.patch)"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$T/test_busybox_tools.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: busybox tools"; exit 1
+  fi
+  tail -1 "$log"
+
   echo "== SQLite: the sqlite3 shell (also in a terminal) and Python's sqlite3, in the guest"
   if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_sqlite.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: sqlite"; exit 1

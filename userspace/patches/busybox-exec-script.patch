@@ -1,0 +1,125 @@
+diff --git a/include/libbb.h b/include/libbb.h
+index 8a79ece..d6ff664 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -1240,8 +1240,9 @@ int executable_exists(const char *filename) FAST_FUNC;
+ /* BB_EXECxx always execs (it's not doing NOFORK/NOEXEC stuff),
+  * but it may exec busybox and call applet instead of searching PATH.
+  */
+-#if ENABLE_FEATURE_PREFER_APPLETS
++/* BB_EXECVP also runs a file without #! as a shell script (libbb/executable.c) */
+ int BB_EXECVP(const char *file, char *const argv[]) FAST_FUNC;
++#if ENABLE_FEATURE_PREFER_APPLETS
+ #define BB_EXECLP(prog,cmd,...) \
+ 	do { \
+ 		if (find_applet_by_name(prog) >= 0) \
+@@ -1249,7 +1250,6 @@ int BB_EXECVP(const char *file, char *const argv[]) FAST_FUNC;
+ 		execlp(prog, cmd, __VA_ARGS__); \
+ 	} while (0)
+ #else
+-#define BB_EXECVP(prog,cmd)     execvp(prog,cmd)
+ #define BB_EXECLP(prog,cmd,...) execlp(prog,cmd,__VA_ARGS__)
+ #endif
+ void BB_EXECVP_or_die(char **argv) NORETURN FAST_FUNC;
+diff --git a/libbb/executable.c b/libbb/executable.c
+index 09bed1e..17fa062 100644
+--- a/libbb/executable.c
++++ b/libbb/executable.c
+@@ -78,15 +78,80 @@ int FAST_FUNC executable_exists(const char *name)
+ 	return ret != NULL;
+ }
+ 
+-#if ENABLE_FEATURE_PREFER_APPLETS
+-/* just like the real execvp, but try to launch an applet named 'file' first */
++/* What execvp does after execve fails with ENOEXEC, as POSIX wants of it ("the execlp() and
++ * execvp() functions shall execute a command interpreter and the environment of the executed
++ * command shall be as if the process invoked the sh utility") and glibc's does: the file run by
++ * /bin/sh, its arguments after it. musl's execvp fails with ENOEXEC instead, so a script without
++ * #! could not be run by hush, env, xargs, find -exec, ... As bash does, a file with a NUL byte
++ * in its first 80 bytes is not taken for a script (a program of another machine): ENOEXEC stays.
++ * No malloc: this runs in the child of a vfork. */
++static void exec_as_script(const char *file, char *const argv[])
++{
++	char buf[PATH_MAX];
++	const char *path = file;
++	int fd, n, argc;
++
++	if (!argv[0])
++		goto out;
++	if (!strchr(file, '/')) {
++		/* the PATH entry execvp took: the first with an executable file of that name */
++		const char *p = getenv("PATH");
++		if (!p)
++			p = bb_default_path;
++		path = NULL;
++		while (*p) {
++			const char *end = strchrnul(p, ':');
++			size_t len = end - p;
++			if (len + 1 + strlen(file) < sizeof(buf)) {
++				memcpy(buf, p, len);
++				buf[len] = '/';
++				strcpy(buf + len + (len != 0), file);
++				if (file_is_executable(buf)) {
++					path = buf;
++					break;
++				}
++			}
++			p = *end ? end + 1 : end;
++		}
++		if (!path)
++			goto out;
++	}
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		goto out;
++	{
++		char head[80];
++		n = full_read(fd, head, sizeof(head));
++		close(fd);
++		if (n < 0 || memchr(head, '\0', n))
++			goto out;
++	}
++	for (argc = 0; argv[argc]; argc++)
++		continue;
++	{
++		char *nargv[argc + 2];
++		nargv[0] = (char *)"sh";
++		nargv[1] = (char *)path;
++		memcpy(nargv + 2, argv + 1, sizeof(nargv[0]) * argc); /* argv[1..], and its NULL */
++		execv("/bin/sh", nargv);
++	}
++ out:
++	errno = ENOEXEC;
++}
++
++/* execvp, which runs a file without #! as a shell script (exec_as_script); with
++ * FEATURE_PREFER_APPLETS, an applet named 'file' first */
+ int FAST_FUNC BB_EXECVP(const char *file, char *const argv[])
+ {
++#if ENABLE_FEATURE_PREFER_APPLETS
+ 	if (find_applet_by_name(file) >= 0)
+ 		execvp(bb_busybox_exec_path, argv);
+-	return execvp(file, argv);
+-}
+ #endif
++	execvp(file, argv);
++	if (errno == ENOEXEC)
++		exec_as_script(file, argv);
++	return -1;
++}
+ 
+ void FAST_FUNC BB_EXECVP_or_die(char **argv)
+ {
+diff --git a/shell/hush.c b/shell/hush.c
+index 0811336..cfff36d 100644
+--- a/shell/hush.c
++++ b/shell/hush.c
+@@ -8570,7 +8570,7 @@ static void execvp_or_die(char **argv)
+ 	/* Don't propagate SIG_IGN to the child */
+ 	if (SPECIAL_JOBSTOP_SIGS != 0)
+ 		switch_off_special_sigs(G.special_sig_mask & SPECIAL_JOBSTOP_SIGS);
+-	execvp(argv[0], argv);
++	BB_EXECVP(argv[0], argv); /* a script without #! too: libbb/executable.c */
+ 	e = 2;
+ 	if (errno == EACCES) e = 126;
+ 	if (errno == ENOENT) e = 127;
