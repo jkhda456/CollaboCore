@@ -19,6 +19,9 @@
 //!                                         storage it must still set up, as (handle, size, align)
 //!   init_tls(handle, block)               that library's `__wasm_init_tls` in this thread
 //!   error(buf, cap) -> len                why the last call failed
+//!   params(slot) -> n                     how many parameters the function in that table slot
+//!                                         takes (for calls through pointers of another type)
+//!   own_table() -> n                      the program's own table slots: [0, n)
 //!
 //! A library links against the program's exports — its functions, its data addresses (exported
 //! as globals), the C library, the `__c_longjmp` tag — and those of the libraries loaded before
@@ -781,7 +784,7 @@ pub const SYSCALL: i32 = 0x7d00_0000;
 
 pub fn syscall(caller: &mut Caller<'_, HostState>, nr: i32, a: [i32; 5]) -> Option<Result<i32>> {
     let op = nr.wrapping_sub(SYSCALL);
-    if !(0..8).contains(&op) {
+    if !(0..10).contains(&op) {
         return None;
     }
     Some(match op {
@@ -844,10 +847,35 @@ pub fn syscall(caller: &mut Caller<'_, HostState>, nr: i32, a: [i32; 5]) -> Opti
             Ok(0)
         }),
         // error(buf, cap) -> len
-        _ => {
+        7 => {
             let text = caller.data().user.dylink.error.clone().into_bytes();
             write(caller, a[0] as u32, &text[..text.len().min(a[1] as usize)]).map(|()| text.len() as i32)
         }
+        // params(slot) -> n: the parameters of the function in that slot of this thread's table,
+        // when it is what a C function of pointers and integers compiles to (i32 parameters, an
+        // i32 result). WebAssembly checks the type of an indirect call exactly, where C's ABIs
+        // ignore the arguments a function does not take: the Python interpreter calls a library's
+        // function through a pointer of another type with as many as it takes (a METH_NOARGS
+        // method declared without its second parameter).
+        8 => guarded(caller, |caller| {
+            let slot = a[0] as u32;
+            let table = main_table(caller)?;
+            let Some(Ref::Func(Some(func))) = table.get(&mut *caller, u64::from(slot)) else {
+                bail!("no function in table slot {slot}");
+            };
+            let ty = func.ty(&*caller);
+            if ty.results().len() != 1 || !ty.params().chain(ty.results()).all(|t| matches!(t, ValType::I32)) {
+                bail!("table slot {slot}: {ty}: not a function of i32 parameters and an i32 result");
+            }
+            let params = ty.params().len();
+            Ok(params as i32)
+        }),
+        // own_table() -> n: the slots of the program's own functions, those its table has before
+        // any library's (a pointer to one is called as declared)
+        _ => guarded(caller, |caller| {
+            let table = main_table(caller)?;
+            Ok(table.ty(&*caller).minimum() as i32)
+        }),
     })
 }
 

@@ -129,6 +129,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
       "$ROOT/userspace/out/initramfs.cpio" "python3 /usr/share/tests/hostapi.py; echo hostapi-rc=\$?" | tr -d '\r')"
     echo "$out" | grep -E "^(FAIL|HOSTAPI:)"
     grep -q "^hostapi-rc=0" <<<"$out" || { echo "$out" | tail -25; echo "FAIL: collabo_core tests"; exit 1; }
+
+    echo "== guest boot: an extension module's functions called through pointers of other types (METH_NOARGS with only self, getters without closure)"
+    python3 "$T/test_pyext_calls.py" >"$progs/pyext-calls.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/pyext-calls.txt" | head -40; echo "FAIL: extension calls (python/patches/cpython-call-trampoline.patch, engine/src/dylink.rs params)"; exit 1; }
+    tail -1 "$progs/pyext-calls.txt"
   else
     echo "(python not built: skipping the Python guest tests; run: python3 build.py python)"
   fi

@@ -12,7 +12,9 @@
 #     (python/build-rust-toolchain.sh, python/build-native.sh)
 #   * extension modules loaded from files, as on Linux (dlopen of WebAssembly side modules, which
 #     the C library's dlopen and the engine's dylink imports provide: `wasm-cc -fPIC -shared`
-#     builds one, named <module>.cpython-313.so); the standard library's own stay built in
+#     builds one, named <module>.cpython-313.so); the standard library's own stay built in; a
+#     module's methods and getters called with the parameters they have, whatever their flags say
+#     (patches/cpython-call-trampoline.patch)
 #
 # Mirrors distro/distro/python/package.nix, without Nix and without root: stock clang-19 via
 # userspace/bin/wasm-cc (see docs/note.md) and a host CPython of the same minor version for the
@@ -75,6 +77,18 @@ if ! grep -q _HAVE_FORK_EXEC "$SRC/Lib/subprocess.py"; then
 fi
 grep -q _HAVE_FORK_EXEC "$SRC/Lib/subprocess.py" && grep -q POSIX_SPAWN_CHDIR "$SRC/Modules/posixmodule.c" \
   || { echo "error: the posix_spawn patch is not in the source tree" >&2; exit 1; }
+
+# Ours: an extension module's function called through a pointer of another type (a METH_NOARGS
+# method declared without its second parameter) is called with the parameters it has, which the
+# engine tells; WebAssembly traps on the mismatch ("indirect call type mismatch") where native
+# ABIs ignore the extra argument. CPython's Emscripten call trampoline, for this guest.
+if ! grep -q _Py_WASM_CALL_TRAMPOLINE "$SRC/Include/internal/pycore_emscripten_trampoline.h"; then
+  echo "== patch: cpython-call-trampoline"
+  (cd "$SRC" && patch -p1 --forward --no-backup-if-mismatch < "$P/patches/cpython-call-trampoline.patch" >> "$P/patch.log" 2>&1) \
+    || { cat "$P/patch.log"; exit 1; }
+fi
+grep -q _PyWasm_TrampolineCall "$SRC/Objects/methodobject.c" \
+  || { echo "error: the call trampoline patch is not in the source tree" >&2; exit 1; }
 
 # The Rust extension modules join the interpreter's table of built-in modules, under the names
 # their packages import them by. (makesetup's Setup files cannot name a dotted module.)

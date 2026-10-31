@@ -1,0 +1,184 @@
+--- a/Include/internal/pycore_emscripten_trampoline.h
++++ b/Include/internal/pycore_emscripten_trampoline.h
+@@ -60,6 +60,60 @@
+     _PyEM_TrampolineCall((PyCFunctionWithKeywords)(get), (obj), (PyObject*)(closure), NULL)
+ 
+ 
++#elif defined(__wasm__) && defined(__linux__)
++
++/* collaboCore's guest (wasm32 Linux): an extension module is a WebAssembly side module that the
++ * engine links into the program (dlopen), its functions in table slots past the program's own.
++ * A function of one of those is called with as many arguments as it takes, a number the engine
++ * knows (Objects/methodobject.c); the interpreter's own functions, in the slots below, are called
++ * as they are declared. */
++#define _Py_WASM_CALL_TRAMPOLINE 1
++
++/* The program's own table slots are [0, this); 0 until _PyWasm_Trampoline_Init */
++extern uintptr_t _PyWasm_own_functions;
++void _PyWasm_Trampoline_Init(void);
++PyObject *_PyWasm_TrampolineCall(void (*func)(void), PyObject *a, PyObject *b, PyObject *c, int declared);
++int _PyWasm_SetterCall(setter set, PyObject *obj, PyObject *value, void *closure);
++
++#define _Py_EmscriptenTrampoline_Init(runtime) _PyWasm_Trampoline_Init()
++
++static inline PyObject *
++_PyCFunction_TrampolineCall(PyCFunction meth, PyObject *self, PyObject *args)
++{
++    if ((uintptr_t)meth < _PyWasm_own_functions) {
++        return meth(self, args);
++    }
++    return _PyWasm_TrampolineCall((void (*)(void))meth, self, args, NULL, 2);
++}
++
++static inline PyObject *
++_PyCFunctionWithKeywords_TrampolineCall(PyCFunctionWithKeywords meth, PyObject *self,
++                                        PyObject *args, PyObject *kw)
++{
++    if ((uintptr_t)meth < _PyWasm_own_functions) {
++        return meth(self, args, kw);
++    }
++    return _PyWasm_TrampolineCall((void (*)(void))meth, self, args, kw, 3);
++}
++
++static inline PyObject *
++descr_get_trampoline_call(getter get, PyObject *obj, void *closure)
++{
++    if ((uintptr_t)get < _PyWasm_own_functions) {
++        return get(obj, closure);
++    }
++    return _PyWasm_TrampolineCall((void (*)(void))get, obj, (PyObject *)closure, NULL, 2);
++}
++
++static inline int
++descr_set_trampoline_call(setter set, PyObject *obj, PyObject *value, void *closure)
++{
++    if ((uintptr_t)set < _PyWasm_own_functions) {
++        return set(obj, value, closure);
++    }
++    return _PyWasm_SetterCall(set, obj, value, closure);
++}
++
+ #else // defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE)
+ 
+ #define _Py_EmscriptenTrampoline_Init(runtime)
+--- a/Include/internal/pycore_object.h
++++ b/Include/internal/pycore_object.h
+@@ -844,7 +844,7 @@
+  * Third party code unintentionally rely on problematic fpcasts. The call
+  * trampoline mitigates common occurrences of bad fpcasts on Emscripten.
+  */
+-#if !(defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE))
++#if !(defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE)) && !defined(_Py_WASM_CALL_TRAMPOLINE)
+ #define _PyCFunction_TrampolineCall(meth, self, args) \
+     (meth)((self), (args))
+ #define _PyCFunctionWithKeywords_TrampolineCall(meth, self, args, kw) \
+--- a/Objects/methodobject.c
++++ b/Objects/methodobject.c
+@@ -551,3 +551,96 @@
+     }
+     return _Py_CheckFunctionResult(tstate, func, result, NULL);
+ }
++
++#ifdef _Py_WASM_CALL_TRAMPOLINE
++
++/* Calls through a function pointer of another type (pycore_emscripten_trampoline.h). C leaves a
++ * call through a pointer of a type the function does not have undefined, and native ABIs ignore
++ * the arguments a function does not take: extension modules declare METH_NOARGS methods without
++ * their unused second parameter, getters without the closure. WebAssembly's call_indirect checks
++ * the type exactly and traps ("indirect call type mismatch"), so a function of a library is called
++ * with the number of parameters it has, which the engine reads from its table slot (the dylink
++ * calls, engine/src/dylink.rs). A host without those calls says ENOSYS (it loads no libraries
++ * either): every function is then called as declared. */
++
++#define DYLINK_SYSCALL 0x7d000000
++enum { DL_PARAMS = 8, DL_OWN_TABLE = 9 };
++
++uintptr_t _PyWasm_own_functions;
++
++void
++_PyWasm_Trampoline_Init(void)
++{
++    int saved = errno;
++    long n = syscall(DYLINK_SYSCALL + DL_OWN_TABLE);
++    errno = saved;
++    _PyWasm_own_functions = n < 0 ? UINTPTR_MAX : (uintptr_t)n;
++}
++
++/* What the engine said of a table slot, direct-mapped: slot << 8 | code, the code being the
++ * number of parameters + 1, or PARAMS_UNKNOWN: not a function of i32 parameters and an i32
++ * result (or no answer), called as declared. Slots past 2^24 are not kept. */
++#define PARAMS_CACHE 4096
++#define PARAMS_UNKNOWN 0xff
++static uint32_t params_cache[PARAMS_CACHE];
++
++static int
++func_params(void (*func)(void), int declared)
++{
++    uintptr_t slot = (uintptr_t)func;
++    uint32_t *entry = &params_cache[slot % PARAMS_CACHE];
++    uint32_t e = _Py_atomic_load_uint32_relaxed(entry);
++    uint32_t code;
++    if (e != 0 && e >> 8 == slot) {
++        code = e & 0xff;
++    }
++    else {
++        int saved = errno;
++        long n = syscall(DYLINK_SYSCALL + DL_PARAMS, (long)slot);
++        errno = saved;
++        code = n < 0 || n >= PARAMS_UNKNOWN - 1 ? PARAMS_UNKNOWN : (uint32_t)n + 1;
++        if (slot < (1u << 24)) {
++            _Py_atomic_store_uint32_relaxed(entry, (uint32_t)slot << 8 | code);
++        }
++    }
++    return code == PARAMS_UNKNOWN ? declared : (int)code - 1;
++}
++
++typedef PyObject *(*zero_arg)(void);
++typedef PyObject *(*one_arg)(PyObject *);
++typedef PyObject *(*two_arg)(PyObject *, PyObject *);
++typedef PyObject *(*three_arg)(PyObject *, PyObject *, PyObject *);
++
++PyObject *
++_PyWasm_TrampolineCall(void (*func)(void), PyObject *a, PyObject *b, PyObject *c, int declared)
++{
++    switch (func_params(func, declared)) {
++    case 0:
++        return ((zero_arg)func)();
++    case 1:
++        return ((one_arg)func)(a);
++    case 2:
++        return ((two_arg)func)(a, b);
++    case 3:
++        return ((three_arg)func)(a, b, c);
++    default:
++        PyErr_SetString(PyExc_SystemError, "Handler takes too many arguments");
++        return NULL;
++    }
++}
++
++int
++_PyWasm_SetterCall(setter set, PyObject *obj, PyObject *value, void *closure)
++{
++    switch (func_params((void (*)(void))set, 3)) {
++    case 2:
++        return ((int (*)(PyObject *, PyObject *))(void (*)(void))set)(obj, value);
++    case 3:
++        return set(obj, value, closure);
++    default:
++        PyErr_SetString(PyExc_SystemError, "Setter takes too few or too many arguments");
++        return -1;
++    }
++}
++
++#endif // _Py_WASM_CALL_TRAMPOLINE
+--- a/Python/pystate.c
++++ b/Python/pystate.c
+@@ -429,7 +429,7 @@
+ 
+     runtime->unicode_state.ids.next_index = unicode_next_index;
+ 
+-#if defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE)
++#if (defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE)) || defined(_Py_WASM_CALL_TRAMPOLINE)
+     _Py_EmscriptenTrampoline_Init(runtime);
+ #endif
+ 
