@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Make the logo of the `version` command (rootfs/version) and write it into that script, between
 its `# logo:` and `# logo end` lines: a 24-bit BMP beside the word CollaboCore in large letters,
-as terminal text. Two pixel rows per line, as half blocks (U+2580, the top pixel its foreground,
-the bottom one its background) in 24-bit colour, `\\e` for ESC; the letters in the colours of the
-logo, on the terminal's own background. A 32x32 image is 32 columns by 16 lines, the letters 45
-columns beside it (79 in all).
+as terminal text. Two pixel rows per line, as lower half blocks (U+2584) in 24-bit colour, `\\e`
+for ESC; the letters in the colours of the logo, on the terminal's own background. A 32x32 image
+is 32 columns by 16 lines, the letters 45 columns beside it (79 in all).
 
-The half blocks (and the ▄ and █ of the letters) are East Asian "ambiguous" characters, which a
-terminal set to draw those wide (Terminal.app's and iTerm2's option, often on in Korean, Chinese
-and Japanese setups) gives two columns: every line then wraps half way. So the script also carries
-the logo in coloured spaces only (`logo_cells`), which `version` draws when the terminal says a
-half block took two columns, and on macOS's terminals (their block characters come from the font,
-short of the cell height: a strip between every two lines). Each column of the image one cell,
-the two pixels of a cell averaged; the letters in their own font at cell resolution
-(`CELL_GLYPHS`), as high as in half blocks. Same 79 columns, 16 lines (`version` checks the
-width: `logo_width`). Run it again when the image changes:
+Every cell's background is its top pixel and the ▄ its bottom one (`half_cell`): macOS's terminals
+draw block characters from the font, short of the cell height, and the strip left over (at the
+top of the cell there) shows the cell's background. So it continues the top pixel instead of
+leaving a line of the terminal's background between every two pixel rows. A cell whose bottom
+pixel is the terminal's own background is a reversed ▄ (SGR 7: the ▄ in that background on the
+top pixel's colour); one pixel in both halves, a space. Where a terminal draws the blocks itself
+(most do) this looks the same as any other way of using half blocks.
+
+The ▄ is an East Asian "ambiguous" character, which a terminal set to draw those wide (an option
+of Terminal.app and iTerm2, often on in Korean, Chinese and Japanese setups) gives two columns:
+every line then wraps half way. So the script also carries the logo in coloured spaces only
+(`logo_cells`), which `version` draws when the terminal says a ▄ took two columns. Each column of
+the image one cell, the two pixels of a cell averaged; the letters in their own font at cell
+resolution (`CELL_GLYPHS`), as high as in half blocks. Same 79 columns, 16 lines (`version`
+checks the width: `logo_width`). Run it again when the image changes:
 
     python3 userspace/logo.py CollaboCore32.bmp userspace/rootfs/version
 """
@@ -71,22 +76,42 @@ def read_bmp(path):
     return rows
 
 
+def half_cell(top, bottom):
+    """A cell of two pixels, each a colour or None (the terminal's background): (character,
+    reversed, foreground, background), the background the top pixel's (the module's doc)."""
+    if top == bottom:
+        return (" ", False, None, top)
+    if bottom is None:
+        return ("▄", True, top, None)  # reversed: the top pixel the background, the ▄ the terminal's
+    return ("▄", False, bottom, top)
+
+
+def half_line(cells):
+    """Cells of half_cell as text, each attribute set where it changes, the terminal's background
+    cells at the end left out."""
+    while cells and cells[-1] == (" ", False, None, None):
+        cells.pop()
+    line, (rev, fg, bg) = [], (False, None, None)
+    for ch, r, f, b in cells:
+        codes = []
+        if r != rev:
+            codes.append("7" if r else "27")
+        if f != fg and ch != " ":  # a space shows no foreground: leave it for the next ▄
+            codes.append("38;2;%d;%d;%d" % f if f else "39")
+            fg = f
+        if b != bg:
+            codes.append("48;2;%d;%d;%d" % b if b else "49")
+        if codes:
+            line.append("\\e[%sm" % ";".join(codes))
+        rev, bg = r, b
+        line.append(ch)
+    return "".join(line) + "\\e[0m"
+
+
 def image_lines(rows):
     if len(rows) % 2:
-        rows = rows + [None]
-    lines = []
-    for top, bottom in zip(rows[0::2], rows[1::2]):
-        line, last = [], None
-        for x, fg in enumerate(top):
-            bg = bottom[x] if bottom else None
-            if (fg, bg) != last:
-                code = "38;2;%d;%d;%d" % fg
-                code += ";48;2;%d;%d;%d" % bg if bg else ";49"
-                line.append(f"\\e[{code}m")
-                last = (fg, bg)
-            line.append("▀")
-        lines.append("".join(line) + "\\e[0m")
-    return lines
+        rows = rows + [[None] * len(rows[0])]
+    return [half_line([half_cell(t, b) for t, b in zip(top, bottom)]) for top, bottom in zip(rows[0::2], rows[1::2])]
 
 
 def image_cells(rows):
@@ -128,13 +153,9 @@ def word_lines():
     width = len(pixels[0])
     lines = []
     for top, bottom in zip(pixels[0::2], pixels[1::2]):
-        line = []
-        for x in range(width):
-            cell = " ▄▀█"[(top[x] == "#") * 2 + (bottom[x] == "#")]
-            if cell != " ":
-                line.append("\\e[38;2;%d;%d;%dm" % mix(x, width))  # each column its own colour
-            line.append(cell)
-        lines.append("".join(line).rstrip() + "\\e[0m")
+        # each column its own colour
+        colour = lambda row, x: mix(x, width) if row[x] == "#" else None
+        lines.append(half_line([half_cell(colour(top, x), colour(bottom, x)) for x in range(width)]))
     return lines
 
 
@@ -189,9 +210,10 @@ def block(bmp):
     left = image_width + len(GAP)
     return [
         "# logo: the image and the word, by userspace/logo.py from CollaboCore32.bmp (run it again,",
-        "# not an editor); \\e is ESC. In half blocks; logo_cells in coloured spaces, for terminals",
-        "# that draw the half blocks two wide or short of the cell. Both logo_width columns; the",
-        "# lines from logo_info on are the image alone, the info logo_left columns in beside them.",
+        "# not an editor); \\e is ESC. In half blocks, each cell's background its top pixel (a ▄",
+        "# short of the cell leaves no gap); logo_cells in coloured spaces, for terminals that draw",
+        "# the ▄ two wide. Both logo_width columns; the lines from logo_info on are the image alone,",
+        "# the info logo_left columns in beside them.",
         f"logo_width={left + word_width} logo_left={left}",
         *layout("logo", *variants[0]),
         *layout("logo_cells", *variants[1]),

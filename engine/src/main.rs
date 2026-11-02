@@ -708,8 +708,8 @@ fn main() -> Result<()> {
     let (columns, rows) = if raw { host_tty::size().unwrap_or((100, 30)) } else { (100, 30) };
     if raw {
         // Which terminal program this is (macOS sets TERM_PROGRAM: Apple_Terminal, iTerm.app),
-        // for what the guest draws: `version`'s logo avoids block characters on terminals that
-        // draw them from the font, short of the cell height (a gap between every two lines).
+        // for guest programs that draw to suit it (nothing reads it now: `version`'s logo
+        // works around the macOS terminals' short block characters by itself).
         if let Ok(program) = std::env::var("TERM_PROGRAM") {
             let program: String = program.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(32).collect();
             if !program.is_empty() {
