@@ -1,0 +1,433 @@
+diff --git a/findutils/grep.c b/findutils/grep.c
+index f6d0a73..82a3501 100644
+--- a/findutils/grep.c
++++ b/findutils/grep.c
+@@ -56,15 +56,17 @@
+ #include "libbb.h"
+ #include "common_bufsiz.h"
+ #include "xregex.h"
++#include <fnmatch.h>
+ 
+ //usage:#define grep_trivial_usage
+-//usage:       "[-HhnlLoqvsrRiwFE"
++//usage:       "[-HhnlLoqvsrRiwFEaI"
+ //usage:	IF_EXTRA_COMPAT("z")
+ //usage:       "] [-m N] "
+ //usage:	IF_FEATURE_GREP_CONTEXT("[-A|B|C N] ")
++//usage:	IF_LONG_OPTS("[--include|--exclude|--exclude-dir=GLOB]... ")
+ //usage:       "{ PATTERN | -e PATTERN... | -f FILE... } [FILE]..."
+ //usage:#define grep_full_usage "\n\n"
+-//usage:       "Search for PATTERN in FILEs (or stdin)\n"
++//usage:       "Search for PATTERN in FILEs (or stdin; with -r, the current directory)\n"
+ //usage:     "\n	-H	Add 'filename:' prefix"
+ //usage:     "\n	-h	Do not add 'filename:' prefix"
+ //usage:     "\n	-n	Add 'line_no:' prefix"
+@@ -93,6 +95,18 @@
+ //usage:	)
+ //usage:     "\n	-e PTRN	Pattern to match"
+ //usage:     "\n	-f FILE	Read pattern from file"
++//usage:     "\n	-I	Skip binary files (a NUL byte in the first 96 KiB)"
++//usage:     "\n	-a	Search binary files as text (the default)"
++//usage:	IF_LONG_OPTS(
++//usage:     "\n	--include=GLOB	Search only files whose name matches GLOB"
++//usage:     "\n	--exclude=GLOB	Skip files whose name matches GLOB"
++//usage:     "\n	--exclude-dir=GLOB Skip directories whose name matches GLOB"
++//usage:     "\n		(The last --include or --exclude that matches decides; a name"
++//usage:     "\n		none matches is searched unless the first is an --include)"
++//usage:     "\n	--binary-files=without-match As -I (binary, text: as -a)"
++//usage:     "\n	--line-buffered	Flush the output after every line"
++//usage:     "\n	GNU grep's long names work too (--ignore-case, --line-number, ...)"
++//usage:	)
+ //usage:
+ //usage:#define grep_example_usage
+ //usage:       "$ grep root /etc/passwd\n"
+@@ -111,9 +125,55 @@
+ 	IF_FEATURE_GREP_CONTEXT("A:+B:+C:+") \
+ 	"E" \
+ 	IF_EXTRA_COMPAT("z") \
+-	"aI"
+-/* ignored: -a "assume all files to be text" */
+-/* ignored: -I "assume binary files have no matches" */
++	"aI" \
++	IF_LONG_OPTS("\xfe:*\xfd:*\xfc:*")
++/* -a: binary files searched as text, the default (it undoes an earlier -I, as in GNU grep) */
++/* -I: binary files searched as if empty */
++/* \xfe, \xfd, \xfc: --include, --exclude, --exclude-dir. Lists, which only a short option can
++ * be in getopt32: no one types these bytes as options. */
++
++#if ENABLE_LONG_OPTS
++/* GNU grep's long names for the options above, and the long options it has alone */
++static const char grep_longopts[] ALIGN1 =
++	"extended-regexp\0"       No_argument       "E"
++	"fixed-strings\0"         No_argument       "F"
++	"regexp\0"                Required_argument "e"
++	"file\0"                  Required_argument "f"
++	"ignore-case\0"           No_argument       "i"
++	"word-regexp\0"           No_argument       "w"
++	"line-regexp\0"           No_argument       "x"
++	"invert-match\0"          No_argument       "v"
++	"count\0"                 No_argument       "c"
++	"files-with-matches\0"    No_argument       "l"
++	"files-without-match\0"   No_argument       "L"
++	"max-count\0"             Required_argument "m"
++	"only-matching\0"         No_argument       "o"
++	"quiet\0"                 No_argument       "q"
++	"silent\0"                No_argument       "q"
++	"no-messages\0"           No_argument       "s"
++	"with-filename\0"         No_argument       "H"
++	"no-filename\0"           No_argument       "h"
++	"line-number\0"           No_argument       "n"
++	"recursive\0"             No_argument       "r"
++	"dereference-recursive\0" No_argument       "R"
++	"text\0"                  No_argument       "a"
++	IF_FEATURE_GREP_CONTEXT(
++	"after-context\0"         Required_argument "A"
++	"before-context\0"        Required_argument "B"
++	"context\0"               Required_argument "C"
++	)
++	IF_EXTRA_COMPAT(
++	"null-data\0"             No_argument       "z"
++	)
++	"include\0"               Required_argument "\xfe"
++	"exclude\0"               Required_argument "\xfd"
++	"exclude-dir\0"           Required_argument "\xfc"
++	"color\0"                 Optional_argument "\xff" /* no colours here */
++	"colour\0"                Optional_argument "\xff"
++	"binary-files\0"          Required_argument "\xfb"
++	"line-buffered\0"         No_argument       "\xfa"
++	;
++#endif
+ enum {
+ 	OPTBIT_l, /* list matched file names only */
+ 	OPTBIT_n, /* print line# */
+@@ -139,6 +199,14 @@ enum {
+ 	IF_FEATURE_GREP_CONTEXT(    OPTBIT_C ,) /* -C NUM: -A and -B combined */
+ 	OPTBIT_E, /* extended regexp */
+ 	IF_EXTRA_COMPAT(            OPTBIT_z ,) /* input is NUL terminated */
++	OPTBIT_a, /* binary files as text */
++	OPTBIT_I, /* binary files as if empty */
++	IF_LONG_OPTS(               OPTBIT_include ,)     /* the lists: no bits read */
++	IF_LONG_OPTS(               OPTBIT_exclude ,)
++	IF_LONG_OPTS(               OPTBIT_exclude_dir ,)
++	IF_LONG_OPTS(               OPTBIT_color ,)       /* the long options alone, in order */
++	IF_LONG_OPTS(               OPTBIT_binary_files ,)
++	IF_LONG_OPTS(               OPTBIT_line_buffered ,)
+ 	OPT_l = 1 << OPTBIT_l,
+ 	OPT_n = 1 << OPTBIT_n,
+ 	OPT_q = 1 << OPTBIT_q,
+@@ -163,6 +231,9 @@ enum {
+ 	OPT_C = IF_FEATURE_GREP_CONTEXT(    (1 << OPTBIT_C)) + 0,
+ 	OPT_E = 1 << OPTBIT_E,
+ 	OPT_z = IF_EXTRA_COMPAT(            (1 << OPTBIT_z)) + 0,
++	OPT_a = 1 << OPTBIT_a,
++	OPT_I = 1 << OPTBIT_I,
++	OPT_line_buffered = IF_LONG_OPTS(   (1 << OPTBIT_line_buffered)) + 0,
+ };
+ 
+ #define PRINT_LINE_NUM              (option_mask32 & OPT_n)
+@@ -193,6 +264,12 @@ struct globals {
+ 	/* globals used internally */
+ 	llist_t *pattern_head;   /* growable list of patterns to match */
+ 	const char *cur_file;    /* the current file we are reading */
++	/* --include, --exclude, --exclude-dir */
++	struct name_rule *name_rules;
++	int name_rule_count;
++	smallint name_default_skip;  /* the first rule is an --include */
++	smallint no_dot_slash;       /* -r with no FILE: names without "./" */
++	llist_t *exclude_dirs;
+ } FIX_ALIASING;
+ #define G (*(struct globals*)bb_common_bufsiz1)
+ #define INIT_G() do { \
+@@ -226,6 +303,13 @@ struct globals {
+ #define pattern_head      (G.pattern_head        )
+ #define cur_file          (G.cur_file            )
+ 
++/* An --include or --exclude GLOB, and where it stands on the command line */
++struct name_rule {
++	const char *glob;
++	int pos;
++	smallint skip;  /* --exclude */
++};
++
+ 
+ typedef struct grep_list_data_t {
+ 	char *pattern;
+@@ -299,6 +383,30 @@ static ssize_t FAST_FUNC bb_getline(char **line_ptr, size_t *line_alloc_len, FIL
+ }
+ #endif
+ 
++/* -I: a binary file, as GNU grep tells one in the C locale: a NUL byte in what it reads first
++ * (96 KiB). Read from where the file stands without moving it; only regular files, as a pipe
++ * cannot be read twice. */
++static int binary_file(FILE *file)
++{
++	enum { LOOK = 96 * 1024 };
++	struct stat st;
++	char *buf;
++	off_t at;
++	ssize_t n;
++	int binary;
++
++	if (fstat(fileno(file), &st) != 0 || !S_ISREG(st.st_mode))
++		return 0;
++	at = lseek(fileno(file), 0, SEEK_CUR);
++	if (at < 0)
++		return 0;
++	buf = xmalloc(LOOK);
++	n = pread(fileno(file), buf, LOOK, at);
++	binary = n > 0 && memchr(buf, '\0', n) != NULL;
++	free(buf);
++	return binary;
++}
++
+ static int grep_file(FILE *file)
+ {
+ 	smalluint found;
+@@ -321,6 +429,11 @@ static int grep_file(FILE *file)
+ 	enum { print_n_lines_after = 0 };
+ #endif
+ 
++	/* -I: GNU grep searches a binary file "as if it did not contain matching data": -c says 0,
++	 * -L names it, -v finds no lines */
++	if ((option_mask32 & OPT_I) && binary_file(file))
++		goto no_more_lines;
++
+ 	while (
+ #if !ENABLE_EXTRA_COMPAT
+ 		(line = xmalloc_fgetline(file)) != NULL
+@@ -587,6 +700,7 @@ static int grep_file(FILE *file)
+ 			break;
+ 		}
+ 	} /* while (read line) */
++ no_more_lines:
+ 
+ 	/* special-case file post-processing for options where we don't print line
+ 	 * matches, just filenames and possibly match counts */
+@@ -654,12 +768,96 @@ static void load_pattern_list(llist_t **lst, char *pattern)
+ 		llist_add_to(lst, new_grep_list_data(p, 0));
+ }
+ 
++/* Does GLOB match NAME, as GNU grep matches --include, --exclude and --exclude-dir: a name met
++ * in a directory by its last component, one from the command line by any suffix of it that
++ * starts after a slash ("../d" is "d" too; "sub/" is not "sub") */
++static int name_matches(const char *glob, const char *name, int command_line)
++{
++	if (!command_line)
++		return fnmatch(glob, bb_basename(name), 0) == 0;
++	for (;;) {
++		if (fnmatch(glob, name, 0) == 0)
++			return 1;
++		name = strchr(name, '/');
++		if (!name)
++			return 0;
++		while (*name == '/')
++			name++;
++		if (!*name)
++			return 0;
++	}
++}
++
++/* --include, --exclude: the last rule whose GLOB matches decides */
++static int skip_file(const char *name, int command_line)
++{
++	const struct name_rule *rule, *last = NULL;
++	int i;
++
++	if (!G.name_rule_count)
++		return 0;
++	for (i = 0; i < G.name_rule_count; i++) {
++		rule = &G.name_rules[i];
++		if ((!last || rule->pos > last->pos) && name_matches(rule->glob, name, command_line))
++			last = rule;
++	}
++	return last ? last->skip : G.name_default_skip;
++}
++
++/* --exclude-dir */
++static int skip_dir(const char *name, int command_line)
++{
++	llist_t *l;
++
++	for (l = G.exclude_dirs; l; l = l->link)
++		if (name_matches(l->data, name, command_line))
++			return 1;
++	return 0;
++}
++
++/* Which argv string holds S, an option's argument ("--include=GLOB" or "--include GLOB"): where
++ * the option stands. getopt moves operands after the options but keeps the options' order. */
++static int argv_position(char **argv, const char *s)
++{
++	int i;
++
++	for (i = 0; argv[i]; i++)
++		if (s >= argv[i] && s <= argv[i] + strlen(argv[i]))
++			return i;
++	return 0;
++}
++
++static void add_name_rules(char **argv, llist_t *globs, int skip)
++{
++	for (; globs; globs = globs->link) {
++		struct name_rule *rule;
++
++		G.name_rules = xrealloc_vector(G.name_rules, 3, G.name_rule_count);
++		rule = &G.name_rules[G.name_rule_count++];
++		rule->glob = globs->data;
++		rule->pos = argv_position(argv, globs->data);
++		rule->skip = skip;
++	}
++}
++
++/* A name found under -r: "./x" is "x" when grep chose "." itself */
++static const char *shown_name(const char *filename)
++{
++	if (G.no_dot_slash && filename[0] == '.' && filename[1] == '/')
++		return filename + 2;
++	return filename;
++}
++
+ static int FAST_FUNC file_action_grep(struct recursive_state *state UNUSED_PARAM,
+ 		const char *filename,
+ 		struct stat *statbuf)
+ {
+ 	FILE *file;
+ 
++	if (skip_file(filename, 0))
++		return 1;
++	filename = shown_name(filename);
++
+ 	/* If we are given a link to a directory, we should bail out now, rather
+ 	 * than trying to open the "file" and hoping getline gives us nothing,
+ 	 * since that is not portable across operating systems (FreeBSD for
+@@ -688,6 +886,16 @@ static int FAST_FUNC file_action_grep(struct recursive_state *state UNUSED_PARAM
+ 	return 1;
+ }
+ 
++/* --exclude-dir below the command line's directories (those are checked by grep_main) */
++static int FAST_FUNC dir_action_grep(struct recursive_state *state,
++		const char *dirname,
++		struct stat *statbuf UNUSED_PARAM)
++{
++	if (state->depth > 0 && skip_dir(dirname, 0))
++		return SKIP;
++	return TRUE;
++}
++
+ static int grep_dir(const char *dir)
+ {
+ 	int matched = 0;
+@@ -695,10 +903,9 @@ static int grep_dir(const char *dir)
+ 		| ACTION_RECURSE
+ 		| ((option_mask32 & OPT_R) ? ACTION_FOLLOWLINKS : 0)
+ 		| ACTION_FOLLOWLINKS_L0 /* grep -r ... SYMLINK follows it */
+-		| ACTION_DEPTHFIRST
+-		| 0,
++		| 0, /* not ACTION_DEPTHFIRST: dir_action_grep comes before the files, to skip them */
+ 		/* fileAction= */ file_action_grep,
+-		/* dirAction= */ NULL,
++		/* dirAction= */ dir_action_grep,
+ 		/* userData= */ &matched
+ 	);
+ 	return matched;
+@@ -710,6 +917,9 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 	FILE *file;
+ 	int matched;
+ 	llist_t *fopt = NULL;
++	llist_t *include = NULL, *exclude = NULL;
++	char *binary_files = NULL;
++	static char *const dot[] = { (char *)".", NULL };
+ #if ENABLE_FEATURE_GREP_CONTEXT
+ 	int Copt, opts;
+ #endif
+@@ -720,15 +930,17 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	/* do normal option parsing */
+ #if ENABLE_FEATURE_GREP_CONTEXT
+-	/* -H unsets -h; -C unsets -A,-B */
++	/* -H unsets -h; -C unsets -A,-B; -a and -I unset each other */
+ 	opts = getopt32long(argv, "^"
+ 		OPTSTR_GREP
+ 			"\0"
+-			"H-h:C-AB",
+-		"color\0" Optional_argument "\xff",
++			"H-h:C-AB:a-I:I-a",
++		grep_longopts,
+ 		&pattern_head, &fopt, &max_matches,
+ 		&lines_after, &lines_before, &Copt
+-		, NULL
++		IF_LONG_OPTS(, &include, &exclude, &G.exclude_dirs)
++		, NULL /* --color */
++		IF_LONG_OPTS(, &binary_files)
+ 	);
+ 
+ 	if (opts & OPT_C) {
+@@ -753,8 +965,36 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 	}
+ #else
+ 	/* with auto sanity checks */
+-	getopt32(argv, "^" OPTSTR_GREP "\0" "H-h:c-n:q-n:l-n:", // why trailing ":"?
+-		&pattern_head, &fopt, &max_matches);
++	getopt32long(argv, "^" OPTSTR_GREP "\0" "H-h:c-n:q-n:l-n:a-I:I-a", // why trailing ":"?
++		grep_longopts,
++		&pattern_head, &fopt, &max_matches
++		IF_LONG_OPTS(, &include, &exclude, &G.exclude_dirs)
++		, NULL /* --color */
++		IF_LONG_OPTS(, &binary_files)
++	);
++#endif
++#if ENABLE_LONG_OPTS
++	if (binary_files) {
++		if (strcmp(binary_files, "without-match") == 0)
++			option_mask32 |= OPT_I;
++		else if (strcmp(binary_files, "binary") == 0 || strcmp(binary_files, "text") == 0)
++			option_mask32 &= ~OPT_I; /* searched as text, as always here */
++		else
++			bb_simple_error_msg_and_die("unknown binary-files type");
++	}
++	if (option_mask32 & OPT_line_buffered)
++		setvbuf(stdout, NULL, _IOLBF, 0);
++	add_name_rules(argv, include, 0);
++	add_name_rules(argv, exclude, 1);
++	if (G.name_rule_count) {
++		/* a name no rule matches is skipped if the first rule is an --include */
++		const struct name_rule *first = &G.name_rules[0];
++		int i;
++		for (i = 1; i < G.name_rule_count; i++)
++			if (G.name_rules[i].pos < first->pos)
++				first = &G.name_rules[i];
++		G.name_default_skip = !first->skip;
++	}
+ #endif
+ 	invert_search = ((option_mask32 & OPT_v) != 0); /* 0 | 1 */
+ 
+@@ -817,6 +1057,13 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 		load_pattern_list(&pattern_head, *argv++);
+ 	}
+ 
++	/* -r with no FILE searches the current directory, as GNU grep does (not stdin), and names
++	 * what it finds without "./" */
++	if (!argv[0] && (option_mask32 & (OPT_r|OPT_R))) {
++		argv = (char **)dot;
++		G.no_dot_slash = 1;
++	}
++
+ 	/* argv[0..(argc-1)] should be names of file to grep through. If
+ 	 * there is more than one file to grep, we will print the filenames. */
+ 	if (argv[0] && argv[1])
+@@ -841,10 +1088,14 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 				if (stat(cur_file, &st) == 0 && S_ISDIR(st.st_mode)) {
+ 					if (!(option_mask32 & OPT_h))
+ 						print_filename = 1;
+-					matched |= grep_dir(cur_file);
++					/* --exclude-dir: a directory named here (not the "." of a bare -r) */
++					if (G.no_dot_slash || !skip_dir(cur_file, 1))
++						matched |= grep_dir(cur_file);
+ 					goto grep_done;
+ 				}
+ 			}
++			if (skip_file(cur_file, 1))
++				continue;
+ 			/* else: fopen(dir) will succeed, but reading won't */
+ 			file = fopen_for_read(cur_file);
+ 			if (file == NULL) {

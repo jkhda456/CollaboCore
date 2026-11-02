@@ -1,0 +1,1216 @@
+diff --git a/findutils/find.c b/findutils/find.c
+index 31c9969..8371dae 100644
+--- a/findutils/find.c
++++ b/findutils/find.c
+@@ -308,6 +308,13 @@
+ //usage:	IF_FEATURE_FIND_DEPTH(
+ //usage:     "\n	-depth		Act on directory *after* traversing it"
+ //usage:	)
++//usage:     "\n	-mount		Same as -xdev"
++//usage:     "\n	-daystart	Time tests after it count from the end of today"
++//usage:	IF_FEATURE_FIND_REGEX(
++//usage:     "\n	-regextype T	The -regex after it: findutils-default (emacs), posix-basic,"
++//usage:     "\n			posix-extended, egrep, ..."
++//usage:	)
++//usage:     "\n	-noleaf -warn -nowarn -ignore_readdir_race: accepted, no effect"
+ //usage:     "\n"
+ //usage:     "\nActions:"
+ //usage:	IF_FEATURE_FIND_PAREN(
+@@ -327,13 +334,19 @@
+ //usage:	)
+ //usage:	IF_FEATURE_FIND_REGEX(
+ //usage:     "\n	-regex PATTERN	Match path to regex PATTERN"
++//usage:     "\n	-iregex PATTERN	Case insensitive -regex"
+ //usage:	)
++//usage:     "\n	-iwholename PAT	Same as -ipath"
++//usage:     "\n	-lname PATTERN	Symlink's target matches PATTERN (-ilname: any case)"
+ //usage:	IF_FEATURE_FIND_TYPE(
+-//usage:     "\n	-type X		File type is X (one of: f,d,l,b,c,s,p)"
++//usage:     "\n	-type X[,Y]...	File type is X (one of: f,d,l,b,c,s,p)"
+ //usage:	)
++//usage:     "\n	-xtype X	-type of a symlink's target (with -L: of the link)"
+ //usage:	IF_FEATURE_FIND_EXECUTABLE(
+ //usage:     "\n	-executable	File is executable"
+ //usage:	)
++//usage:     "\n	-readable	File is readable (-writable: writable)"
++//usage:     "\n	-true -false	Always true, always false"
+ //usage:	IF_FEATURE_FIND_PERM(
+ //usage:     "\n	-perm MASK	At least one mask bit (+MASK), all bits (-MASK),"
+ //usage:     "\n			or exactly MASK bits are set in file's mode"
+@@ -360,7 +373,11 @@
+ //usage:	)
+ //usage:	IF_FEATURE_FIND_NEWER(
+ //usage:     "\n	-newer FILE	mtime is more recent than FILE's"
++//usage:     "\n	-anewer FILE	atime is more recent than FILE's mtime (-cnewer: ctime)"
++//usage:     "\n	-newerXY REF	X time (a,c,m) is more recent than REF's Y time (a,c,m),"
++//usage:     "\n			or than the date REF with Y t: -newermt '2 days ago'"
+ //usage:	)
++//usage:     "\n	-used DAYS	Accessed +N/-N/N days after its status changed"
+ //usage:	IF_FEATURE_FIND_INUM(
+ //usage:     "\n	-inum N		File has inode number N"
+ //usage:	)
+@@ -373,6 +390,9 @@
+ //usage:	IF_FEATURE_FIND_GROUP(
+ //usage:     "\n	-group NAME/ID	File is owned by given group"
+ //usage:	)
++//usage:     "\n	-uid N, -gid N	Owner/group id is N (+N greater, -N less)"
++//usage:     "\n	-nouser		No user has the file's uid (-nogroup: gid)"
++//usage:     "\n	-fstype TYPE	File is on a filesystem of TYPE"
+ //usage:	IF_FEATURE_FIND_SIZE(
+ //usage:     "\n	-size N[bck]	File size is N (c:bytes,k:kbytes,b:512 bytes(def.))"
+ //usage:     "\n			+/-N: file size is bigger/smaller than N"
+@@ -395,6 +415,10 @@
+ //usage:	IF_FEATURE_FIND_PRINT0(
+ //usage:     "\n	-print0		Print file name, NUL terminated"
+ //usage:	)
++//usage:     "\n	-printf FMT	Print FMT, as GNU find: %p %P %f %h %H %d %s %k %b %m %M %u"
++//usage:     "\n			%g %U %G %i %n %l %y %Y %F %S %a %c %t %A@ %Tk ..., \\n \\t \\0"
++//usage:     "\n	-ls		Print as ls -dils"
++//usage:     "\n	-fprint FILE, -fprint0 FILE, -fprintf FILE FMT, -fls FILE: to FILE"
+ //usage:	IF_FEATURE_FIND_EXEC(
+ //usage:     "\n	-exec CMD ARG ;	Run CMD with all instances of {} replaced by"
+ //usage:     "\n			file name. Fails if CMD exits with nonzero"
+@@ -405,6 +429,12 @@
+ //usage:	IF_FEATURE_FIND_EXEC_OK(
+ //usage:     "\n	-ok CMD ARG ;   Prompt and run CMD with {} replaced"
+ //usage:	)
++//usage:	IF_FEATURE_FIND_EXEC(
++//usage:     "\n	-execdir CMD ARG ;|+ Same as -exec, in the file's folder, {} as ./NAME"
++//usage:	)
++//usage:	IF_FEATURE_FIND_EXEC_OK(
++//usage:     "\n	-okdir CMD ARG ; Same as -ok, in the file's folder"
++//usage:	)
+ //usage:	IF_FEATURE_FIND_DELETE(
+ //usage:     "\n	-delete		Delete current file/directory. Turns on -depth option"
+ //usage:	)
+@@ -457,12 +487,12 @@ typedef struct {
+ IF_FEATURE_FIND_PATH(   ACTS(path,  const char *pattern; bool ipath;))
+ IF_FEATURE_FIND_REGEX(  ACTS(regex, regex_t compiled_pattern;))
+ IF_FEATURE_FIND_PRINT0( ACTS(print0))
+-IF_FEATURE_FIND_TYPE(   ACTS(type,  int type_mask;))
++IF_FEATURE_FIND_TYPE(   ACTS(type,  unsigned types;)) /* bit (mode & S_IFMT) >> 12 */
+ IF_FEATURE_FIND_EXECUTABLE(ACTS(executable))
+ IF_FEATURE_FIND_PERM(   ACTS(perm,  char perm_char; mode_t perm_mask;))
+-IF_FEATURE_FIND_MTIME(  ACTS(mtime, unsigned char time_type; unsigned char mtime_char; unsigned mtime_days;))
+-IF_FEATURE_FIND_MMIN(   ACTS(mmin,  unsigned char time_type; unsigned char mmin_char; unsigned mmin_mins;))
+-IF_FEATURE_FIND_NEWER(  ACTS(newer, time_t newer_mtime;))
++IF_FEATURE_FIND_MTIME(  ACTS(mtime, unsigned char time_type; unsigned char mtime_char; unsigned mtime_days; time_t now;))
++IF_FEATURE_FIND_MMIN(   ACTS(mmin,  unsigned char time_type; unsigned char mmin_char; unsigned mmin_mins; time_t now;))
++IF_FEATURE_FIND_NEWER(  ACTS(newer, struct timespec ref; char x;)) /* -newer -anewer -cnewer -newerXY */
+ IF_FEATURE_FIND_INUM(   ACTS(inum,  ino_t inode_num;))
+ IF_FEATURE_FIND_SAMEFILE(ACTS(samefile, ino_t inode_num; dev_t device;))
+ IF_FEATURE_FIND_USER(   ACTS(user,  uid_t uid;))
+@@ -480,6 +510,8 @@ IF_FEATURE_FIND_EXEC(   ACTS(exec,
+ 				IF_FEATURE_FIND_EXEC_OK(
+ 				int ok;		/* -ok */
+ 				)
++				bool dir;	/* -execdir, -okdir: run in the file's folder */
++				char *list_dir;	/* the folder of the files in filelist */
+ 				IF_FEATURE_FIND_EXEC_PLUS(
+ 					/*
+ 					 * filelist is NULL if "exec ;"
+@@ -492,6 +524,26 @@ IF_FEATURE_FIND_EXEC(   ACTS(exec,
+ 				))
+ IF_FEATURE_FIND_GROUP(  ACTS(group, gid_t gid;))
+ IF_FEATURE_FIND_LINKS(  ACTS(links, char links_char; int links_count;))
++/* GNU find's */
++                        ACTS(printf, FILE *out; const char *fmt; char kind;) /* kind: printf, ls, print, print0 */
++                        ACTS(constant, int value;)  /* -true -false */
++                        ACTS(access, int mode;)     /* -readable -writable */
++                        ACTS(lname, const char *pattern; bool icase;)
++                        ACTS(xtype, unsigned types;)
++                        ACTS(id,    char cmp; bool group; unsigned long id;) /* -uid -gid */
++                        ACTS(noid,  bool group;)    /* -nouser -nogroup */
++                        ACTS(used,  char cmp; unsigned days;)
++                        ACTS(fstype, const char *type;)
++
++struct find_out {  /* -fprint FILE and the like: one stream for each FILE */
++	struct find_out *next;
++	const char *name;
++	FILE *fp;
++};
++struct find_mount {
++	dev_t dev;
++	char *type;
++};
+ 
+ struct globals {
+ 	IF_FEATURE_FIND_XDEV(dev_t *xdev_dev;)
+@@ -505,6 +557,16 @@ struct globals {
+ 	smalluint exitstatus;
+ 	recurse_flags_t recurse_flags;
+ 	IF_FEATURE_FIND_EXEC_PLUS(unsigned max_argv_len;)
++	const char *root;          /* the starting point being walked (-printf %H %P) */
++	int depth;                 /* the file's (-printf %d) */
++	time_t now;                /* time tests count back from it, -daystart moves it */
++	smallint regex_type;       /* -regextype: 0 emacs (GNU's default), 1 basic, 2 extended */
++	int cwd_fd;                /* where -execdir comes back to */
++	struct find_out *outs;
++	struct find_mount *mounts;
++	int mounts_n;
++	smallint mounts_read;
++	smallint daystart;
+ } FIX_ALIASING;
+ #define G (*(struct globals*)bb_common_bufsiz1)
+ #define INIT_G() do { \
+@@ -664,7 +726,7 @@ ACTF(regex)
+ #if ENABLE_FEATURE_FIND_TYPE
+ ACTF(type)
+ {
+-	return ((statbuf->st_mode & S_IFMT) == ap->type_mask);
++	return (ap->types >> ((statbuf->st_mode & S_IFMT) >> 12)) & 1;
+ }
+ #endif
+ #if ENABLE_FEATURE_FIND_EXECUTABLE
+@@ -694,7 +756,7 @@ ACTF(perm)
+  || ENABLE_FEATURE_FIND_CTIME \
+  || ENABLE_FEATURE_FIND_MMIN  \
+  || ENABLE_FEATURE_FIND_MTIME
+-static int time_cmp(const struct stat *statbuf, unsigned type_and_char, time_t N_from_user, unsigned unit)
++static int time_cmp(const struct stat *statbuf, unsigned type_and_char, time_t N_from_user, unsigned unit, time_t now)
+ {
+ 	time_t ftime, file_age;
+ 
+@@ -710,7 +772,7 @@ static int time_cmp(const struct stat *statbuf, unsigned type_and_char, time_t N
+ #  endif
+ 	type_and_char &= 0xff;
+ # endif
+-	file_age = time(NULL) - ftime;
++	file_age = now - ftime;
+ 	N_from_user *= unit;
+ 	switch (type_and_char) {
+ 	case '+': return file_age >= N_from_user + unit;
+@@ -729,7 +791,7 @@ ACTF(mtime)
+ 			(ap->time_type << 8) |
+ # endif
+ 				ap->mtime_char,
+-			ap->mtime_days, 24*60*60);
++			ap->mtime_days, 24*60*60, ap->now);
+ }
+ #endif
+ #if ENABLE_FEATURE_FIND_MMIN
+@@ -740,13 +802,15 @@ ACTF(mmin)
+ 			(ap->time_type << 8) |
+ # endif
+ 				ap->mmin_char,
+-			ap->mmin_mins, 60);
++			ap->mmin_mins, 60, ap->now);
+ }
+ #endif
+ #if ENABLE_FEATURE_FIND_NEWER
+ ACTF(newer)
+ {
+-	return (ap->newer_mtime < statbuf->st_mtime);
++	const struct timespec *t = ap->x == 'a' ? &statbuf->st_atim
++		: ap->x == 'c' ? &statbuf->st_ctim : &statbuf->st_mtim;
++	return t->tv_sec > ap->ref.tv_sec || (t->tv_sec == ap->ref.tv_sec && t->tv_nsec > ap->ref.tv_nsec);
+ }
+ #endif
+ #if ENABLE_FEATURE_FIND_INUM
+@@ -763,9 +827,26 @@ ACTF(samefile)
+ }
+ #endif
+ #if ENABLE_FEATURE_FIND_EXEC
++/* -execdir: the folder of fileName to run in, and ./NAME for {} */
++static char *exec_dir_of(const char *fileName, char **name)
++{
++	const char *e = fileName + strlen(fileName), *b;
++
++	while (e > fileName + 1 && e[-1] == '/')
++		e--;
++	b = e;
++	while (b > fileName && b[-1] != '/')
++		b--;
++	*name = xasprintf("./%.*s", (int)(e - b), b);
++	if (b == fileName)
++		return xstrdup(".");
++	return xstrndup(fileName, b - fileName > 1 ? b - fileName - 1 : 1);
++}
++
+ static int do_exec(action_exec *ap, const char *fileName)
+ {
+ 	int i, rc;
++	char *dir = NULL, *name = NULL;
+ # if ENABLE_FEATURE_FIND_EXEC_PLUS
+ 	int size = ap->exec_argc + ap->filelist_idx + 1;
+ # else
+@@ -778,6 +859,15 @@ static int do_exec(action_exec *ap, const char *fileName)
+ # endif
+ 	char **pp = argv;
+ 
++	if (ap->dir) {
++		if (fileName) {
++			dir = exec_dir_of(fileName, &name);
++			fileName = name;
++		} else {
++			dir = ap->list_dir;
++			ap->list_dir = NULL;
++		}
++	}
+ 	for (i = 0; i < ap->exec_argc; i++) {
+ 		const char *arg = ap->exec_argv[i];
+ 
+@@ -826,9 +916,16 @@ static int do_exec(action_exec *ap, const char *fileName)
+ 		}
+ 	}
+ # endif
+-	rc = spawn_and_wait(argv);
+-	if (rc < 0)
+-		bb_simple_perror_msg(argv[0]);
++	if (dir && chdir(dir) != 0) {
++		bb_perror_msg("can't change directory to '%s'", dir);
++		rc = -1;
++	} else {
++		rc = spawn_and_wait(argv);
++		if (rc < 0)
++			bb_simple_perror_msg(argv[0]);
++		if (dir && fchdir(G.cwd_fd) != 0)
++			bb_simple_perror_msg_and_die("can't go back to the starting folder");
++	}
+ 
+ # if ENABLE_FEATURE_FIND_EXEC_OK
+     not_ok:
+@@ -836,6 +933,8 @@ static int do_exec(action_exec *ap, const char *fileName)
+ 	i = 0;
+ 	while (argv[i])
+ 		free(argv[i++]);
++	free(dir);
++	free(name);
+ 	return rc == 0; /* return 1 if exitcode 0 */
+ }
+ ACTF(exec)
+@@ -844,6 +943,21 @@ ACTF(exec)
+ 	if (ap->filelist) {
+ 		int rc;
+ 
++		if (ap->dir) {
++			/* -execdir ... +: one run for the files of a folder in a row */
++			char *name, *dir = exec_dir_of(fileName, &name);
++			rc = 1;
++			if (ap->filelist_idx && strcmp(dir, ap->list_dir) != 0)
++				rc = do_exec(ap, NULL);
++			free(ap->list_dir);
++			ap->list_dir = dir;
++			ap->filelist = xrealloc_vector(ap->filelist, 8, ap->filelist_idx);
++			ap->filelist[ap->filelist_idx++] = name;
++			ap->file_len += strlen(name) + sizeof(char*) + 1;
++			if (ap->file_len >= G.max_argv_len)
++				rc = do_exec(ap, NULL);
++			return rc;
++		}
+ 		ap->filelist = xrealloc_vector(ap->filelist, 8, ap->filelist_idx);
+ 		ap->filelist[ap->filelist_idx++] = xstrdup(fileName);
+ 		ap->file_len += strlen(fileName) + sizeof(char*) + 1;
+@@ -1009,6 +1123,491 @@ ACTF(links)
+ }
+ #endif
+ 
++
++/* -printf, -ls and the like */
++static char type_char(mode_t mode)
++{
++	switch (mode & S_IFMT) {
++	case S_IFREG: return 'f';
++	case S_IFDIR: return 'd';
++	case S_IFLNK: return 'l';
++	case S_IFBLK: return 'b';
++	case S_IFCHR: return 'c';
++	case S_IFIFO: return 'p';
++	case S_IFSOCK: return 's';
++	}
++	return 'U';
++}
++
++static const char *fstype_of(dev_t dev)
++{
++	int i;
++
++	if (!G.mounts_read) {
++		FILE *f = fopen_for_read("/proc/self/mountinfo");
++		char *line;
++
++		G.mounts_read = 1;
++		while (f && (line = xmalloc_fgetline(f)) != NULL) {
++			unsigned maj, min;
++			char *sep = strstr(line, " - ");
++			if (sep && sscanf(line, "%*u %*u %u:%u", &maj, &min) == 2) {
++				char *type = sep + 3;
++				type[strcspn(type, " ")] = '\0';
++				G.mounts = xrealloc_vector(G.mounts, 4, G.mounts_n);
++				G.mounts[G.mounts_n].dev = makedev(maj, min);
++				G.mounts[G.mounts_n++].type = xstrdup(type);
++			}
++			free(line);
++		}
++		if (f)
++			fclose(f);
++	}
++	for (i = G.mounts_n - 1; i >= 0; i--) {
++		if (G.mounts[i].dev == dev)
++			return G.mounts[i].type;
++	}
++	return "unknown";
++}
++
++/* a time as GNU find prints it: kind 0 for %a %c %t ("Mon Nov  2 00:50:21.4811880850 2026"),
++ * '@' for seconds since the epoch, else a strftime conversion; S T X + carry the fraction after
++ * the seconds, ten digits as GNU's */
++static void find_time(char *buf, size_t size, const struct timespec *ts, int kind)
++{
++	struct tm tm;
++	char ns[16];
++
++	sprintf(ns, ".%09ld0", (long)ts->tv_nsec);
++	if (kind == '@' || !localtime_r(&ts->tv_sec, &tm)) {
++		snprintf(buf, size, "%lld%s", (long long)ts->tv_sec, kind == '@' ? ns : "");
++		return;
++	}
++	if (kind == 0) {
++		char a[64], y[16];
++		strftime(a, sizeof(a), "%a %b %e %H:%M:%S", &tm);
++		strftime(y, sizeof(y), "%Y", &tm);
++		snprintf(buf, size, "%s%s %s", a, ns, y);
++	} else {
++		/* '_' keeps an empty expansion (%p in some locales) apart from an error */
++		char fmt[8] = "_%?", a[128], b[128];
++		size_t n, i;
++
++		if (kind == '+')
++			strcpy(fmt, "_%F+%T");
++		else
++			fmt[2] = kind;
++		/* glibc's, which musl's strftime has not */
++		if (kind == 'k' || kind == 'l') {
++			snprintf(buf, size, "%2d", kind == 'k' ? tm.tm_hour : (tm.tm_hour + 11) % 12 + 1);
++			return;
++		}
++		if (kind == 'P') {
++			snprintf(buf, size, "%s", tm.tm_hour < 12 ? "am" : "pm");
++			return;
++		}
++		n = strftime(a, sizeof(a), fmt, &tm);
++		buf[0] = '\0';
++		if (n == 0)
++			return;
++		if (strchr("STX+", kind)) {
++			/* where the seconds are: where a time 11 seconds apart differs */
++			struct tm alt = tm;
++			alt.tm_sec += alt.tm_sec >= 11 ? -11 : 11;
++			strftime(b, sizeof(b), fmt, &alt);
++			for (i = 1; i < n && a[i] == b[i]; i++)
++				continue;
++			if (i + 2 <= n) {
++				snprintf(buf, size, "%.*s%s%s", (int)(i + 1), a + 1, ns, a + i + 2);
++				return;
++			}
++		}
++		snprintf(buf, size, "%s", a + 1);
++	}
++}
++
++static const char find_time_kinds[] ALIGN1 = "aAbBcCdDeFgGhHIjklmMnpPrRsStTuUVwWxXyYzZ+@";
++
++/* a -printf directive at *pf (past the %): its text in buf, or NULL if there is none such */
++static const char *find_directive(char *buf, size_t size, const char **pf,
++		const char *fileName, const struct stat *st, int alt)
++{
++	const char *f = *pf;
++	int c = *f++;
++
++	*pf = f;
++	switch (c) {
++	case '%': return "%";
++	case 'p': return fileName;
++	case 'f': {
++		/* gnulib's base_name: the last component, with one '/' if it has any after it */
++		const char *end = fileName + strlen(fileName), *e = end, *b;
++		while (e > fileName + 1 && e[-1] == '/')
++			e--;
++		b = e;
++		while (b > fileName && b[-1] != '/')
++			b--;
++		if (b == e)
++			return "/";
++		snprintf(buf, size, "%.*s", (int)(e - b + (e < end)), b);
++		return buf;
++	}
++	case 'h': {
++		/* as GNU find 4.10 does it: the trailing '/'s go, but not after a name of one character
++		 * ("w/" gives "w", "ab/" "."), then what is before the last '/' */
++		char *t, *slash;
++		snprintf(buf, size, "%s", fileName);
++		t = buf + strlen(buf) - 1;
++		while (t >= buf && *t == '/')
++			t--;
++		if (buf < t && t[1] == '/')
++			t[1] = '\0';
++		slash = strrchr(buf, '/');
++		if (!slash)
++			return ".";
++		*slash = '\0';
++		return buf;
++	}
++	case 'H': return G.root;
++	case 'P': {
++		const char *p = fileName + strlen(G.root);
++		if (strncmp(fileName, G.root, strlen(G.root)) != 0)
++			return fileName;
++		return *p == '/' ? p + 1 : p;
++	}
++	case 'd': sprintf(buf, "%d", G.depth); return buf;
++	case 'D': sprintf(buf, "%llu", (unsigned long long)st->st_dev); return buf;
++	case 'i': sprintf(buf, "%llu", (unsigned long long)st->st_ino); return buf;
++	case 'n': sprintf(buf, "%lu", (unsigned long)st->st_nlink); return buf;
++	case 's': sprintf(buf, "%lld", (long long)st->st_size); return buf;
++	case 'b': sprintf(buf, "%lld", (long long)st->st_blocks); return buf;
++	case 'k': sprintf(buf, "%lld", (long long)(st->st_blocks + 1) / 2); return buf;
++	case 'm': sprintf(buf, alt ? "%#o" : "%o", (unsigned)(st->st_mode & 07777)); return buf;
++	case 'M': bb_mode_string(buf, st->st_mode); return buf;
++	case 'u': return get_cached_username(st->st_uid);
++	case 'U': sprintf(buf, "%lu", (unsigned long)st->st_uid); return buf;
++	case 'g': return get_cached_groupname(st->st_gid);
++	case 'G': sprintf(buf, "%lu", (unsigned long)st->st_gid); return buf;
++	case 'l': {
++		ssize_t n = S_ISLNK(st->st_mode) ? readlink(fileName, buf, size - 1) : -1;
++		buf[n > 0 ? n : 0] = '\0';
++		return buf;
++	}
++	case 'y': buf[0] = type_char(st->st_mode); buf[1] = '\0'; return buf;
++	case 'Y': {
++		struct stat t;
++		buf[0] = type_char(st->st_mode);
++		if (S_ISLNK(st->st_mode))
++			buf[0] = stat(fileName, &t) == 0 ? type_char(t.st_mode)
++				: errno == ENOENT ? 'N' : errno == ELOOP ? 'L' : '?';
++		buf[1] = '\0';
++		return buf;
++	}
++	case 'F': return fstype_of(st->st_dev);
++	case 'S': {
++		double sparse = st->st_size ? 512.0 * st->st_blocks / st->st_size : st->st_blocks ? 1.0 / 0.0 : 1.0;
++		snprintf(buf, size, "%g", sparse);
++		return buf;
++	}
++	case 'Z': return ""; /* no SELinux here */
++	case 'a': find_time(buf, size, &st->st_atim, 0); return buf;
++	case 'c': find_time(buf, size, &st->st_ctim, 0); return buf;
++	case 't': find_time(buf, size, &st->st_mtim, 0); return buf;
++	case 'A': case 'C': case 'T':
++		if (!*f)
++			return NULL;
++		*pf = f + 1;
++		if (!strchr(find_time_kinds, *f)) {
++			/* GNU prints % and the character */
++			sprintf(buf, "%%%c", *f);
++			return buf;
++		}
++		find_time(buf, size, c == 'A' ? &st->st_atim : c == 'C' ? &st->st_ctim : &st->st_mtim, *f);
++		return buf;
++	}
++	return NULL;
++}
++
++/* -printf FORMAT's warnings, once, as GNU gives them */
++static void find_printf_check(const char *fmt)
++{
++	const char *f;
++
++	for (f = fmt; *f; f++) {
++		if (*f == '\\') {
++			if (!*++f) {
++				bb_simple_error_msg("warning: escape `\\' followed by nothing at all");
++				break;
++			}
++			if (!strchr("abcfnrtv\\01234567", *f))
++				bb_error_msg("warning: unrecognized escape `\\%c'", *f);
++		} else if (*f == '%') {
++			f++;
++			f += strspn(f, "-+ #0123456789.");
++			if (!*f)
++				bb_simple_error_msg_and_die("error: % at end of format string");
++			if (strchr("ACT", *f)) {
++				if (!f[1])
++					bb_error_msg("warning: format directive `%%%c' should be followed by another character", *f);
++				else
++					f++;
++			} else if (!strchr("%pfhHPdDinsbkmMuUgGlyYFSZact", *f)) {
++				bb_error_msg("warning: unrecognized format directive `%%%c'", *f);
++			}
++		}
++	}
++}
++
++static void find_printf(FILE *out, const char *fmt, const char *fileName, const struct stat *st)
++{
++	const char *f = fmt;
++	char buf[PATH_MAX + 64];
++
++	while (*f) {
++		if (*f == '\\') {
++			const char *e = f + 1;
++			int c = *e;
++			if (c >= '0' && c <= '7') {
++				int n = 0, i;
++				for (i = 0; i < 3 && *e >= '0' && *e <= '7'; i++)
++					n = n * 8 + (*e++ - '0');
++				putc(n, out);
++				f = e;
++				continue;
++			}
++			switch (c) {
++			case 'a': c = '\a'; break;
++			case 'b': c = '\b'; break;
++			case 'f': c = '\f'; break;
++			case 'n': c = '\n'; break;
++			case 'r': c = '\r'; break;
++			case 't': c = '\t'; break;
++			case 'v': c = '\v'; break;
++			case '\\': break;
++			case 'c': return; /* no more of this format */
++			case '\0': putc('\\', out); return;
++			default: putc('\\', out); break; /* as it is */
++			}
++			putc(c, out);
++			f = e + 1;
++			continue;
++		}
++		if (*f != '%') {
++			putc(*f++, out);
++			continue;
++		}
++		{
++			/* %[flags][width][.precision]X: flags, width and precision as for a string */
++			const char *start = f++, *val;
++			char spec[32];
++			int n = 0, alt = 0;
++
++			spec[n++] = '%';
++			for (; *f && strchr("-+ #0", *f); f++) {
++				if (*f == '-' && n == 1)
++					spec[n++] = '-';
++				if (*f == '#')
++					alt = 1;
++			}
++			for (; isdigit((unsigned char)*f); f++)
++				if (n < 12) spec[n++] = *f;
++			if (*f == '.') {
++				spec[n++] = *f++;
++				for (; isdigit((unsigned char)*f); f++)
++					if (n < 24) spec[n++] = *f;
++			}
++			spec[n++] = 's';
++			spec[n] = '\0';
++			if (!*f) {
++				putc('%', out);
++				break;
++			}
++			if (*f == '%') {
++				/* GNU: "%%" is %, "%5%" is %5 */
++				fwrite(start, 1, f - start, out);
++				f++;
++				continue;
++			}
++			val = find_directive(buf, sizeof(buf), &f, fileName, st, alt);
++			if (!val)
++				fwrite(start, 1, f - start, out); /* as it is */
++			else
++				fprintf(out, spec, val);
++		}
++	}
++}
++
++static void find_ls(FILE *out, const char *fileName, const struct stat *st)
++{
++	char mode[12], when[64];
++	struct tm tm;
++	time_t now = time(NULL);
++
++	fprintf(out, "%9llu %6llu %s %3lu %-8s %-8s ", (unsigned long long)st->st_ino,
++		(unsigned long long)(st->st_blocks + 1) / 2, bb_mode_string(mode, st->st_mode),
++		(unsigned long)st->st_nlink, get_cached_username(st->st_uid), get_cached_groupname(st->st_gid));
++	if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
++		fprintf(out, "%3u, %3u ", (unsigned)major(st->st_rdev), (unsigned)minor(st->st_rdev));
++	else
++		fprintf(out, "%8lld ", (long long)st->st_size);
++	when[0] = '\0';
++	if (localtime_r(&st->st_mtime, &tm)) {
++		/* recent: the last six months (of 365.2425 days) */
++		int recent = st->st_mtime <= now && st->st_mtime >= now - 31556952 / 2;
++		strftime(when, sizeof(when), recent ? "%b %e %H:%M" : "%b %e  %Y", &tm);
++	}
++	fprintf(out, "%s %s", when, fileName);
++	if (S_ISLNK(st->st_mode)) {
++		char *target = xmalloc_readlink(fileName);
++		fprintf(out, " -> %s", target ? target : "");
++		free(target);
++	}
++	putc('\n', out);
++}
++
++ACTF(printf)
++{
++	if (ap->kind == 'f')
++		find_printf(ap->out, ap->fmt, fileName, statbuf);
++	else if (ap->kind == 'l')
++		find_ls(ap->out, fileName, statbuf);
++	else {
++		fputs(fileName, ap->out);
++		putc(ap->kind == '0' ? '\0' : '\n', ap->out);
++	}
++	return TRUE;
++}
++ACTF(constant)
++{
++	return ap->value;
++}
++ACTF(access)
++{
++	return access(fileName, ap->mode) == 0;
++}
++ACTF(lname)
++{
++	char *target;
++	int r;
++
++	if (!S_ISLNK(statbuf->st_mode))
++		return FALSE;
++	target = xmalloc_readlink(fileName);
++	r = target && fnmatch(ap->pattern, target, ap->icase ? FNM_CASEFOLD : 0) == 0;
++	free(target);
++	return r;
++}
++ACTF(xtype)
++{
++	/* the type -type does not look at: a link's target's, or with -L the link's own */
++	struct stat st;
++	mode_t m = statbuf->st_mode;
++
++	if (G.recurse_flags & ACTION_FOLLOWLINKS) {
++		if (lstat(fileName, &st) == 0)
++			m = st.st_mode;
++	} else if (S_ISLNK(m) && stat(fileName, &st) == 0) {
++		m = st.st_mode;
++	}
++	return (ap->types >> ((m & S_IFMT) >> 12)) & 1;
++}
++ACTF(id)
++{
++	unsigned long v = ap->group ? statbuf->st_gid : statbuf->st_uid;
++	return ap->cmp == '+' ? v > ap->id : ap->cmp == '-' ? v < ap->id : v == ap->id;
++}
++ACTF(noid)
++{
++	return ap->group ? getgrgid(statbuf->st_gid) == NULL : getpwuid(statbuf->st_uid) == NULL;
++}
++ACTF(used)
++{
++	/* as GNU find 4.10 counts it, d = atime - ctime: never when d < 0; N: (N-1) days <= d < N days;
++	 * +N: d > N days; -N: d < N days */
++	double d = (statbuf->st_atim.tv_sec - statbuf->st_ctim.tv_sec)
++		+ (statbuf->st_atim.tv_nsec - statbuf->st_ctim.tv_nsec) / 1e9;
++	double n = (double)ap->days * 86400;
++	if (d < 0)
++		return FALSE;
++	if (ap->cmp == '+')
++		return d > n;
++	if (ap->cmp == '-')
++		return d < n;
++	return d >= n - 86400 && d < n;
++}
++ACTF(fstype)
++{
++	return strcmp(fstype_of(statbuf->st_dev), ap->type) == 0;
++}
++
++static FILE *find_open(const char *name)
++{
++	struct find_out *o;
++
++	if (strcmp(name, "/dev/stdout") == 0)
++		return stdout;
++	if (strcmp(name, "/dev/stderr") == 0)
++		return stderr;
++	for (o = G.outs; o; o = o->next) {
++		if (strcmp(o->name, name) == 0)
++			return o->fp;
++	}
++	o = xzalloc(sizeof(*o));
++	o->name = name;
++	o->fp = xfopen_for_write(name);
++	o->next = G.outs;
++	G.outs = o;
++	return o->fp;
++}
++
++/* GNU find's default -regex syntax, emacs's, as an ERE: \( \) \| group and alternate, ( ) | { }
++ * are themselves */
++static char *emacs_to_ere(const char *s)
++{
++	char *out = xmalloc(strlen(s) * 2 + 1), *o = out;
++
++	while (*s) {
++		if (*s == '\\' && s[1]) {
++			char c = s[1];
++			s += 2;
++			if (c != '(' && c != ')' && c != '|')
++				*o++ = '\\';
++			*o++ = c;
++			continue;
++		}
++		if (*s == '[') {
++			*o++ = *s++;
++			if (*s == '^')
++				*o++ = *s++;
++			if (*s == ']')
++				*o++ = *s++;
++			while (*s && *s != ']') {
++				if (s[0] == '[' && (s[1] == ':' || s[1] == '.' || s[1] == '=')) {
++					char end = s[1];
++					*o++ = *s++;
++					*o++ = *s++;
++					while (*s && !(s[0] == end && s[1] == ']'))
++						*o++ = *s++;
++					if (*s) {
++						*o++ = *s++;
++						*o++ = *s++;
++					}
++				} else {
++					*o++ = *s++;
++				}
++			}
++			if (*s)
++				*o++ = *s++;
++			continue;
++		}
++		if (strchr("(){}|", *s))
++			*o++ = '\\';
++		*o++ = *s++;
++	}
++	*o = '\0';
++	return out;
++}
++
+ static int FAST_FUNC fileAction(
+ 		struct recursive_state *state IF_NOT_FEATURE_FIND_MAXDEPTH(UNUSED_PARAM),
+ 		const char *fileName,
+@@ -1040,6 +1639,7 @@ static int FAST_FUNC fileAction(
+ 		return SKIP; /* stop recursing */
+ #endif
+ 
++	G.depth = state->depth;
+ 	r = exec_actions(G.actions, fileName, statbuf);
+ 	/* Had no explicit -print[0] or -exec? then print */
+ 	if ((r & TRUE) && G.need_print)
+@@ -1064,29 +1664,34 @@ static int FAST_FUNC fileAction(
+ 
+ 
+ #if ENABLE_FEATURE_FIND_TYPE
+-static int find_type(const char *type)
++/* -type and -xtype: one or more of b c d p f l s, with commas between */
++static unsigned find_type(const char *type, const char *opt)
+ {
+-	int mask = 0;
+-
+-	if (*type == 'b')
+-		mask = S_IFBLK;
+-	else if (*type == 'c')
+-		mask = S_IFCHR;
+-	else if (*type == 'd')
+-		mask = S_IFDIR;
+-	else if (*type == 'p')
+-		mask = S_IFIFO;
+-	else if (*type == 'f')
+-		mask = S_IFREG;
+-	else if (*type == 'l')
+-		mask = S_IFLNK;
+-	else if (*type == 's')
+-		mask = S_IFSOCK;
+-
+-	if (mask == 0 || type[1] != '\0')
+-		bb_error_msg_and_die(bb_msg_invalid_arg_to, type, "-type");
+-
+-	return mask;
++	static const char chars[] ALIGN1 = "bcdpfls";
++	static const unsigned short modes[] = { S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFREG, S_IFLNK, S_IFSOCK };
++	unsigned mask = 0;
++	const char *p = type;
++
++	/* GNU's messages */
++	if (!*p)
++		bb_error_msg_and_die("Arguments to %s should contain at least one letter", opt);
++	for (;;) {
++		const char *c = *p ? strchr(chars, *p) : NULL;
++		unsigned bit;
++		if (!c)
++			bb_error_msg_and_die("Unknown argument to %s: %c", opt, *p);
++		bit = 1 << (modes[c - chars] >> 12);
++		if (mask & bit)
++			bb_error_msg_and_die("Duplicate file type '%c' in the argument list to %s.", *p, opt);
++		mask |= bit;
++		if (!p[1])
++			return mask;
++		if (p[1] != ',')
++			bb_error_msg_and_die("Must separate multiple arguments to %s using: ','", opt);
++		if (!p[2])
++			bb_error_msg_and_die("Last file type in list argument to %s is missing, i.e., list is ending on: ','", opt);
++		p += 2;
++	}
+ }
+ #endif
+ 
+@@ -1149,6 +1754,22 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_EXEC(   PARM_exec      ,)
+ 	IF_FEATURE_FIND_EXEC_OK(PARM_ok        ,)
+ 	IF_FEATURE_FIND_EXECUTABLE(PARM_executable,)
++	                        PARM_true      ,
++	                        PARM_false     ,
++	                        PARM_readable  ,
++	                        PARM_writable  ,
++	                        PARM_nouser    ,
++	                        PARM_nogroup   ,
++	                        PARM_ls        ,
++	                        PARM_daystart  ,
++	                        PARM_mount     ,
++	                        PARM_noleaf    ,
++	                        PARM_ignore_race,
++	                        PARM_noignore_race,
++	                        PARM_warn      ,
++	                        PARM_nowarn    ,
++	IF_FEATURE_FIND_EXEC(   PARM_execdir   ,)
++	IF_FEATURE_FIND_EXEC_OK(PARM_okdir     ,)
+ 	IF_FEATURE_FIND_PAREN(  PARM_char_brace,)
+ 	/* All options/actions starting from here require argument */
+ 	                        PARM_name      ,
+@@ -1177,6 +1798,24 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_SIZE(   PARM_size      ,)
+ 	IF_FEATURE_FIND_CONTEXT(PARM_context   ,)
+ 	IF_FEATURE_FIND_LINKS(  PARM_links     ,)
++	                        PARM_printf    ,
++	                        PARM_fprintf   ,
++	                        PARM_fprint    ,
++	                        PARM_fprint0   ,
++	                        PARM_fls       ,
++	IF_FEATURE_FIND_PATH(   PARM_iwholename,)
++	IF_FEATURE_FIND_REGEX(  PARM_iregex    ,)
++	IF_FEATURE_FIND_REGEX(  PARM_regextype ,)
++	                        PARM_lname     ,
++	                        PARM_ilname    ,
++	                        PARM_xtype     ,
++	                        PARM_uid       ,
++	                        PARM_gid       ,
++	                        PARM_used      ,
++	IF_FEATURE_FIND_NEWER(  PARM_anewer    ,)
++	IF_FEATURE_FIND_NEWER(  PARM_cnewer    ,)
++	IF_FEATURE_FIND_NEWER(  PARM_newerXY   ,)
++	                        PARM_fstype    ,
+ 	IF_FEATURE_FIND_MAXDEPTH(OPT_MINDEPTH,OPT_MAXDEPTH,)
+ 	};
+ 
+@@ -1201,6 +1840,22 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_EXEC(   "-exec\0"   )
+ 	IF_FEATURE_FIND_EXEC_OK("-ok\0"     )
+ 	IF_FEATURE_FIND_EXECUTABLE("-executable\0")
++	                        "-true\0"
++	                        "-false\0"
++	                        "-readable\0"
++	                        "-writable\0"
++	                        "-nouser\0"
++	                        "-nogroup\0"
++	                        "-ls\0"
++	                        "-daystart\0"
++	                        "-mount\0"
++	                        "-noleaf\0"
++	                        "-ignore_readdir_race\0"
++	                        "-noignore_readdir_race\0"
++	                        "-warn\0"
++	                        "-nowarn\0"
++	IF_FEATURE_FIND_EXEC(   "-execdir\0")
++	IF_FEATURE_FIND_EXEC_OK("-okdir\0"  )
+ 	IF_FEATURE_FIND_PAREN(  "(\0"       )
+ 	/* All options/actions starting from here require argument */
+ 	                        "-name\0"
+@@ -1227,6 +1882,24 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_SIZE(   "-size\0"   )
+ 	IF_FEATURE_FIND_CONTEXT("-context\0")
+ 	IF_FEATURE_FIND_LINKS(  "-links\0"  )
++	                        "-printf\0"
++	                        "-fprintf\0"
++	                        "-fprint\0"
++	                        "-fprint0\0"
++	                        "-fls\0"
++	IF_FEATURE_FIND_PATH(   "-iwholename\0")
++	IF_FEATURE_FIND_REGEX(  "-iregex\0" )
++	IF_FEATURE_FIND_REGEX(  "-regextype\0")
++	                        "-lname\0"
++	                        "-ilname\0"
++	                        "-xtype\0"
++	                        "-uid\0"
++	                        "-gid\0"
++	                        "-used\0"
++	IF_FEATURE_FIND_NEWER(  "-anewer\0" )
++	IF_FEATURE_FIND_NEWER(  "-cnewer\0" )
++	IF_FEATURE_FIND_NEWER(  "-newerXY\0")
++	                        "-fstype\0"
+ 	IF_FEATURE_FIND_MAXDEPTH("-mindepth\0""-maxdepth\0")
+ 	;
+ 
+@@ -1271,6 +1944,12 @@ static action*** parse_params(char **argv)
+ 		int parm = index_in_strings(params, arg);
+ 		const char *arg1 = argv[1];
+ 
++#if ENABLE_FEATURE_FIND_NEWER
++		/* -newerXY: X, Y one of a B c m, Y also t */
++		if (parm < 0 && strncmp(arg, "-newer", 6) == 0 && arg[6] && arg[7] && !arg[8])
++			parm = PARM_newerXY;
++#endif
++
+ 		dbg("arg:'%s' arg1:'%s' parm:%d PARM_type:%d", arg, arg1, parm, PARM_type);
+ 
+ 		if (parm >= PARM_name) {
+@@ -1293,11 +1972,28 @@ static action*** parse_params(char **argv)
+ 			G.recurse_flags |= ACTION_FOLLOWLINKS | ACTION_DANGLING_OK;
+ 		}
+ #if ENABLE_FEATURE_FIND_XDEV
+-		else if (parm == OPT_XDEV) {
++		else if (parm == OPT_XDEV || parm == PARM_mount) {
+ 			dbg("%d", __LINE__);
+ 			G.xdev_on = 1;
+ 		}
+ #endif
++		else if (parm == PARM_noleaf || parm == PARM_ignore_race || parm == PARM_noignore_race
++		      || parm == PARM_warn || parm == PARM_nowarn
++		) {
++			/* nothing to do here */
++		}
++		else if (parm == PARM_daystart) {
++			/* time tests count from the end of today */
++			struct tm tm;
++			if (!G.daystart) {
++				localtime_r(&G.now, &tm);
++				tm.tm_mday++;
++				tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
++				tm.tm_isdst = -1;
++				G.now = mktime(&tm);
++				G.daystart = 1;
++			}
++		}
+ #if ENABLE_FEATURE_FIND_MAXDEPTH
+ 		else if (parm == OPT_MINDEPTH || parm == OPT_MINDEPTH + 1) {
+ 			dbg("%d", __LINE__);
+@@ -1380,14 +2076,19 @@ static action*** parse_params(char **argv)
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_EXEC
+-		else if (parm == PARM_exec IF_FEATURE_FIND_EXEC_OK(|| parm == PARM_ok)) {
++		else if (parm == PARM_exec IF_FEATURE_FIND_EXEC_OK(|| parm == PARM_ok || parm == PARM_okdir)
++		      || parm == PARM_execdir
++		) {
+ 			int i;
+ 			action_exec *ap;
+ 			IF_FEATURE_FIND_EXEC_PLUS(int all_subst = 0;)
+ 			dbg("%d", __LINE__);
+ 			G.need_print = 0;
+ 			ap = ALLOC_ACTION(exec);
+-			IF_FEATURE_FIND_EXEC_OK(ap->ok = (parm == PARM_ok);)
++			IF_FEATURE_FIND_EXEC_OK(ap->ok = (parm == PARM_ok || parm == PARM_okdir);)
++			ap->dir = (parm == PARM_execdir IF_FEATURE_FIND_EXEC_OK(|| parm == PARM_okdir));
++			if (ap->dir && G.cwd_fd <= 0)
++				G.cwd_fd = xopen(".", O_RDONLY | O_DIRECTORY);
+ 			ap->exec_argv = ++argv; /* first arg after -exec */
+ 			/*ap->exec_argc = 0; - ALLOC_ACTION did it */
+ 			while (1) {
+@@ -1398,7 +2099,7 @@ static action*** parse_params(char **argv)
+ 				// find -exec echo Foo ">{}<" "+"
+ 				// executes "echo Foo FILENAME1 FILENAME2 FILENAME3...".
+ 				if ((argv[0][0] == ';'
+-				     || (argv[0][0] == '+' IF_FEATURE_FIND_EXEC_OK(&& parm != PARM_ok))
++				     || (argv[0][0] == '+' IF_FEATURE_FIND_EXEC_OK(&& parm != PARM_ok && parm != PARM_okdir))
+ 						/* -ok CMD + syntax is not accepted, only with ';' */
+ 				    )
+ 				 && argv[0][1] == '\0'
+@@ -1461,28 +2162,105 @@ static action*** parse_params(char **argv)
+ 			ap->iname = (parm == PARM_iname);
+ 		}
+ #if ENABLE_FEATURE_FIND_PATH
+-		else if (parm == PARM_path IF_DESKTOP(|| parm == PARM_wholename) || parm == PARM_ipath) {
++		else if (parm == PARM_path IF_DESKTOP(|| parm == PARM_wholename) || parm == PARM_ipath
++		      || parm == PARM_iwholename
++		) {
+ 			action_path *ap;
+ 			dbg("%d", __LINE__);
+ 			ap = ALLOC_ACTION(path);
+ 			ap->pattern = arg1;
+-			ap->ipath = (parm == PARM_ipath);
++			ap->ipath = (parm == PARM_ipath || parm == PARM_iwholename);
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_REGEX
+-		else if (parm == PARM_regex) {
++		else if (parm == PARM_regex || parm == PARM_iregex) {
+ 			action_regex *ap;
++			int flags = parm == PARM_iregex ? REG_ICASE : 0;
+ 			dbg("%d", __LINE__);
+ 			ap = ALLOC_ACTION(regex);
+-			xregcomp(&ap->compiled_pattern, arg1, 0 /*cflags*/);
++			if (G.regex_type == 0) {
++				char *ere = emacs_to_ere(arg1);
++				xregcomp(&ap->compiled_pattern, ere, flags | REG_EXTENDED);
++				free(ere);
++			} else {
++				xregcomp(&ap->compiled_pattern, arg1, flags | (G.regex_type == 2 ? REG_EXTENDED : 0));
++			}
++		}
++		else if (parm == PARM_regextype) {
++			static const char types[] ALIGN1 =
++				"findutils-default\0emacs\0"
++				"posix-basic\0ed\0sed\0grep\0posix-minimal-basic\0"
++				"posix-extended\0egrep\0posix-egrep\0awk\0gnu-awk\0posix-awk\0";
++			int t = index_in_strings(types, arg1);
++			if (t < 0)
++				bb_error_msg_and_die("Unknown regular expression type '%s'; valid types are "
++					"'findutils-default', 'ed', 'emacs', 'gnu-awk', 'grep', 'posix-awk', 'awk', "
++					"'posix-basic', 'posix-egrep', 'egrep', 'posix-extended', 'posix-minimal-basic', 'sed'.",
++					arg1);
++			G.regex_type = t < 2 ? 0 : t < 7 ? 1 : 2;
+ 		}
+ #endif
++		else if (parm == PARM_true || parm == PARM_false) {
++			(ALLOC_ACTION(constant))->value = (parm == PARM_true);
++		}
++		else if (parm == PARM_readable || parm == PARM_writable) {
++			(ALLOC_ACTION(access))->mode = (parm == PARM_readable ? R_OK : W_OK);
++		}
++		else if (parm == PARM_nouser || parm == PARM_nogroup) {
++			(ALLOC_ACTION(noid))->group = (parm == PARM_nogroup);
++		}
++		else if (parm == PARM_ls || parm == PARM_printf || parm == PARM_fprintf
++		      || parm == PARM_fprint || parm == PARM_fprint0 || parm == PARM_fls
++		) {
++			action_printf *ap;
++			FILE *out = stdout;
++			const char *fmt = NULL;
++
++			G.need_print = 0;
++			if (parm == PARM_fprintf || parm == PARM_fprint || parm == PARM_fprint0 || parm == PARM_fls)
++				out = find_open(arg1);
++			if (parm == PARM_printf)
++				fmt = arg1;
++			if (parm == PARM_fprintf) {
++				if (!argv[1])
++					bb_error_msg_and_die(bb_msg_requires_arg, arg);
++				fmt = *++argv;
++			}
++			if (fmt)
++				find_printf_check(fmt);
++			ap = ALLOC_ACTION(printf);
++			ap->out = out;
++			ap->fmt = fmt;
++			ap->kind = fmt ? 'f' : (parm == PARM_ls || parm == PARM_fls) ? 'l' : parm == PARM_fprint0 ? '0' : 'p';
++		}
++		else if (parm == PARM_lname || parm == PARM_ilname) {
++			action_lname *ap = ALLOC_ACTION(lname);
++			ap->pattern = arg1;
++			ap->icase = (parm == PARM_ilname);
++		}
++		else if (parm == PARM_xtype) {
++			(ALLOC_ACTION(xtype))->types = find_type(arg1, arg);
++		}
++		else if (parm == PARM_uid || parm == PARM_gid) {
++			action_id *ap = ALLOC_ACTION(id);
++			ap->group = (parm == PARM_gid);
++			ap->cmp = arg1[0];
++			ap->id = xatoul(plus_minus_num(arg1));
++		}
++		else if (parm == PARM_used) {
++			action_used *ap = ALLOC_ACTION(used);
++			ap->cmp = arg1[0];
++			ap->days = xatoul(plus_minus_num(arg1));
++		}
++		else if (parm == PARM_fstype) {
++			(ALLOC_ACTION(fstype))->type = arg1;
++		}
+ #if ENABLE_FEATURE_FIND_TYPE
+ 		else if (parm == PARM_type) {
+ 			action_type *ap;
+ 			ap = ALLOC_ACTION(type);
+-			ap->type_mask = find_type(arg1);
+-			dbg("created:type mask:%x", ap->type_mask);
++			ap->types = find_type(arg1, arg);
++			dbg("created:type mask:%x", ap->types);
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_EXECUTABLE
+@@ -1525,6 +2303,7 @@ static action*** parse_params(char **argv)
+ # endif
+ 			ap->mtime_char = arg1[0];
+ 			ap->mtime_days = xatoul(plus_minus_num(arg1));
++			ap->now = G.now;
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_MMIN
+@@ -1544,16 +2323,35 @@ static action*** parse_params(char **argv)
+ # endif
+ 			ap->mmin_char = arg1[0];
+ 			ap->mmin_mins = xatoul(plus_minus_num(arg1));
++			ap->now = G.now;
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_NEWER
+-		else if (parm == PARM_newer) {
+-			struct stat stat_newer;
++		else if (parm == PARM_newer || parm == PARM_anewer || parm == PARM_cnewer || parm == PARM_newerXY) {
++			/* the file's X time is later than FILE's Y time, or than the date with Y t */
+ 			action_newer *ap;
++			char x = parm == PARM_anewer ? 'a' : parm == PARM_cnewer ? 'c' : 'm', y = 'm';
+ 			dbg("%d", __LINE__);
++			if (parm == PARM_newerXY) {
++				x = arg[6];
++				y = arg[7];
++				if (!strchr("acmB", x) || !strchr("acmBt", y))
++					bb_error_msg_and_die("invalid predicate `%s'", arg);
++				if (x == 'B' || y == 'B')
++					bb_simple_error_msg_and_die("this system does not provide a way to find the birth time of a file");
++			}
+ 			ap = ALLOC_ACTION(newer);
+-			xstat(arg1, &stat_newer);
+-			ap->newer_mtime = stat_newer.st_mtime;
++			ap->x = x;
++			if (y == 't') {
++				struct timespec now;
++				clock_gettime(CLOCK_REALTIME, &now);
++				if (parse_gnu_datetime(arg1, &now, &ap->ref) != 0)
++					bb_error_msg_and_die("I cannot figure out how to interpret '%s' as a date or time", arg1);
++			} else {
++				struct stat stat_newer;
++				xstat(arg1, &stat_newer);
++				ap->ref = y == 'a' ? stat_newer.st_atim : y == 'c' ? stat_newer.st_ctim : stat_newer.st_mtim;
++			}
+ 		}
+ #endif
+ #if ENABLE_FEATURE_FIND_INUM
+@@ -1648,8 +2446,7 @@ static action*** parse_params(char **argv)
+ 		}
+ #endif
+ 		else {
+-			bb_error_msg("unrecognized: %s", arg);
+-			bb_show_usage();
++			bb_error_msg_and_die("unknown predicate `%s'", arg); /* as GNU */
+ 		}
+ 		argv++;
+ 	}
+@@ -1668,6 +2465,7 @@ int find_main(int argc UNUSED_PARAM, char **argv)
+ 	char **past_HLP, *saved;
+ 
+ 	INIT_G();
++	G.now = time(NULL);
+ 
+ 	/* "find -type f" + getopt("+HLP") => disaster.
+ 	 * Need to avoid getopt running into a non-HLP option.
+@@ -1737,6 +2535,7 @@ int find_main(int argc UNUSED_PARAM, char **argv)
+ #endif
+ 
+ 	for (i = 0; argv[i]; i++) {
++		G.root = argv[i];
+ 		if (!recursive_action(argv[i],
+ 				G.recurse_flags,/* flags */
+ 				fileAction,     /* file action */

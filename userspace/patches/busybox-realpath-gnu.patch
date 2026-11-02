@@ -1,0 +1,465 @@
+diff --git a/libbb/xreadlink.c b/libbb/xreadlink.c
+index 2682f69..2a10aea 100644
+--- a/libbb/xreadlink.c
++++ b/libbb/xreadlink.c
+@@ -196,3 +196,186 @@ char* FAST_FUNC xmalloc_realpath_coreutils(char *path)
+ 
+ 	return buf;
+ }
++
++/* GNU's canonicalize_filename_mode, for realpath and readlink -f -e -m. The kind (mode & 3):
++ * CANON_EXISTING: every component must exist; CANON_ALL_BUT_LAST: the last may be missing;
++ * CANON_MISSING: any may be. CANON_NOLINKS: symlinks are not followed, . and .. go as text;
++ * CANON_LOGICAL: .. goes first, as text, then symlinks are followed.
++ * NULL (and errno) if it can't be done. */
++static int more_components(const char *p)
++{
++	while (*p == '/')
++		p++;
++	return *p != '\0';
++}
++
++char* FAST_FUNC xmalloc_canonicalize(const char *name, unsigned mode)
++{
++	unsigned kind = mode & 3;
++	char *res, *pending, *p;
++	int links = 0, e;
++
++	if (!name[0]) {
++		errno = ENOENT;
++		return NULL;
++	}
++	/* res: the path so far, "" for "/" */
++	if (name[0] == '/') {
++		res = xzalloc(1);
++	} else {
++		res = xrealloc_getcwd_or_warn(NULL);
++		if (!res)
++			return NULL;
++		if (strcmp(res, "/") == 0)
++			res[0] = '\0';
++	}
++	pending = xstrdup(name);
++	if (mode & CANON_LOGICAL) {
++		/* "a/../b" is "b", whatever a is */
++		char *full = name[0] == '/' ? xstrdup(name) : xasprintf("%s/%s", res, name);
++		char *out = xzalloc(strlen(full) + 2), *q = full;
++		while (*q) {
++			size_t n;
++			while (*q == '/')
++				q++;
++			n = strcspn(q, "/");
++			if (n == 0)
++				break;
++			if (n == 2 && q[0] == '.' && q[1] == '.') {
++				char *s = strrchr(out, '/');
++				if (s)
++					*s = '\0';
++			} else if (!(n == 1 && q[0] == '.')) {
++				strcat(out, "/");
++				strncat(out, q, n);
++			}
++			q += n;
++		}
++		free(full);
++		free(pending);
++		pending = out[0] ? out : strcpy(xrealloc(out, 2), "/");
++		res[0] = '\0';
++	}
++	p = pending;
++	while (*p) {
++		struct stat st;
++		const char *comp;
++		size_t n;
++
++		while (*p == '/')
++			p++;
++		if (!*p)
++			break;
++		comp = p;
++		n = strcspn(p, "/");
++		p += n;
++		if (n == 1 && comp[0] == '.')
++			continue;
++		if (n == 2 && comp[0] == '.' && comp[1] == '.') {
++			char *s = strrchr(res, '/');
++			if (s)
++				*s = '\0';
++			continue;
++		}
++		res = xrealloc(res, strlen(res) + n + 2);
++		strcat(res, "/");
++		strncat(res, comp, n);
++		if (mode & CANON_NOLINKS) {
++			if (kind == CANON_EXISTING && stat(res, &st) != 0)
++				goto fail;
++			continue;
++		}
++		if (lstat(res, &st) != 0) {
++			if ((errno == ENOENT && kind == CANON_ALL_BUT_LAST && !more_components(p))
++			 || ((errno == ENOENT || errno == ENOTDIR) && kind == CANON_MISSING)
++			) {
++				continue;
++			}
++			goto fail;
++		}
++		if (S_ISLNK(st.st_mode)) {
++			char *target, *rest, *s;
++			if (++links > 40) {
++				errno = ELOOP;
++				goto fail;
++			}
++			target = xmalloc_readlink(res);
++			if (!target)
++				goto fail;
++			/* the link's target, then the rest */
++			rest = xasprintf("%s%s", target, p);
++			if (target[0] == '/') {
++				res[0] = '\0';
++			} else {
++				s = strrchr(res, '/');
++				*s = '\0';
++			}
++			free(target);
++			free(pending);
++			pending = p = rest;
++			continue;
++		}
++		if (!S_ISDIR(st.st_mode) && *p && kind != CANON_MISSING) {
++			/* "file/x", "file/" */
++			errno = ENOTDIR;
++			goto fail;
++		}
++	}
++	free(pending);
++	if (!res[0])
++		res = strcpy(xrealloc(res, 2), "/");
++	return res;
++ fail:
++	e = errno;
++	free(pending);
++	free(res);
++	errno = e;
++	return NULL;
++}
++
++/* path relative to dir, both canonical: "../c", "." */
++char* FAST_FUNC xmalloc_relative_path(const char *path, const char *dir)
++{
++	const char *p = path, *d = dir, *pc = path, *dc = dir;
++	char *out;
++	size_t ups = 0;
++
++	/* the common leading components */
++	for (;;) {
++		size_t pn, dn;
++		while (*p == '/')
++			p++;
++		while (*d == '/')
++			d++;
++		pn = strcspn(p, "/");
++		dn = strcspn(d, "/");
++		if (!pn || pn != dn || strncmp(p, d, pn) != 0)
++			break;
++		p += pn;
++		d += dn;
++		pc = p;
++		dc = d;
++	}
++	for (d = dc; *d; ) {
++		size_t dn;
++		while (*d == '/')
++			d++;
++		dn = strcspn(d, "/");
++		if (dn)
++			ups++;
++		d += dn;
++	}
++	while (*pc == '/')
++		pc++;
++	out = xzalloc(ups * 3 + strlen(pc) + 2);
++	while (ups--)
++		strcat(out, out[0] ? "/.." : "..");
++	if (*pc) {
++		if (out[0])
++			strcat(out, "/");
++		strcat(out, pc);
++	}
++	if (!out[0])
++		strcpy(out, ".");
++	return out;
++}
+diff --git a/include/libbb.h b/include/libbb.h
+index 858ac35..bd823fd 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -593,6 +593,9 @@ DIR *warn_opendir(const char *path) FAST_FUNC;
+ 
+ char *xmalloc_realpath(const char *path) FAST_FUNC RETURNS_MALLOC;
+ char *xmalloc_realpath_coreutils(char *path) FAST_FUNC RETURNS_MALLOC;
++enum { CANON_EXISTING = 0, CANON_ALL_BUT_LAST = 1, CANON_MISSING = 2, CANON_NOLINKS = 4, CANON_LOGICAL = 8 };
++char *xmalloc_canonicalize(const char *name, unsigned mode) FAST_FUNC RETURNS_MALLOC;
++char *xmalloc_relative_path(const char *path, const char *dir) FAST_FUNC RETURNS_MALLOC;
+ char *xmalloc_readlink(const char *path) FAST_FUNC RETURNS_MALLOC;
+ char *xmalloc_readlink_or_warn(const char *path) FAST_FUNC RETURNS_MALLOC;
+ /* !RETURNS_MALLOC: it's a realloc-like function */
+diff --git a/coreutils/realpath.c b/coreutils/realpath.c
+index 22820a7..e7a491c 100644
+--- a/coreutils/realpath.c
++++ b/coreutils/realpath.c
+@@ -21,32 +21,102 @@
+ /* BB_AUDIT SUSv3 N/A -- Apparently a busybox extension. */
+ 
+ //usage:#define realpath_trivial_usage
+-//usage:       "FILE..."
++//usage:       "[-eLmPqsz] [--relative-to DIR] [--relative-base DIR] FILE..."
+ //usage:#define realpath_full_usage "\n\n"
+-//usage:       "Print absolute pathnames of FILEs"
++//usage:       "Print absolute pathnames of FILEs, as GNU realpath\n"
++//usage:     "\n	-e	All components must exist (default: all but the last)"
++//usage:     "\n	-m	No component needs to exist"
++//usage:     "\n	-L	Resolve .. before symlinks (-P: after, the default)"
++//usage:     "\n	-s	Don't expand symlinks (--strip, --no-symlinks)"
++//usage:     "\n	-q	No error messages"
++//usage:     "\n	-z	End each name with NUL"
++//usage:     "\n	--relative-to DIR	Print names relative to DIR"
++//usage:     "\n	--relative-base DIR	Relative names for those under DIR, else absolute"
+ 
+ #include "libbb.h"
+ 
++/* is path under prefix (or prefix itself)? */
++static int path_prefix(const char *prefix, const char *path)
++{
++	size_t n = strlen(prefix);
++	if (strcmp(prefix, "/") == 0)
++		return 1;
++	return strncmp(path, prefix, n) == 0 && (path[n] == '\0' || path[n] == '/');
++}
++
+ int realpath_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int realpath_main(int argc UNUSED_PARAM, char **argv)
+ {
++	enum {
++		OPT_e = 1 << 0, OPT_L = 1 << 1, OPT_m = 1 << 2, OPT_P = 1 << 3,
++		OPT_q = 1 << 4, OPT_s = 1 << 5, OPT_z = 1 << 6,
++	};
++	static const char longopts[] ALIGN1 =
++		"canonicalize-existing\0" No_argument "e"
++		"logical\0"               No_argument "L"
++		"canonicalize-missing\0"  No_argument "m"
++		"physical\0"              No_argument "P"
++		"quiet\0"                 No_argument "q"
++		"strip\0"                 No_argument "s"
++		"no-symlinks\0"           No_argument "s"
++		"zero\0"                  No_argument "z"
++		"relative-to\0"           Required_argument "\xff"
++		"relative-base\0"         Required_argument "\xfe"
++	;
+ 	int retval = EXIT_SUCCESS;
++	char *rel_to = NULL, *rel_base = NULL, *can_to = NULL, *can_base = NULL;
++	unsigned opt, mode;
++
++	opt = getopt32long(argv, "^" "eLmPqsz\xff:\xfe:" "\0" "-1:e--m:m--e:L--P:P--L",
++			longopts, &rel_to, &rel_base);
++	argv += optind;
++	mode = (opt & OPT_e) ? CANON_EXISTING : (opt & OPT_m) ? CANON_MISSING : CANON_ALL_BUT_LAST;
++	if (opt & OPT_s)
++		mode |= CANON_NOLINKS;
++	if (opt & OPT_L)
++		mode |= CANON_LOGICAL;
++	if (opt & OPT_q)
++		logmode = LOGMODE_NONE;
+ 
+-	if (!*++argv) {
+-		bb_show_usage();
++	if (rel_base && !rel_to)
++		rel_to = rel_base;
++	if (rel_to) {
++		can_to = xmalloc_canonicalize(rel_to, mode);
++		if (!can_to)
++			bb_simple_perror_msg_and_die(rel_to);
++	}
++	if (rel_base) {
++		can_base = xmalloc_canonicalize(rel_base, mode);
++		if (!can_base)
++			bb_simple_perror_msg_and_die(rel_base);
++		/* as GNU: DIR out of the base, no name is relative */
++		if (!path_prefix(can_base, can_to)) {
++			free(can_to);
++			can_to = NULL;
++		}
+ 	}
+ 
+ 	do {
+-		/* NOFORK: only one alloc is allowed; must free */
+-		char *resolved_path = xmalloc_realpath_coreutils(*argv);
+-		if (resolved_path != NULL) {
+-			puts(resolved_path);
+-			free(resolved_path);
++		/* NOFORK: must free what it allocates */
++		char *path = xmalloc_canonicalize(*argv, mode);
++		if (path) {
++			char *out = path;
++			if (can_to && (!can_base || path_prefix(can_base, path)))
++				out = xmalloc_relative_path(path, can_to);
++			fputs(out, stdout);
++			putchar((opt & OPT_z) ? '\0' : '\n');
++			if (out != path)
++				free(out);
++			free(path);
+ 		} else {
+ 			retval = EXIT_FAILURE;
+ 			bb_simple_perror_msg(*argv);
+ 		}
+ 	} while (*++argv);
+ 
++	if (ENABLE_FEATURE_CLEAN_UP) {
++		free(can_to);
++		free(can_base);
++	}
+ 	fflush_stdout_and_exit(retval);
+ }
+diff --git a/coreutils/readlink.c b/coreutils/readlink.c
+index 9200f4a..2cc2282 100644
+--- a/coreutils/readlink.c
++++ b/coreutils/readlink.c
+@@ -25,70 +25,94 @@
+ //kbuild:lib-$(CONFIG_READLINK) += readlink.o
+ 
+ //usage:#define readlink_trivial_usage
+-//usage:	IF_FEATURE_READLINK_FOLLOW("[-fnv] ")
++//usage:	IF_FEATURE_READLINK_FOLLOW("[-femnqsvz] ")
+ //usage:	IF_NOT_FEATURE_READLINK_FOLLOW("[-n] ")
+-//usage:	"FILE"
++//usage:	"FILE..."
+ //usage:#define readlink_full_usage "\n\n"
+-//usage:       "Display the value of a symlink" "\n"
++//usage:       "Display the value of a symlink, as GNU readlink" "\n"
+ //usage:     "\n	-n	Don't add newline"
+ //usage:	IF_FEATURE_READLINK_FOLLOW(
+-//usage:     "\n	-f	Canonicalize by following all symlinks"
+-//usage:     "\n	-v	Verbose"
++//usage:     "\n	-f	Canonicalize by following all symlinks (all but the last component exist)"
++//usage:     "\n	-e	... every component exists"
++//usage:     "\n	-m	... without the components having to exist"
++//usage:     "\n	-q,-s	No error messages (the default)"
++//usage:     "\n	-v	Error messages"
++//usage:     "\n	-z	End each name with NUL"
+ //usage:	)
+ 
+ #include "libbb.h"
+ 
+-/*
+- * # readlink --version
+- * readlink (GNU coreutils) 6.10
+- * # readlink --help
+- *   -f, --canonicalize
+- *      canonicalize by following every symlink in
+- *      every component of the given name recursively;
+- *      all but the last component must exist
+- *   -e, --canonicalize-existing
+- *      canonicalize by following every symlink in
+- *      every component of the given name recursively,
+- *      all components must exist
+- *   -m, --canonicalize-missing
+- *      canonicalize by following every symlink in
+- *      every component of the given name recursively,
+- *      without requirements on components existence
+- *   -n, --no-newline              do not output the trailing newline
+- *   -q, --quiet, -s, --silent     suppress most error messages
+- *   -v, --verbose                 report error messages
+- *
+- * bbox supports: -f (partially) -n -v (fully), -q -s (accepts but ignores)
+- * Note: we export the -f flag, but our -f behaves like coreutils' -e.
+- * Unfortunately, there isn't a C lib function we can leverage to get this
+- * behavior which means we'd have to implement the full stack ourselves :(.
+- */
+ 
+ int readlink_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int readlink_main(int argc UNUSED_PARAM, char **argv)
+ {
+-	char *buf;
++	enum {
++		OPT_n = 1 << 0,
++		OPT_f = (1 << 1) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_v = (1 << 2) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_s = (1 << 3) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_q = (1 << 4) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_e = (1 << 5) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_m = (1 << 6) * ENABLE_FEATURE_READLINK_FOLLOW,
++		OPT_z = (1 << 7) * ENABLE_FEATURE_READLINK_FOLLOW,
++	};
++	static const char longopts[] ALIGN1 =
++		"no-newline\0"            No_argument "n"
++		IF_FEATURE_READLINK_FOLLOW(
++		"canonicalize\0"          No_argument "f"
++		"verbose\0"               No_argument "v"
++		"silent\0"                No_argument "s"
++		"quiet\0"                 No_argument "q"
++		"canonicalize-existing\0" No_argument "e"
++		"canonicalize-missing\0"  No_argument "m"
++		"zero\0"                  No_argument "z"
++		)
++	;
+ 	unsigned opt;
++	int status = EXIT_SUCCESS;
++	char end;
+ 
+ 	/* -n must use bit 0 (see printf below) */
+-	opt = getopt32(argv, "^" "n" IF_FEATURE_READLINK_FOLLOW("fvsq")
+-                       "\0" "=1");
++	opt = getopt32long(argv, "^" "n" IF_FEATURE_READLINK_FOLLOW("fvsqemz")
++			"\0" "-1" IF_FEATURE_READLINK_FOLLOW(":f--em:e--fm:m--fe:v--qs:q--v:s--v"),
++			longopts);
++	argv += optind;
+ 
+ 	/* compat: coreutils readlink reports errors silently via exit code */
+-	if (!(opt & 4)) /* not -v */
++	if (!(opt & OPT_v)) /* not -v */
+ 		logmode = LOGMODE_NONE;
+-
+-	/* NOFORK: only one alloc is allowed; must free */
+-	if (opt & 2) { /* -f */
+-		buf = xmalloc_realpath_coreutils(argv[optind]);
+-	} else {
+-		buf = xmalloc_readlink_or_warn(argv[optind]);
++	end = (opt & OPT_z) ? '\0' : '\n';
++	if ((opt & OPT_n) && argv[1]) {
++		/* GNU says so even without -v */
++		smallint saved = logmode;
++		logmode = LOGMODE_STDIO;
++		bb_simple_error_msg("ignoring --no-newline with multiple arguments");
++		logmode = saved;
++		opt &= ~OPT_n;
+ 	}
+ 
+-	if (!buf)
+-		return EXIT_FAILURE;
+-	printf("%s%s", buf, &"\n"[opt & 1]);
+-	free(buf);
++	do {
++		/* NOFORK: must free what it allocates */
++		char *buf;
++		if (opt & (OPT_f | OPT_e | OPT_m)) {
++			buf = xmalloc_canonicalize(*argv,
++				(opt & OPT_e) ? CANON_EXISTING : (opt & OPT_m) ? CANON_MISSING : CANON_ALL_BUT_LAST);
++			if (!buf)
++				bb_simple_perror_msg(*argv);
++		} else {
++			buf = xmalloc_readlink(*argv);
++			if (!buf)
++				bb_simple_perror_msg(*argv); /* "Invalid argument": not a symlink */
++		}
++		if (!buf) {
++			status = EXIT_FAILURE;
++			continue;
++		}
++		fputs(buf, stdout);
++		if (!(opt & OPT_n))
++			putchar(end);
++		free(buf);
++	} while (*++argv);
+ 
+-	fflush_stdout_and_exit_SUCCESS();
++	fflush_stdout_and_exit(status);
+ }

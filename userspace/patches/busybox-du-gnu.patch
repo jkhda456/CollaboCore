@@ -1,0 +1,487 @@
+diff --git a/coreutils/du.c b/coreutils/du.c
+index 4652b63..c12c411 100644
+--- a/coreutils/du.c
++++ b/coreutils/du.c
+@@ -38,23 +38,27 @@
+ /* http://www.opengroup.org/onlinepubs/007904975/utilities/du.html */
+ 
+ //usage:#define du_trivial_usage
+-//usage:       "[-aHLdclsx" IF_FEATURE_HUMAN_READABLE("hm") "k] [FILE]..."
++//usage:       "[-aHLdclsxbhmkS0] [-B SIZE] [-t SIZE] [--exclude PAT] [FILE]..."
+ //usage:#define du_full_usage "\n\n"
+-//usage:       "Summarize disk space used for FILEs (or directories)\n"
+-//usage:     "\n	-a	Show file sizes too"
+-//usage:     "\n	-b	Apparent size (including holes)"
+-//usage:     "\n	-L	Follow all symlinks"
+-//usage:     "\n	-H	Follow symlinks on command line"
+-//usage:     "\n	-d N	Limit output to directories (and files with -a) of depth < N"
+-//usage:     "\n	-c	Show grand total"
+-//usage:     "\n	-l	Count sizes many times if hard linked"
+-//usage:     "\n	-s	Display only a total for each argument"
+-//usage:     "\n	-x	Skip directories on different filesystems"
+-//usage:	IF_FEATURE_HUMAN_READABLE(
+-//usage:     "\n	-h	Sizes in human readable format (e.g., 1K 243M 2G)"
++//usage:       "Summarize disk space used for FILEs (or directories), as GNU du\n"
++//usage:     "\n	-a,--all	Show file sizes too"
++//usage:     "\n	-b,--bytes	Apparent size in bytes (--apparent-size: in the unit)"
++//usage:     "\n	-L,--dereference	Follow all symlinks"
++//usage:     "\n	-H,-D,--dereference-args	Follow symlinks on command line"
++//usage:     "\n	-d,--max-depth N	Limit output to directories (and files with -a) of depth < N"
++//usage:     "\n	-c,--total	Show grand total"
++//usage:     "\n	-l,--count-links	Count sizes many times if hard linked"
++//usage:     "\n	-s,--summarize	Display only a total for each argument"
++//usage:     "\n	-S,--separate-dirs	A directory's size without its subdirectories'"
++//usage:     "\n	-x,--one-file-system	Skip directories on different filesystems"
++//usage:     "\n	-h,--human-readable	Sizes in human readable format (1K 243M 2G), --si: of 1000"
+ //usage:     "\n	-m	Sizes in megabytes"
+-//usage:	)
+ //usage:     "\n	-k	Sizes in kilobytes" IF_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(" (default)")
++//usage:     "\n	-B,--block-size SIZE	Sizes in units of SIZE (1K, M, 1MB...)"
++//usage:     "\n	-t,--threshold SIZE	Leave out entries smaller than SIZE (-SIZE: larger)"
++//usage:     "\n	--exclude PAT	Leave out files matching PAT (-X FILE: those in FILE)"
++//usage:     "\n	--inodes	Count inodes, not space"
++//usage:     "\n	-0,--null	End lines with NUL"
+ //usage:	IF_NOT_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(
+ //usage:     "\n		Default unit is 512 bytes"
+ //usage:	)
+@@ -74,6 +78,7 @@
+ 
+ #include "libbb.h"
+ #include "common_bufsiz.h"
++#include <fnmatch.h>
+ 
+ enum {
+ 	OPT_a_files_too    = (1 << 0),
+@@ -88,65 +93,151 @@ enum {
+ 	OPT_b              = (1 << 9),
+ 	OPT_h_for_humans   = (1 << 10),
+ 	OPT_m_mbytes       = (1 << 11),
++	OPT_D              = (1 << 12),
++	OPT_S_separate     = (1 << 13),
++	OPT_B_blocksize    = (1 << 14),
++	OPT_t_threshold    = (1 << 15),
++	OPT_0_null         = (1 << 16),
++	OPT_X_exclude_from = (1 << 17),
++	OPT_apparent       = (1 << 18),
++	OPT_si             = (1 << 19),
++	OPT_exclude        = (1 << 20),
++	OPT_inodes         = (1 << 21),
+ };
+ 
+ struct globals {
+-#if ENABLE_FEATURE_HUMAN_READABLE
+-	unsigned long disp_unit;
+-#else
+-	unsigned disp_k;
+-#endif
++	unsigned long long unit;   /* sizes are printed in it, rounded up */
++	const char *unit_suffix;   /* -BM: "M" after each size */
++	unsigned human;            /* -h 1024, --si 1000 */
++	long long threshold;
++	llist_t *excludes;
+ 	int max_print_depth;
+ 	bool status;
+ 	int slink_depth;
+ 	int du_depth;
+ 	dev_t dir_dev;
++	bool last_was_dir;
+ } FIX_ALIASING;
+ #define G (*(struct globals*)bb_common_bufsiz1)
+ #define INIT_G() do { setup_common_bufsiz(); } while (0)
+ 
++/* coreutils' human_readable, rounding up: one decimal under 10, "1.0M" rather than "1024K" */
++static void du_human(char *buf, unsigned long long n, unsigned base)
++{
++	static const char sfx_1024[] ALIGN1 = "KMGTPEZY";
++	static const char sfx_1000[] ALIGN1 = "kMGTPEZY";
++	const char *sfx = base == 1000 ? sfx_1000 : sfx_1024;
++	unsigned long long p = 1, q, r;
++	int e = 0;
++
++	while (n / p >= base && e < 8) {
++		p *= base;
++		e++;
++	}
++	if (e == 0) {
++		sprintf(buf, "%llu", n);
++		return;
++	}
++	q = n / p;
++	r = n % p;
++	if (q < 10) {
++		unsigned long long t = (r * 10 + p - 1) / p; /* tenths, rounded up */
++		if (t == 10) {
++			q++;
++			t = 0;
++		}
++		if (q < 10) {
++			sprintf(buf, "%llu.%llu%c", q, t, sfx[e - 1]);
++			return;
++		}
++	} else if (r) {
++		q++;
++	}
++	if (q == base && e < 8) {
++		sprintf(buf, "1.0%c", sfx[e]);
++		return;
++	}
++	sprintf(buf, "%llu%c", q, sfx[e - 1]);
++}
++
++/* SIZE for -B and -t: N[K|M|G][iB|B] or the suffix alone; KB is 1000 */
++static unsigned long long du_size(const char *arg, const char *opt, const char **suffix)
++{
++	static const struct suffix_mult sizes[] ALIGN_SUFFIX = {
++		{ "KiB", 1024ULL }, { "KB", 1000ULL }, { "K", 1024ULL }, { "k", 1024ULL },
++		{ "MiB", 1024ULL * 1024 }, { "MB", 1000ULL * 1000 }, { "M", 1024ULL * 1024 },
++		{ "GiB", 1024ULL * 1024 * 1024 }, { "GB", 1000ULL * 1000 * 1000 }, { "G", 1024ULL * 1024 * 1024 },
++		{ "", 0 }
++	};
++	unsigned long long n;
++	char *num = (char*)arg;
++
++	if (suffix)
++		*suffix = isdigit((unsigned char)arg[0]) ? "" : arg;
++	if (!isdigit((unsigned char)arg[0]))
++		num = xasprintf("1%s", arg);
++	n = xatoull_sfx(num, sizes);
++	if (num != arg)
++		free(num);
++	if (n == 0)
++		bb_error_msg_and_die("invalid %s argument '%s'", opt, arg);
++	return n;
++}
+ 
+ static void print(unsigned long long size, const char *filename)
+ {
+-	/* TODO - May not want to defer error checking here. */
+-#if ENABLE_FEATURE_HUMAN_READABLE
+-# if ENABLE_DESKTOP
+-	/* ~30 bytes of code for extra compat:
+-	 * coreutils' du rounds sizes up:
+-	 * for example,  1025k file is shown as "2" by du -m.
+-	 * We round to nearest if human-readable [too hard to fix],
+-	 * else (fixed scale such as -m), we round up. To that end,
+-	 * add yet another half of the unit before displaying:
+-	 */
+-	if (G.disp_unit)
+-		size += (G.disp_unit-1) / (unsigned)(512 * 2);
+-# endif
+-	printf("%s\t%s\n",
+-			/* size x 512 / G.disp_unit.
+-			 * If G.disp_unit == 0, show one fractional
+-			 * and use suffixes
+-			 */
+-			make_human_readable_str(size, (option_mask32 & OPT_b) ? 1 : 512, G.disp_unit),
+-			filename);
+-#else
+-	if (G.disp_k) {
+-		if (!(option_mask32 & OPT_b)) {
+-			size++;
+-			size >>= 1;
+-		} else {
+-			size >>= 10;
++	char buf[32];
++
++	if (G.threshold > 0 ? size < (unsigned long long)G.threshold
++	 : G.threshold < 0 ? size > (unsigned long long)-G.threshold : 0)
++		return;
++	if (option_mask32 & OPT_inodes)
++		sprintf(buf, "%llu", size);
++	else if (G.human)
++		du_human(buf, size, G.human);
++	else
++		sprintf(buf, "%llu%s", (size + G.unit - 1) / G.unit, G.unit_suffix);
++	printf("%s\t%s%c", buf, filename, (option_mask32 & OPT_0_null) ? '\0' : '\n');
++}
++
++/* --exclude PAT, as GNU du (gnulib's exclude with EXCLUDE_WILDCARDS): PAT against the name and
++ * each tail of it after a '/'; '*' matches '/' too */
++static int excluded(const char *filename)
++{
++	llist_t *l;
++
++	for (l = G.excludes; l; l = l->link) {
++		const char *p = filename;
++		if (fnmatch(l->data, p, 0) == 0)
++			return 1;
++		for (; *p; p++) {
++			if (*p == '/' && p[1] != '/' && fnmatch(l->data, p + 1, 0) == 0)
++				return 1;
+ 		}
+ 	}
+-	printf("%llu\t%s\n", size, filename);
+-#endif
++	return 0;
+ }
+ 
+-/* tiny recursive du */
+-static unsigned long long du(const char *filename)
++static unsigned long long size_of(const struct stat *st)
++{
++	if (option_mask32 & OPT_inodes)
++		return 1;
++	if (option_mask32 & (OPT_b | OPT_apparent)) /* as GNU: a directory's is 0 */
++		return (S_ISREG(st->st_mode) || S_ISLNK(st->st_mode)) ? st->st_size : 0;
++	return (unsigned long long)st->st_blocks * 512;
++}
++
++/* tiny recursive du: the size counted for filename (without its subdirectories' with -S),
++ * and *all its size with them for -c */
++static unsigned long long du(const char *filename, unsigned long long *all)
+ {
+ 	struct stat statbuf;
+ 	unsigned long long sum;
+ 
++	*all = 0;
++	G.last_was_dir = 0;
++	if (G.excludes && excluded(filename))
++		return 0;
+ 	if (lstat(filename, &statbuf) != 0) {
+ 		bb_simple_perror_msg(filename);
+ 		G.status = EXIT_FAILURE;
+@@ -161,8 +252,6 @@ static unsigned long long du(const char *filename)
+ 		}
+ 	}
+ 
+-	sum = ((option_mask32 & OPT_b) ? statbuf.st_size : statbuf.st_blocks);
+-
+ 	if (S_ISLNK(statbuf.st_mode)) {
+ 		if (G.slink_depth > G.du_depth) { /* -H or -L */
+ 			if (stat(filename, &statbuf) != 0) {
+@@ -170,13 +259,13 @@ static unsigned long long du(const char *filename)
+ 				G.status = EXIT_FAILURE;
+ 				return 0;
+ 			}
+-			sum = ((option_mask32 & OPT_b) ? statbuf.st_size : statbuf.st_blocks);
+ 			if (G.slink_depth == 1) {
+ 				/* Convert -H to -L */
+ 				G.slink_depth = INT_MAX;
+ 			}
+ 		}
+ 	}
++	sum = size_of(&statbuf);
+ 
+ 	if (!(option_mask32 & OPT_l_hardlinks)
+ 	 && statbuf.st_nlink > 1
+@@ -188,6 +277,7 @@ static unsigned long long du(const char *filename)
+ 		add_to_ino_dev_hashtable(&statbuf, NULL);
+ 	}
+ 
++	*all = sum;
+ 	if (S_ISDIR(statbuf.st_mode)) {
+ 		DIR *dir;
+ 		struct dirent *entry;
+@@ -196,19 +286,22 @@ static unsigned long long du(const char *filename)
+ 		dir = warn_opendir(filename);
+ 		if (!dir) {
+ 			G.status = EXIT_FAILURE;
+-			return sum;
+-		}
+-
+-		while ((entry = readdir(dir))) {
+-			newfile = concat_subpath_file(filename, entry->d_name);
+-			if (newfile == NULL)
+-				continue;
+-			++G.du_depth;
+-			sum += du(newfile);
+-			--G.du_depth;
+-			free(newfile);
++		} else {
++			while ((entry = readdir(dir))) {
++				unsigned long long s, a;
++				newfile = concat_subpath_file(filename, entry->d_name);
++				if (newfile == NULL)
++					continue;
++				++G.du_depth;
++				s = du(newfile, &a);
++				--G.du_depth;
++				*all += a;
++				if (!(G.last_was_dir && (option_mask32 & OPT_S_separate)))
++					sum += s;
++				free(newfile);
++			}
++			closedir(dir);
+ 		}
+-		closedir(dir);
+ 	} else {
+ 		if (!(option_mask32 & OPT_a_files_too) && G.du_depth != 0)
+ 			return sum;
+@@ -216,27 +309,47 @@ static unsigned long long du(const char *filename)
+ 	if (G.du_depth <= G.max_print_depth) {
+ 		print(sum, filename);
+ 	}
++	G.last_was_dir = S_ISDIR(statbuf.st_mode);
+ 	return sum;
+ }
+ 
+ int du_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int du_main(int argc UNUSED_PARAM, char **argv)
+ {
+-	unsigned long long total;
+-	int slink_depth_save;
++	static const char du_longopts[] ALIGN1 =
++		"all\0"              No_argument       "a"
++		"dereference-args\0" No_argument       "H"
++		"dereference\0"      No_argument       "L"
++		"summarize\0"        No_argument       "s"
++		"one-file-system\0"  No_argument       "x"
++		"max-depth\0"        Required_argument "d"
++		"count-links\0"      No_argument       "l"
++		"total\0"            No_argument       "c"
++		"bytes\0"            No_argument       "b"
++		"human-readable\0"   No_argument       "h"
++		"separate-dirs\0"    No_argument       "S"
++		"block-size\0"       Required_argument "B"
++		"threshold\0"        Required_argument "t"
++		"null\0"             No_argument       "0"
++		"exclude-from\0"     Required_argument "X"
++		"apparent-size\0"    No_argument       "\xff"
++		"si\0"               No_argument       "\xfe"
++		"exclude\0"          Required_argument "\xfd"
++		"inodes\0"           No_argument       "\xfc"
++	;
++	unsigned long long total, all;
++	int slink_depth_save, last_unit = 0;
+ 	unsigned opt;
++	char **a;
++	const char *block_size = NULL, *threshold = NULL, *exclude_from = NULL;
+ 
+ 	INIT_G();
+ 
+-#if ENABLE_FEATURE_HUMAN_READABLE
+-	IF_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.disp_unit = 1024;)
+-	IF_NOT_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.disp_unit = 512;)
++	IF_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.unit = 1024;)
++	IF_NOT_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.unit = 512;)
+ 	if (getenv("POSIXLY_CORRECT"))  /* TODO - a new libbb function? */
+-		G.disp_unit = 512;
+-#else
+-	IF_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.disp_k = 1;)
+-	/* IF_NOT_FEATURE_DU_DEFAULT_BLOCKSIZE_1K(G.disp_k = 0;) - G is pre-zeroed */
+-#endif
++		G.unit = 512;
++	G.unit_suffix = "";
+ 	G.max_print_depth = INT_MAX;
+ 
+ 	/* Note: SUSv3 specifies that -a and -s options cannot be used together
+@@ -245,39 +358,81 @@ int du_main(int argc UNUSED_PARAM, char **argv)
+ 	 * gnu du exits with an error code in this case.  We choose to simply
+ 	 * ignore -a.  This is consistent with -s being equivalent to -d 0.
+ 	 */
+-#if ENABLE_FEATURE_HUMAN_READABLE
+-	opt = getopt32(argv, "^"
+-			"aHkLsxd:+lcbhm"
+-			"\0" "h-km:k-hm:m-hk:H-L:L-H:s-d:d-s",
+-			&G.max_print_depth
++	/* as GNU: of -h --si -k -m -B -b, the one given last says how sizes are printed */
++	for (a = argv + 1; *a && a[0][0] == '-' && a[0][1]; a++) {
++		const char *c = *a + 1;
++		if (*c == '-') {
++			if (!c[1])
++				break;
++			if (strcmp(c, "-human-readable") == 0) last_unit = 'h';
++			else if (strcmp(c, "-si") == 0) last_unit = 's';
++			else if (strcmp(c, "-bytes") == 0) last_unit = 'b';
++			else if (strncmp(c, "-block-size", 11) == 0) {
++				last_unit = 'B';
++				if (!c[11])
++					a++;
++			} else if (strchr(c, '=') == NULL && (strcmp(c, "-max-depth") == 0 || strcmp(c, "-threshold") == 0
++			        || strcmp(c, "-exclude") == 0 || strcmp(c, "-exclude-from") == 0))
++				a++;
++			if (!*a)
++				break;
++			continue;
++		}
++		for (; *c; c++) {
++			if (strchr("hkmb", *c))
++				last_unit = *c;
++			if (strchr("BdtX", *c)) {
++				if (*c == 'B')
++					last_unit = 'B';
++				if (!c[1])
++					a++;
++				break;
++			}
++		}
++		if (!*a)
++			break;
++	}
++	opt = getopt32long(argv, "^"
++			"aHkLsxd:+lcbhmDSB:t:0X:\xff\xfe\xfd:\xfc"
++			"\0" "h-km:k-hm:m-hk:H-L:L-H:s-d:d-s:\xfd::",
++			du_longopts,
++			&G.max_print_depth, &block_size, &threshold, &exclude_from, &G.excludes
+ 	);
+ 	argv += optind;
+-	if (opt & OPT_b) {
+-		G.disp_unit = 1;
++	if (opt & OPT_b)
++		G.unit = 1;
++	if (opt & OPT_k_kbytes)
++		G.unit = 1024;
++	if (opt & OPT_m_mbytes)
++		G.unit = 1024*1024;
++	if (opt & OPT_B_blocksize)
++		G.unit = du_size(block_size, "--block-size", &G.unit_suffix);
++	if (opt & OPT_h_for_humans)
++		G.human = 1024;
++	if (opt & OPT_si)
++		G.human = 1000;
++	switch (last_unit) {
++	case 'h': G.human = 1024; break;
++	case 's': G.human = 1000; break;
++	case 'b': G.human = 0; G.unit = 1; G.unit_suffix = ""; break;
++	case 'k': G.human = 0; G.unit = 1024; G.unit_suffix = ""; break;
++	case 'm': G.human = 0; G.unit = 1024 * 1024; G.unit_suffix = ""; break;
++	case 'B': G.human = 0; G.unit = du_size(block_size, "--block-size", &G.unit_suffix); break;
+ 	}
+-	if (opt & OPT_h_for_humans) {
+-		G.disp_unit = 0;
++	if (opt & OPT_t_threshold) {
++		int neg = threshold[0] == '-';
++		G.threshold = du_size(threshold + neg, "--threshold", NULL);
++		if (neg)
++			G.threshold = -G.threshold;
+ 	}
+-	if (opt & OPT_m_mbytes) {
+-		G.disp_unit = 1024*1024;
+-	}
+-	if (opt & OPT_k_kbytes) {
+-		G.disp_unit = 1024;
+-	}
+-#else
+-	opt = getopt32(argv, "^"
+-			"aHkLsxd:+lcb"
+-			"\0" "H-L:L-H:s-d:d-s",
+-			&G.max_print_depth
+-	);
+-	argv += optind;
+-# if !ENABLE_FEATURE_DU_DEFAULT_BLOCKSIZE_1K
+-	if (opt & OPT_k_kbytes) {
+-		G.disp_k = 1;
++	if (opt & OPT_X_exclude_from) {
++		FILE *f = xfopen_stdin(exclude_from);
++		char *line;
++		while ((line = xmalloc_fgetline(f)) != NULL)
++			llist_add_to_end(&G.excludes, line);
++		fclose_if_not_stdin(f);
+ 	}
+-# endif
+-#endif
+-	if (opt & OPT_H_follow_links) {
++	if (opt & (OPT_H_follow_links | OPT_D)) {
+ 		G.slink_depth = 1;
+ 	}
+ 	if (opt & OPT_L_follow_links) {
+@@ -298,7 +453,8 @@ int du_main(int argc UNUSED_PARAM, char **argv)
+ 	slink_depth_save = G.slink_depth;
+ 	total = 0;
+ 	do {
+-		total += du(*argv);
++		du(*argv, &all);
++		total += all;
+ 		G.slink_depth = slink_depth_save;
+ 	} while (*++argv);
+ 

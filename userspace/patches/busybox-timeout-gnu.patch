@@ -1,0 +1,301 @@
+diff --git a/coreutils/timeout.c b/coreutils/timeout.c
+index 864dcbb..15c8428 100644
+--- a/coreutils/timeout.c
++++ b/coreutils/timeout.c
+@@ -39,111 +39,229 @@
+ //kbuild:lib-$(CONFIG_TIMEOUT) += timeout.o
+ 
+ //usage:#define timeout_trivial_usage
+-//usage:       "[-s SIG] [-k KILL_SECS] SECS PROG ARGS"
++//usage:       "[-s SIG] [-k KILL_SECS] [-fpv] SECS PROG ARGS"
+ //usage:#define timeout_full_usage "\n\n"
+ //usage:       "Run PROG. Send SIG to it if it is not gone in SECS seconds.\n"
+-//usage:       "Default SIG: TERM."
+-//usage:       "If it still exists in KILL_SECS seconds, send KILL.\n"
++//usage:       "Default SIG: TERM. If it still exists in KILL_SECS seconds, send KILL.\n"
++//usage:     "\n	-s SIG	Signal to send (name or number)"
++//usage:     "\n	-k SECS	Send KILL this long after SIG"
++//usage:     "\n	-f	PROG only, not its children (otherwise the whole process group)"
++//usage:     "\n	-p	Exit with PROG's status also when it timed out"
++//usage:     "\n	-v	Tell on stderr which signal is sent"
++//usage:     "\n"
++//usage:     "\nSECS can have a fraction and a suffix: s, m, h, d. 0: no timeout."
++//usage:     "\nExit status, as GNU timeout's: 124 timed out, 125 timeout failed,"
++//usage:     "\n126 PROG cannot be run, 127 not found, 137 KILLed, else PROG's"
+ 
+ #include "libbb.h"
++#include <sched.h> /* CLONE_VM, CLONE_VFORK */
++#include <sys/prctl.h>
+ 
+-static NOINLINE int timeout_wait(duration_t timeout, pid_t pid)
+-{
+-	/* Just sleep(HUGE_NUM); kill(parent) may kill wrong process! */
+-	while (1) {
+-#if ENABLE_FLOAT_DURATION
+-		if (timeout < 1)
+-			sleep_for_duration(timeout);
+-		else
+-#endif
+-			sleep1();
+-		if (--timeout <= 0)
+-			break;
+-		if (kill(pid, 0)) {
+-			/* process is gone */
+-			return EXIT_SUCCESS;
+-		}
+-	}
+-	return EXIT_FAILURE;
+-}
++/* As GNU timeout does: timeout stays the parent, starts PROG in its own process group
++ * (unless -f), waits for it and on timeout signals the group, then exits 124 (or with
++ * 128+9 when KILL was needed). Signals timeout itself gets are passed on to PROG. */
+ 
+ struct child_args {
+-	duration_t timeout;
+-	duration_t kill_timeout;
+-	pid_t parent_pid;
+-	int signo;
++	char **argv;
++	sigset_t *mask;
++	volatile int *failed;
+ };
+ 
+-/* This function runs in the cloned child process */
+-static int watcher_child(void *data)
++/* Runs in the vfork-like clone: back to the caller's signal mask, then PROG */
++static int child_func(void *data)
+ {
+-	struct child_args *args = (struct child_args *)data;
++	struct child_args *a = data;
+ 
+-	/* Sleep, then kill parent if it's still alive */
+-	if (timeout_wait(args->timeout, args->parent_pid) == EXIT_SUCCESS)
+-		return EXIT_SUCCESS;
+-	kill(args->parent_pid, args->signo);
++	signal(SIGTTIN, SIG_DFL);
++	signal(SIGTTOU, SIG_DFL);
++	sigprocmask(SIG_SETMASK, a->mask, NULL);
++	BB_EXECVP(a->argv[0], a->argv);
++	*a->failed = errno ? errno : ENOEXEC;
++	_exit(127);
++}
+ 
+-	if (args->kill_timeout > 0) {
+-		if (timeout_wait(args->kill_timeout, args->parent_pid) == EXIT_SUCCESS)
+-			return EXIT_SUCCESS;
+-		kill(args->parent_pid, SIGKILL);
++static void send_sig(pid_t pid, int sig, int foreground, int verbose, const char *prog)
++{
++	if (verbose)
++		bb_error_msg("sending signal %s to command '%s'", get_signame(sig), prog);
++	kill(pid, sig);
++	if (!foreground) {
++		kill(0, sig);
++		if (sig != SIGKILL && sig != SIGSTOP) {
++			/* our own copy is blocked: take it back so it is not seen as one from outside */
++			sigset_t one;
++			struct timespec zero = { 0, 0 };
++			sigemptyset(&one);
++			sigaddset(&one, sig);
++			sigtimedwait(&one, NULL, &zero);
++		}
++	}
++	if (sig != SIGKILL && sig != SIGCONT) {
++		/* a stopped process would not see it */
++		kill(pid, SIGCONT);
++		if (!foreground)
++			kill(0, SIGCONT);
+ 	}
+-
+-	return EXIT_SUCCESS;
+ }
+ 
+-/* Keep the watcher out of the target's child list.  The short-lived child
+- * creates it and exits; after we reap that child, the watcher is orphaned and
+- * this process can become the requested program. */
+-static int launcher_child(void *data)
++static unsigned long long to_ns(duration_t d)
+ {
+-	xclone(watcher_child, 0, data);
+-	return EXIT_SUCCESS;
++#if ENABLE_FLOAT_DURATION
++	return (unsigned long long)(d * 1e9);
++#else
++	return (unsigned long long)d * 1000000000ULL;
++#endif
+ }
+ 
+ int timeout_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int timeout_main(int argc UNUSED_PARAM, char **argv)
+ {
+-	int signo;
+-	duration_t timeout;
+-	duration_t kill_timeout;
+-	pid_t parent_pid;
+-	pid_t pid;
++	enum {
++		OPT_s = 1 << 0,
++		OPT_k = 1 << 1,
++		OPT_f = 1 << 2,
++		OPT_p = 1 << 3,
++		OPT_v = 1 << 4,
++	};
++#if ENABLE_LONG_OPTS
++	static const char timeout_longopts[] ALIGN1 =
++		"signal\0"          Required_argument "s"
++		"kill-after\0"      Required_argument "k"
++		"foreground\0"      No_argument       "f"
++		"preserve-status\0" No_argument       "p"
++		"verbose\0"         No_argument       "v"
++		;
++#endif
++	static const uint8_t passed_on[] ALIGN1 = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
+ 	const char *opt_s = "TERM";
+ 	char *opt_k = NULL;
++	unsigned opts, k;
++	int signo, status, timed_out = 0, preserve, killed_stage = 0;
++	unsigned long long deadline = 0, kill_after = 0;
++	duration_t timeout;
++	sigset_t block, old;
++	volatile int failed = 0;
+ 	struct child_args args;
++	pid_t pid;
++
++	/* errors of timeout itself: 125 */
++	xfunc_error_retval = 125;
+ 
+ 	/* '+': stop at first non-option */
+-	getopt32(argv, "+s:k:", &opt_s, &opt_k);
++	opts = getopt32long(argv, "+s:k:fpv", timeout_longopts, &opt_s, &opt_k);
+ 	argv += optind;
++	preserve = (opts & OPT_p);
+ 
+ 	signo = get_signum(opt_s);
+ 	if (signo < 0)
+-		bb_error_msg_and_die("unknown signal '%s'", opt_s);
+-
+-	kill_timeout = 0;
++		bb_error_msg_and_die("'%s': invalid signal", opt_s);
+ 	if (opt_k)
+-		kill_timeout = parse_duration_str(opt_k);
+-
++		kill_after = to_ns(parse_duration_str(opt_k));
+ 	if (!argv[0])
+ 		bb_show_usage();
+ 	timeout = parse_duration_str(*argv++);
+ 	if (!argv[0]) /* no PROG? */
+ 		bb_show_usage();
+ 
+-	parent_pid = getpid();
++	if (!(opts & OPT_f)) {
++		setpgid(0, 0);
++		/* not the foreground group of a terminal any more */
++		signal(SIGTTIN, SIG_IGN);
++		signal(SIGTTOU, SIG_IGN);
++	}
++
++	/* the signals we wait for, instead of handling them */
++	sigemptyset(&block);
++	sigaddset(&block, SIGCHLD);
++	sigaddset(&block, SIGALRM);
++	for (k = 0; k < ARRAY_SIZE(passed_on); k++)
++		sigaddset(&block, passed_on[k]);
++	if (signo != SIGKILL && signo != SIGSTOP)
++		sigaddset(&block, signo);
++	sigprocmask(SIG_BLOCK, &block, &old);
+ 
+-	/* Setup args for the child */
+-	args.timeout = timeout;
+-	args.kill_timeout = kill_timeout;
+-	args.parent_pid = parent_pid;
+-	args.signo = signo;
++	args.argv = argv;
++	args.mask = &old;
++	args.failed = &failed;
++	fflush_all();
++	pid = bb_clone(child_func, CLONE_VM | CLONE_VFORK, &args);
++	if (pid < 0)
++		bb_simple_perror_msg_and_die("can't start the command");
++	if (failed) {
++		safe_waitpid(pid, NULL, 0);
++		errno = failed;
++		bb_perror_msg("failed to run command '%s'", argv[0]);
++		return failed == ENOENT ? 127 : 126;
++	}
+ 
+-	pid = xclone(launcher_child, 0, &args);
+-	if (wait4pid(pid) != EXIT_SUCCESS)
+-		return EXIT_FAILURE;
++	if (to_ns(timeout))
++		deadline = monotonic_ns() + to_ns(timeout);
+ 
+-	/* Ok, exec the program as requested */
+-	BB_EXECVP_or_die(argv);
++	for (;;) {
++		struct timespec ts, *tsp = NULL;
++		int sig;
++
++		if (safe_waitpid(pid, &status, WNOHANG) == pid)
++			break;
++		if (deadline) {
++			unsigned long long now = monotonic_ns();
++			if (now >= deadline)
++				goto expired;
++			ts.tv_sec = (deadline - now) / 1000000000ULL;
++			ts.tv_nsec = (deadline - now) % 1000000000ULL;
++			tsp = &ts;
++		}
++		sig = sigtimedwait(&block, NULL, tsp);
++		if (sig < 0) {
++			if (errno == EAGAIN)
++				goto expired;
++			continue; /* EINTR */
++		}
++		if (sig == SIGCHLD || sig == SIGALRM)
++			continue;
++		/* from outside: pass it on, and with -k, KILL follows it */
++		send_sig(pid, sig, opts & OPT_f, 0, argv[0]);
++		if (kill_after && !killed_stage) {
++			killed_stage = 1;
++			signo = SIGKILL;
++			deadline = monotonic_ns() + kill_after;
++		}
++		continue;
++ expired:
++		if (!killed_stage)
++			timed_out = 1;
++		send_sig(pid, signo, opts & OPT_f, opts & OPT_v, argv[0]);
++		if (kill_after && !killed_stage) {
++			killed_stage = 1;
++			signo = SIGKILL;
++			deadline = monotonic_ns() + kill_after;
++		} else
++			deadline = 0;
++	}
++
++	if (WIFSIGNALED(status)) {
++		int sig = WTERMSIG(status);
++		if (WCOREDUMP(status))
++			bb_simple_error_msg("the monitored command dumped core");
++		if (!timed_out) {
++			/* die of the same signal, as PROG did (without a core of our own:
++			 * RLIMIT_CORE does not stop a core_pattern pipe, PR_SET_DUMPABLE does) */
++			struct rlimit rl = { 0, 0 };
++			sigset_t one;
++			setrlimit(RLIMIT_CORE, &rl);
++			prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
++			signal(sig, SIG_DFL);
++			sigemptyset(&one);
++			sigaddset(&one, sig);
++			sigprocmask(SIG_UNBLOCK, &one, NULL);
++			raise(sig);
++		}
++		if (sig == SIGKILL)
++			preserve = 1;
++		status = 128 + sig;
++	} else
++		status = WEXITSTATUS(status);
++	if (timed_out && !preserve)
++		status = 124;
++	return status;
+ }

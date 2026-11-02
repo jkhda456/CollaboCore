@@ -1,0 +1,709 @@
+diff --git a/libbb/time.c b/libbb/time.c
+index f09ef5d..f40b8ad 100644
+--- a/libbb/time.c
++++ b/libbb/time.c
+@@ -359,3 +359,610 @@ unsigned FAST_FUNC monotonic_sec(void)
+ }
+ 
+ #endif
++
++/* The dates GNU's date -d, touch -d and find -newermt take (gnulib's parse-datetime), as it reads
++ * them: "2026-01-02", "2026-01-02T03:04:05.5Z", "Jan 2 2026", "2 Jan", "1/2/2026", "20260102",
++ * "10:00", "3pm", "@1700000000", "Mon Nov  2 01:02:03 UTC 2026", "yesterday", "2 days ago",
++ * "+1 hour", "next monday", "last month", "thursday week", "now + 90 min", zones (UTC, KST,
++ * +09:00, the military letters). A date alone is at midnight; a relative item alone keeps the
++ * time of day; a day name moves forward to that day, at midnight; "ago" turns around the item
++ * before it; year/month/day steps go through mktime ("2026-01-31 + 1 month" is March 3), the
++ * hours and seconds are added after. Returns 0 with *res, -1 if s is not written as such a date,
++ * -2 if it is but names none (February 30, 25:00). */
++enum { GD_YEAR, GD_MONTH, GD_DAY, GD_HOUR, GD_MIN, GD_SEC };
++struct gnu_date {
++	const char *p;
++	int year, month, day, year_digits;
++	int hour, min, sec, meridian;
++	long nsec;
++	int zone;                       /* minutes east of UTC */
++	int day_number, day_ordinal;
++	long rel[6];
++	int last_rel;                   /* the item "ago" turns around, -1: none */
++	long last_rel_n;
++	unsigned char dates, times, days, zones, rels;
++};
++
++static void gd_skip(struct gnu_date *g)
++{
++	for (;;) {
++		if (isspace((unsigned char)*g->p) || *g->p == ',') {
++			g->p++;
++		} else if (*g->p == '(') { /* a comment, as GNU allows */
++			int depth = 0;
++			do {
++				if (*g->p == '(') depth++;
++				else if (*g->p == ')') depth--;
++				g->p++;
++			} while (*g->p && depth);
++		} else {
++			return;
++		}
++	}
++}
++
++static long gd_number(struct gnu_date *g, int *digits)
++{
++	long n = 0;
++	int d = 0;
++	while (isdigit((unsigned char)*g->p)) {
++		if (n < 100000000000L)
++			n = n * 10 + (*g->p - '0');
++		g->p++;
++		d++;
++	}
++	*digits = d;
++	return n;
++}
++
++/* a word, lowercased, without its trailing '.'s; "a.m." is "a.m" */
++static int gd_word(struct gnu_date *g, char *w, int size)
++{
++	int n = 0;
++	while (isalpha((unsigned char)*g->p) || (*g->p == '.' && n && isalpha((unsigned char)g->p[1]))) {
++		if (n < size - 1)
++			w[n++] = tolower((unsigned char)*g->p);
++		g->p++;
++	}
++	while (*g->p == '.')
++		g->p++;
++	w[n] = '\0';
++	return n;
++}
++
++/* 1..12 for a month name or its abbreviation, 0 if w is not one */
++static int gd_month(const char *w)
++{
++	static const char names[] ALIGN1 =
++		"january\0february\0march\0april\0may\0june\0july\0august\0september\0october\0november\0december\0";
++	const char *n = names;
++	int i;
++	for (i = 1; *n; i++, n += strlen(n) + 1) {
++		if (strcmp(w, n) == 0 || (strlen(w) == 3 && strncmp(w, n, 3) == 0))
++			return i;
++	}
++	return strcmp(w, "sept") == 0 ? 9 : 0;
++}
++
++/* 1..7 (Sunday..Saturday) for a day name or its abbreviation, 0 if w is not one */
++static int gd_weekday(const char *w)
++{
++	static const char names[] ALIGN1 = "sunday\0monday\0tuesday\0wednesday\0thursday\0friday\0saturday\0";
++	const char *n = names;
++	int i;
++	for (i = 1; *n; i++, n += strlen(n) + 1) {
++		if (strcmp(w, n) == 0 || (strlen(w) == 3 && strncmp(w, n, 3) == 0))
++			return i;
++	}
++	if (strcmp(w, "tues") == 0) return 3;
++	if (strcmp(w, "wednes") == 0) return 4;
++	if (strcmp(w, "thur") == 0 || strcmp(w, "thurs") == 0) return 5;
++	return 0;
++}
++
++/* a unit of relative time: its field and how many of it, 0 if w is not one */
++static int gd_unit(const char *w, int *field)
++{
++	static const struct { char name[10]; unsigned char field, n; } units[] = {
++		{ "year", GD_YEAR, 1 }, { "month", GD_MONTH, 1 }, { "fortnight", GD_DAY, 14 },
++		{ "week", GD_DAY, 7 }, { "day", GD_DAY, 1 }, { "hour", GD_HOUR, 1 },
++		{ "minute", GD_MIN, 1 }, { "min", GD_MIN, 1 }, { "second", GD_SEC, 1 }, { "sec", GD_SEC, 1 },
++	};
++	int i, len = strlen(w);
++	for (i = 0; i < ARRAY_SIZE(units); i++) {
++		int l = strlen(units[i].name);
++		if (strncmp(w, units[i].name, l) == 0 && (len == l || (len == l + 1 && w[l] == 's'))) {
++			*field = units[i].field;
++			return units[i].n;
++		}
++	}
++	return 0;
++}
++
++/* minutes east of UTC for a zone name, or INT_MIN */
++static int gd_zone(const char *w)
++{
++	static const struct { char name[5]; signed char hours, minutes; } zones[] = {
++		{ "utc", 0, 0 }, { "ut", 0, 0 }, { "gmt", 0, 0 }, { "z", 0, 0 },
++		{ "wet", 0, 0 }, { "west", 1, 0 }, { "bst", 1, 0 }, { "art", -3, 0 }, { "brt", -3, 0 },
++		{ "brst", -2, 0 }, { "nst", -3, -30 }, { "ndt", -2, -30 }, { "ast", -4, 0 }, { "adt", -3, 0 },
++		{ "clt", -4, 0 }, { "clst", -3, 0 }, { "est", -5, 0 }, { "edt", -4, 0 }, { "cst", -6, 0 },
++		{ "cdt", -5, 0 }, { "mst", -7, 0 }, { "mdt", -6, 0 }, { "pst", -8, 0 }, { "pdt", -7, 0 },
++		{ "akst", -9, 0 }, { "akdt", -8, 0 }, { "hst", -10, 0 }, { "hast", -10, 0 }, { "hadt", -9, 0 },
++		{ "sst", -11, 0 }, { "wat", 1, 0 }, { "cet", 1, 0 }, { "cest", 2, 0 }, { "met", 1, 0 },
++		{ "mez", 1, 0 }, { "mest", 2, 0 }, { "mesz", 2, 0 }, { "eet", 2, 0 }, { "eest", 3, 0 },
++		{ "cat", 2, 0 }, { "sast", 2, 0 }, { "eat", 3, 0 }, { "msk", 3, 0 }, { "msd", 4, 0 },
++		{ "ist", 5, 30 }, { "sgt", 8, 0 }, { "kst", 9, 0 }, { "jst", 9, 0 }, { "gst", 10, 0 },
++		{ "nzst", 12, 0 }, { "nzdt", 13, 0 },
++	};
++	int i;
++	for (i = 0; i < ARRAY_SIZE(zones); i++) {
++		if (strcmp(w, zones[i].name) == 0)
++			return zones[i].hours * 60 + zones[i].minutes;
++	}
++	/* the military letters: A-I +1..+9, K-M +10..+12, N-Y -1..-12 */
++	if (w[0] >= 'a' && w[0] <= 'y' && w[0] != 'j' && !w[1]) {
++		int c = w[0];
++		return 60 * (c <= 'i' ? c - 'a' + 1 : c <= 'm' ? c - 'a' : -(c - 'n' + 1));
++	}
++	return INT_MIN;
++}
++
++static void gd_add_rel(struct gnu_date *g, int field, long n)
++{
++	g->rel[field] += n;
++	g->last_rel = field;
++	g->last_rel_n = n;
++	g->rels++;
++}
++
++/* [+-]HH, HHMM or HH:MM after a sign: a zone */
++static int gd_zone_offset(struct gnu_date *g, int sign)
++{
++	int digits, h, m = 0;
++	long n = gd_number(g, &digits);
++	if (digits <= 2) {
++		h = n;
++		if (*g->p == ':' && isdigit((unsigned char)g->p[1])) {
++			g->p++;
++			m = gd_number(g, &digits);
++			if (digits != 2)
++				return -1;
++		}
++	} else if (digits <= 4) {
++		h = n / 100;
++		m = n % 100;
++	} else {
++		return -1;
++	}
++	if (h > 24 || m > 59)
++		return -1;
++	g->zone = sign * (h * 60 + m);
++	g->zones++;
++	return 0;
++}
++
++/* after a number of hours: [:MM[:SS[.frac]]] [am|pm] [zone offset] */
++static int gd_time(struct gnu_date *g, long hour)
++{
++	int digits;
++	const char *save;
++	char w[8];
++
++	g->hour = hour;
++	g->min = g->sec = 0;
++	g->nsec = 0;
++	g->meridian = 0;
++	if (*g->p == ':') {
++		g->p++;
++		g->min = gd_number(g, &digits);
++		if (!digits)
++			return -1;
++		if (*g->p == ':') {
++			g->p++;
++			g->sec = gd_number(g, &digits);
++			if (!digits)
++				return -1;
++			if ((*g->p == '.' || *g->p == ',') && isdigit((unsigned char)g->p[1])) {
++				long scale = 100000000;
++				g->p++;
++				while (isdigit((unsigned char)*g->p)) {
++					g->nsec += (*g->p++ - '0') * scale;
++					scale /= 10;
++				}
++			}
++		}
++	}
++	g->times++;
++	save = g->p;
++	gd_skip(g);
++	if (isalpha((unsigned char)*g->p)) {
++		gd_word(g, w, sizeof(w));
++		if (strcmp(w, "am") == 0 || strcmp(w, "a.m") == 0)
++			g->meridian = 'a';
++		else if (strcmp(w, "pm") == 0 || strcmp(w, "p.m") == 0)
++			g->meridian = 'p';
++		else
++			g->p = save;
++		if (g->meridian)
++			save = g->p;
++	}
++	g->p = save;
++	/* 10:00+09:00, 10:00 -0500, but not 10:00 -1 hour */
++	gd_skip(g);
++	if ((*g->p == '+' || *g->p == '-') && isdigit((unsigned char)g->p[1])) {
++		const char *at = g->p;
++		int sign = *g->p == '-' ? -1 : 1, field;
++		g->p++;
++		gd_number(g, &digits);
++		gd_skip(g);
++		gd_word(g, w, sizeof(w));
++		if (gd_unit(w, &field)) {
++			g->p = save;
++			return 0;
++		}
++		g->p = at + 1;
++		return gd_zone_offset(g, sign);
++	}
++	g->p = save;
++	return 0;
++}
++
++static int gd_year(int y, int digits)
++{
++	if (digits <= 2)
++		y += y < 69 ? 2000 : 1900;
++	return y;
++}
++
++static int gd_number_item(struct gnu_date *g)
++{
++	int digits, d2, field, n;
++	long v = gd_number(g, &digits);
++	const char *save;
++	char w[16];
++
++	if (*g->p == ':')
++		return gd_time(g, v);
++	if (*g->p == '-' && isdigit((unsigned char)g->p[1])) {
++		/* YYYY-MM-DD[THH:MM[:SS]] */
++		g->year = gd_year(v, digits);
++		g->year_digits = digits;
++		g->p++;
++		g->month = gd_number(g, &d2);
++		if (*g->p != '-' || !isdigit((unsigned char)g->p[1]))
++			return -1;
++		g->p++;
++		g->day = gd_number(g, &d2);
++		g->dates++;
++		if ((*g->p == 'T' || *g->p == 't') && isdigit((unsigned char)g->p[1])) {
++			g->p++;
++			v = gd_number(g, &digits);
++			if (*g->p != ':')
++				return -1;
++			return gd_time(g, v);
++		}
++		return 0;
++	}
++	if (*g->p == '-' && isalpha((unsigned char)g->p[1])) {
++		/* D-Mon[-YYYY] */
++		g->p++;
++		gd_word(g, w, sizeof(w));
++		if (!(g->month = gd_month(w)))
++			return -1;
++		g->day = v;
++		g->dates++;
++		if (*g->p == '-' && isdigit((unsigned char)g->p[1])) {
++			g->p++;
++			v = gd_number(g, &digits);
++			g->year = gd_year(v, digits);
++			g->year_digits = digits;
++		}
++		return 0;
++	}
++	if (*g->p == '/') {
++		/* M/D[/Y] or Y/M/D */
++		long b, c;
++		g->p++;
++		b = gd_number(g, &d2);
++		if (!d2)
++			return -1;
++		g->dates++;
++		if (*g->p == '/' && isdigit((unsigned char)g->p[1])) {
++			int d3;
++			g->p++;
++			c = gd_number(g, &d3);
++			if (digits >= 3) {
++				g->year = v; g->year_digits = digits; g->month = b; g->day = c;
++			} else {
++				g->month = v; g->day = b; g->year = gd_year(c, d3); g->year_digits = d3;
++			}
++		} else {
++			g->month = v;
++			g->day = b;
++		}
++		return 0;
++	}
++	save = g->p;
++	gd_skip(g);
++	if (isalpha((unsigned char)*g->p)) {
++		gd_word(g, w, sizeof(w));
++		if (strcmp(w, "am") == 0 || strcmp(w, "pm") == 0 || strcmp(w, "a.m") == 0 || strcmp(w, "p.m") == 0) {
++			g->p = save;
++			gd_time(g, v); /* no ':': the hour, then the meridian */
++			return 0;
++		}
++		if ((n = gd_month(w)) != 0) {
++			/* D Mon [YYYY] */
++			g->day = v;
++			g->month = n;
++			g->dates++;
++			save = g->p;
++			gd_skip(g);
++			if (isdigit((unsigned char)*g->p)) {
++				v = gd_number(g, &digits);
++				if (*g->p == ':') {
++					g->p = save;
++				} else {
++					g->year = gd_year(v, digits);
++					g->year_digits = digits;
++				}
++			} else {
++				g->p = save;
++			}
++			return 0;
++		}
++		if ((n = gd_unit(w, &field)) != 0) {
++			gd_add_rel(g, field, v * n);
++			return 0;
++		}
++	}
++	g->p = save;
++	/* a number by itself, as GNU takes it: the year after a date, YYYYMMDD, or HHMM */
++	if (g->dates && !g->year_digits && !g->rels && (g->times || digits > 2)) {
++		g->year = gd_year(v, digits);
++		g->year_digits = digits;
++	} else if (digits > 8) {
++		return -1; /* not GNU's: busybox's own [[CC]YY]MMDDhhmm, for the callers */
++	} else if (digits > 4) {
++		g->day = v % 100;
++		g->month = v / 100 % 100;
++		g->year = v / 10000;
++		g->year_digits = digits - 4;
++		g->dates++;
++	} else {
++		g->hour = digits > 2 ? v / 100 : v;
++		g->min = digits > 2 ? v % 100 : 0;
++		g->sec = 0;
++		g->nsec = 0;
++		g->meridian = 0;
++		g->times++;
++	}
++	return 0;
++}
++
++static int gd_word_item(struct gnu_date *g)
++{
++	static const char ordinals[] ALIGN1 =
++		"last\0this\0next\0first\0third\0fourth\0fifth\0sixth\0seventh\0eighth\0ninth\0tenth\0eleventh\0twelfth\0";
++	static const signed char ordinal_n[] = { -1, 0, 1, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++	char w[16];
++	int n, field, z, i;
++
++	gd_word(g, w, sizeof(w));
++	if ((n = gd_month(w)) != 0) {
++		/* Mon D[,] [YYYY] */
++		int digits;
++		const char *save;
++		g->month = n;
++		gd_skip(g);
++		if (!isdigit((unsigned char)*g->p))
++			return -1;
++		g->day = gd_number(g, &digits);
++		g->dates++;
++		save = g->p;
++		gd_skip(g);
++		if (isdigit((unsigned char)*g->p)) {
++			long v = gd_number(g, &digits);
++			if (*g->p == ':' || isalpha((unsigned char)*g->p)) {
++				g->p = save;
++			} else {
++				g->year = gd_year(v, digits);
++				g->year_digits = digits;
++			}
++		} else {
++			g->p = save;
++		}
++		return 0;
++	}
++	if ((n = gd_weekday(w)) != 0) {
++		g->day_number = n - 1;
++		g->day_ordinal = 0;
++		g->days++;
++		return 0;
++	}
++	if ((n = gd_unit(w, &field)) != 0) {
++		gd_add_rel(g, field, n);
++		return 0;
++	}
++	i = index_in_strings(ordinals, w);
++	if (i >= 0) {
++		int o = ordinal_n[i];
++		gd_skip(g);
++		gd_word(g, w, sizeof(w));
++		if ((n = gd_weekday(w)) != 0) {
++			g->day_number = n - 1;
++			g->day_ordinal = o;
++			g->days++;
++			return 0;
++		}
++		if ((n = gd_unit(w, &field)) != 0) {
++			gd_add_rel(g, field, (long)o * n);
++			return 0;
++		}
++		return -1;
++	}
++	if (strcmp(w, "ago") == 0) {
++		if (g->last_rel < 0)
++			return -1;
++		g->rel[g->last_rel] -= 2 * g->last_rel_n;
++		g->last_rel = -1;
++		return 0;
++	}
++	if (strcmp(w, "now") == 0 || strcmp(w, "today") == 0) {
++		g->rels++;
++		g->last_rel = -1;
++		return 0;
++	}
++	if (strcmp(w, "tomorrow") == 0 || strcmp(w, "yesterday") == 0) {
++		gd_add_rel(g, GD_DAY, w[0] == 't' ? 1 : -1);
++		g->last_rel = -1;
++		return 0;
++	}
++	z = gd_zone(w);
++	if (z != INT_MIN) {
++		g->zone = z;
++		g->zones++;
++		/* UTC+9, GMT-05:00 */
++		if ((*g->p == '+' || *g->p == '-') && isdigit((unsigned char)g->p[1])) {
++			int sign = *g->p++ == '-' ? -1 : 1;
++			if (gd_zone_offset(g, sign) != 0)
++				return -1;
++			g->zone += z;
++			g->zones--;
++		}
++		return 0;
++	}
++	return -1;
++}
++
++int FAST_FUNC parse_gnu_datetime(const char *s, const struct timespec *now, struct timespec *res)
++{
++	struct gnu_date g;
++	struct tm tm, want;
++	time_t t;
++	long nsec;
++
++	memset(&g, 0, sizeof(g));
++	g.p = s;
++	g.last_rel = -1;
++	gd_skip(&g);
++	if (*g.p == '@') {
++		/* @SECONDS[.frac]: that moment, and nothing else */
++		int digits, sign = 1;
++		long scale = 100000000;
++		g.p++;
++		if (*g.p == '-' || *g.p == '+')
++			sign = *g.p++ == '-' ? -1 : 1;
++		res->tv_sec = sign * gd_number(&g, &digits);
++		res->tv_nsec = 0;
++		if (!digits)
++			return -1;
++		if ((*g.p == '.' || *g.p == ',') && isdigit((unsigned char)g.p[1])) {
++			g.p++;
++			while (isdigit((unsigned char)*g.p)) {
++				res->tv_nsec += (*g.p++ - '0') * scale;
++				scale /= 10;
++			}
++		}
++		gd_skip(&g);
++		return *g.p ? -1 : 0;
++	}
++	while (*g.p) {
++		unsigned char c = *g.p;
++		if (isdigit(c)) {
++			if (gd_number_item(&g) != 0)
++				return -1;
++		} else if (c == '+' || c == '-') {
++			/* +N UNIT, -N UNIT; a zone after a time */
++			int sign = c == '-' ? -1 : 1, digits, field, n;
++			const char *at;
++			long v;
++			char w[16];
++			g.p++;
++			while (isspace((unsigned char)*g.p))
++				g.p++;
++			if (!isdigit((unsigned char)*g.p))
++				return -1;
++			at = g.p;
++			v = gd_number(&g, &digits);
++			gd_skip(&g);
++			gd_word(&g, w, sizeof(w));
++			if ((n = gd_unit(w, &field)) != 0) {
++				gd_add_rel(&g, field, sign * v * n);
++			} else if (g.times || g.dates) {
++				g.p = at;
++				if (gd_zone_offset(&g, sign) != 0)
++					return -1;
++			} else {
++				return -1;
++			}
++		} else if (isalpha(c)) {
++			if (gd_word_item(&g) != 0)
++				return -1;
++		} else {
++			return -1;
++		}
++		gd_skip(&g);
++	}
++	if (g.dates > 1 || g.times > 1 || g.days > 1 || g.zones > 1)
++		return -1;
++
++	localtime_r(&now->tv_sec, &tm);
++	nsec = now->tv_nsec;
++	if (g.dates) {
++		if (g.year_digits)
++			tm.tm_year = g.year - 1900;
++		tm.tm_mon = g.month - 1;
++		tm.tm_mday = g.day;
++		if (g.month < 1 || g.month > 12 || g.day < 1 || g.day > 31)
++			return -2;
++	}
++	if (g.times) {
++		if (g.meridian) {
++			if (g.hour < 1 || g.hour > 12)
++				return -2;
++			g.hour = g.hour % 12 + (g.meridian == 'p' ? 12 : 0);
++		}
++		if (g.hour > 23 || g.min > 59 || g.sec > 60)
++			return -2;
++		tm.tm_hour = g.hour;
++		tm.tm_min = g.min;
++		tm.tm_sec = g.sec;
++		nsec = g.nsec;
++	} else if (!(g.rels && !g.dates && !g.days)) {
++		tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
++		nsec = 0;
++	}
++	/* as GNU: with nothing but relative items, the DST of now stays (so "yesterday" is 24 hours
++	 * back across a DST change) */
++	if (g.dates || g.days || g.times || !g.rels)
++		tm.tm_isdst = -1;
++	want = tm;
++#define GD_MKTIME(tm) (g.zones ? timegm(&(tm)) - g.zone * 60 : mktime(&(tm)))
++	t = GD_MKTIME(tm);
++	if (g.dates && (tm.tm_mday != want.tm_mday || tm.tm_mon != want.tm_mon || tm.tm_year != want.tm_year))
++		return -2; /* February 30 */
++	if (g.days && !g.dates) {
++		tm.tm_mday += (g.day_number - tm.tm_wday + 7) % 7
++			+ 7 * (g.day_ordinal - (0 < g.day_ordinal && tm.tm_wday != g.day_number));
++		tm.tm_isdst = -1;
++		t = GD_MKTIME(tm);
++	}
++	if (g.rel[GD_YEAR] || g.rel[GD_MONTH] || g.rel[GD_DAY]) {
++		tm.tm_year += g.rel[GD_YEAR];
++		tm.tm_mon += g.rel[GD_MONTH];
++		tm.tm_mday += g.rel[GD_DAY];
++		tm.tm_hour = want.tm_hour;
++		tm.tm_min = want.tm_min;
++		tm.tm_sec = want.tm_sec;
++		tm.tm_isdst = want.tm_isdst;
++		t = GD_MKTIME(tm);
++	}
++#undef GD_MKTIME
++	if (t == (time_t)-1 && !(tm.tm_year == 69 && tm.tm_mon == 11 && tm.tm_mday == 31))
++		return -2;
++	res->tv_sec = t + g.rel[GD_HOUR] * 3600 + g.rel[GD_MIN] * 60 + g.rel[GD_SEC];
++	res->tv_nsec = nsec;
++	return 0;
++}
+diff --git a/include/libbb.h b/include/libbb.h
+index 35b633f..cb8e139 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -739,6 +739,7 @@ struct BUG_too_small {
+ 
+ int parse_datestr(const char *date_str, struct tm *ptm) FAST_FUNC;
+ time_t validate_tm_time(const char *date_str, struct tm *ptm) FAST_FUNC;
++int parse_gnu_datetime(const char *s, const struct timespec *now, struct timespec *res) FAST_FUNC;
+ char *strftime_HHMMSS(char *buf, unsigned len, time_t *tp) FAST_FUNC;
+ char *strftime_YYYYMMDDHHMMSS(char *buf, unsigned len, time_t *tp) FAST_FUNC;
+ void xgettimeofday(struct timeval *tv) FAST_FUNC;
+diff --git a/coreutils/date.c b/coreutils/date.c
+index 3a89b6c..e15bdb8 100644
+--- a/coreutils/date.c
++++ b/coreutils/date.c
+@@ -172,6 +172,7 @@ int date_main(int argc UNUSED_PARAM, char **argv)
+ 	char *fmt_str2dt;
+ 	char *filename;
+ 	char *isofmt_arg = NULL;
++	unsigned gnu;
+ 
+ 	opt = getopt32long(argv, "^"
+ 			"Rs:ud:r:"
+@@ -204,6 +205,8 @@ int date_main(int argc UNUSED_PARAM, char **argv)
+ 		fmt_dt2str = &argv[0][1]; /* skip over the '+' */
+ 		argv++;
+ 	}
++	/* -d and -s take what GNU date takes (parse_gnu_datetime); DATE as an operand is MMDDhhmm */
++	gnu = opt & (OPT_SET | OPT_DATE);
+ 	if (!(opt & (OPT_SET | OPT_DATE))) { /* neither -s TIME nor -d TIME? */
+ 		opt |= OPT_SET;
+ 		date_str = argv[0]; /* can be NULL */
+@@ -265,6 +268,16 @@ int date_main(int argc UNUSED_PARAM, char **argv)
+ 	localtime_r(&ts.tv_sec, &tm_time);
+ 
+ 	/* If date string is given, update tm_time, and maybe set date */
++	if (date_str != NULL && gnu && !(ENABLE_FEATURE_DATE_ISOFMT && (opt & OPT_STR2DT))
++	 && (gnu = parse_gnu_datetime(date_str, &ts, &ts) + 1) != 0 /* -1: not GNU's grammar */
++	) {
++		if (gnu != 1) /* February 30 */
++			bb_error_msg_and_die(bb_msg_invalid_date, date_str);
++		localtime_r(&ts.tv_sec, &tm_time);
++		if ((opt & OPT_SET) && clock_settime(CLOCK_REALTIME, &ts) < 0) {
++			bb_simple_perror_msg("can't set date");
++		}
++	} else
+ 	if (date_str != NULL) {
+ 		int check_dst = 1;
+ 		/* Zero out fields - take her back to midnight! */
+diff --git a/coreutils/touch.c b/coreutils/touch.c
+index ced596c..068f9fc 100644
+--- a/coreutils/touch.c
++++ b/coreutils/touch.c
+@@ -144,17 +144,30 @@ int touch_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 		//memset(&tm_time, 0, sizeof(tm_time));
+ 		/* Better than memset: makes "HH:MM" dates meaningful */
+-		time(&t);
+-		localtime_r(&t, &tm_time);
+-		check_dst = parse_datestr(date_str, &tm_time);
++		struct timespec now, ts;
++		int r;
+ 
+-		/* Correct any day of week and day of year etc. fields */
+-		if (check_dst)
+-			tm_time.tm_isdst = -1;  /* recheck dst unless date is UTC */
+-		t = validate_tm_time(date_str, &tm_time);
++		clock_gettime(CLOCK_REALTIME, &now);
++		/* -d DATE: what GNU touch -d takes; -t: [[CC]YY]MMDDhhmm[.ss] */
++		r = (opts & OPT_d) ? parse_gnu_datetime(date_str, &now, &ts) : -1;
+ 
+-		timebuf[1].tv_sec = timebuf[0].tv_sec = t;
+-		timebuf[1].tv_nsec = timebuf[0].tv_nsec = 0;
++		if (r == -2) /* February 30 */
++			bb_error_msg_and_die("invalid date format '%s'", date_str);
++		if (r == 0) {
++			timebuf[1] = timebuf[0] = ts;
++		} else {
++			t = now.tv_sec;
++			localtime_r(&t, &tm_time);
++			check_dst = parse_datestr(date_str, &tm_time);
++
++			/* Correct any day of week and day of year etc. fields */
++			if (check_dst)
++				tm_time.tm_isdst = -1;  /* recheck dst unless date is UTC */
++			t = validate_tm_time(date_str, &tm_time);
++
++			timebuf[1].tv_sec = timebuf[0].tv_sec = t;
++			timebuf[1].tv_nsec = timebuf[0].tv_nsec = 0;
++		}
+ 	}
+ 	/* If both -a and -m specified, both times should be set.
+ 	 * IOW: set OMIT only if one, not both, of them is given!

@@ -1,0 +1,891 @@
+diff --git a/libbb/copy_file.c b/libbb/copy_file.c
+index 044bc3c..5836390 100644
+--- a/libbb/copy_file.c
++++ b/libbb/copy_file.c
+@@ -20,6 +20,8 @@
+ // This is strange, but POSIX-correct.
+ // coreutils cp has --remove-destination to override this...
+ 
++struct copy_file_gnu copy_file_gnu;
++
+ /* Called if open of destination, link creation etc fails.
+  * errno must be set to relevant value ("why we cannot create dest?")
+  * to give reasonable error message */
+@@ -49,7 +51,7 @@ static int ask_and_unlink(const char *dest, int flags)
+ 		// Or else we will end up having 3 open()s!
+ 		fprintf(stderr, "%s: overwrite '%s'? ", applet_name, dest);
+ 		if (!bb_ask_y_confirmation())
+-			return 0; /* not allowed to overwrite */
++			return -1; /* not allowed to overwrite: as GNU, a failure, said nothing of */
+ 	}
+ 	if (unlink(dest) < 0) {
+ #if ENABLE_FEATURE_VERBOSE_CP_MESSAGE
+@@ -86,6 +88,9 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 	smallint retval = 0;
+ 	smallint dest_exists = 0;
+ 	smallint ovr;
++	char *backup = NULL;
++	unsigned preserve = (copy_file_gnu.preserve ? copy_file_gnu.preserve
++		: COPY_PRESERVE_MODE | COPY_PRESERVE_OWNER | COPY_PRESERVE_TIMES) & ~copy_file_gnu.no_preserve;
+ 
+ /* Inverse of cp -d ("cp without -d") */
+ #define FLAGS_DEREF (flags & (FILEUTILS_DEREFERENCE + FILEUTILS_DEREFERENCE_L0))
+@@ -111,7 +116,18 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			bb_error_msg("'%s' and '%s' are the same file", source, dest);
+ 			return -1;
+ 		}
+-		if (flags & FILEUTILS_NO_OVERWRITE) /* cp -n */
++		/* "cp a link_to_a" would write through the link: a would be emptied */
++		if (S_ISLNK(dest_stat.st_mode) && S_ISREG(source_stat.st_mode)
++		 && !(flags & (FILEUTILS_RMDEST | FILEUTILS_MAKE_SOFTLINK | FILEUTILS_MAKE_HARDLINK))
++		) {
++			struct stat st;
++			if (stat(dest, &st) == 0 && st.st_dev == source_stat.st_dev && st.st_ino == source_stat.st_ino) {
++				bb_error_msg("'%s' and '%s' are the same file", source, dest);
++				return -1;
++			}
++		}
++		/* cp -n: but into a folder there is, as GNU */
++		if ((flags & FILEUTILS_NO_OVERWRITE) && !(S_ISDIR(source_stat.st_mode) && S_ISDIR(dest_stat.st_mode)))
+ 			return 0;
+ 		dest_exists = 1;
+ 	}
+@@ -141,7 +157,7 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 		mode_t saved_umask = 0;
+ 
+ 		if (!(flags & FILEUTILS_RECUR)) {
+-			bb_error_msg("omitting directory '%s'", source);
++			bb_error_msg("-r not specified; omitting directory '%s'", source);
+ 			return -1;
+ 		}
+ 
+@@ -167,8 +183,10 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			saved_umask = umask(0);
+ 
+ 			mode = source_stat.st_mode;
+-			if (!(flags & FILEUTILS_PRESERVE_STATUS))
++			if (!(flags & FILEUTILS_PRESERVE_STATUS) || !(preserve & COPY_PRESERVE_MODE))
+ 				mode = source_stat.st_mode & ~saved_umask;
++			if (copy_file_gnu.no_preserve & COPY_PRESERVE_MODE)
++				mode = 0777 & ~saved_umask;
+ 			/* Allow owner to access new dir (at least for now) */
+ 			mode |= S_IRWXU;
+ 			if (mkdir(dest, mode) < 0) {
+@@ -186,6 +204,13 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 		/* remember (dev,inode) of each created dir.
+ 		 * NULL: name is not remembered */
+ 		add_to_ino_dev_hashtable(&dest_stat, NULL);
++		/* as GNU: a folder made is told of before what is in it */
++		if ((flags & FILEUTILS_VERBOSE) && !dest_exists)
++			printf("'%s' -> '%s'\n", source, dest);
++
++		/* -x: a folder on another filesystem is made, but not filled */
++		if (copy_file_gnu.one_fs && source_stat.st_dev != copy_file_gnu.top_dev)
++			goto dir_done;
+ 
+ 		/* Recursively copy files in SOURCE */
+ 		dp = opendir(source);
+@@ -194,22 +219,46 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			goto preserve_mode_ugid_time;
+ 		}
+ 
+-		while ((d = readdir(dp)) != NULL) {
+-			char *new_source, *new_dest;
+-
+-			new_source = concat_subpath_file(source, d->d_name);
+-			if (new_source == NULL)
+-				continue;
+-			new_dest = concat_path_file(dest, d->d_name);
+-			if (copy_file(new_source, new_dest, flags & ~FILEUTILS_DEREFERENCE_L0) < 0)
+-				retval = -1;
+-			free(new_source);
+-			free(new_dest);
++		{
++			/* as GNU (gnulib's savedir, SAVEDIR_SORT_FASTREAD): in the order of their inodes */
++			struct ent { ino_t ino; char *name; } *ents = NULL;
++			int n = 0, i;
++
++			while ((d = readdir(dp)) != NULL) {
++				if (DOT_OR_DOTDOT(d->d_name))
++					continue;
++				ents = xrealloc_vector(ents, 5, n);
++				ents[n].ino = d->d_ino;
++				ents[n++].name = xstrdup(d->d_name);
++			}
++			closedir(dp);
++			for (i = 1; i < n; i++) { /* insertion sort: folders are small */
++				struct ent e = ents[i];
++				int j = i;
++				while (j > 0 && ents[j - 1].ino > e.ino) {
++					ents[j] = ents[j - 1];
++					j--;
++				}
++				ents[j] = e;
++			}
++			for (i = 0; i < n; i++) {
++				char *new_source, *new_dest;
++
++				new_source = concat_path_file(source, ents[i].name);
++				new_dest = concat_path_file(dest, ents[i].name);
++				if (copy_file(new_source, new_dest, flags & ~FILEUTILS_DEREFERENCE_L0) < 0)
++					retval = -1;
++				free(new_source);
++				free(new_dest);
++				free(ents[i].name);
++			}
++			free(ents);
+ 		}
+-		closedir(dp);
++ dir_done:
+ 
+ 		if (!dest_exists
+-		 && chmod(dest, source_stat.st_mode & ~saved_umask) < 0
++		 && chmod(dest, (copy_file_gnu.no_preserve & COPY_PRESERVE_MODE) ? 0777 & ~saved_umask
++				: source_stat.st_mode & ~saved_umask) < 0
+ 		) {
+ 			bb_perror_msg("can't preserve %s of '%s'", "permissions", dest);
+ 			/* retval = -1; - WRONG! copy *WAS* made */
+@@ -231,6 +280,18 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			dest_exists = 0;
+ 		}
+ #endif
++		/* --backup: the old one moves aside */
++		if (dest_exists && copy_file_gnu.backup != BACKUP_NONE && !S_ISDIR(dest_stat.st_mode)
++		 && !copy_file_gnu.attributes_only
++		) {
++			backup = xmalloc_backup_name(dest, copy_file_gnu.backup, copy_file_gnu.suffix);
++			if (backup && rename(dest, backup) < 0) {
++				bb_perror_msg("cannot backup '%s'", dest);
++				free(backup);
++				return -1;
++			}
++			dest_exists = 0;
++		}
+ 	}
+ 
+ 	if (flags & (FILEUTILS_MAKE_SOFTLINK|FILEUTILS_MAKE_HARDLINK)) {
+@@ -241,6 +302,11 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 		 * (but realpath returns NULL on dangling symlinks...) */
+ 		lf = (flags & FILEUTILS_MAKE_SOFTLINK) ? symlink : link;
+ 		if (lf(source, dest) < 0) {
++			if (!(flags & (FILEUTILS_FORCE|FILEUTILS_INTERACTIVE))) {
++				bb_perror_msg("cannot create %s link '%s' to '%s'",
++					(flags & FILEUTILS_MAKE_SOFTLINK) ? "symbolic" : "hard", dest, source);
++				return -1;
++			}
+ 			ovr = ask_and_unlink(dest, flags);
+ 			if (ovr <= 0)
+ 				return ovr;
+@@ -271,7 +337,8 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			goto dont_cat;
+ 		}
+ 
+-		if (ENABLE_FEATURE_PRESERVE_HARDLINKS && !FLAGS_DEREF) {
++		/* as GNU: with -a, -d or --preserve=links */
++		if (ENABLE_FEATURE_PRESERVE_HARDLINKS && !FLAGS_DEREF && copy_file_gnu.links) {
+ 			const char *link_target;
+ 			link_target = is_in_ino_dev_hashtable(&source_stat);
+ 			if (link_target) {
+@@ -289,21 +356,42 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 			add_to_ino_dev_hashtable(&source_stat, dest);
+ 		}
+ 
++		if (copy_file_gnu.attributes_only) {
++			/* --attributes-only: a new file is made empty, an old one stays as it is */
++			if (!dest_exists) {
++				dst_fd = open3_or_warn(dest, O_WRONLY|O_CREAT|O_EXCL,
++					(copy_file_gnu.no_preserve & COPY_PRESERVE_MODE) ? 0666 : source_stat.st_mode);
++				if (dst_fd < 0)
++					return -1;
++				close(dst_fd);
++			}
++			goto preserve_mode_ugid_time;
++		}
++
+ 		src_fd = open_or_warn(source, O_RDONLY);
+ 		if (src_fd < 0)
+ 			return -1;
+ 
+ 		/* Do not try to open with weird mode fields */
+ 		new_mode = source_stat.st_mode;
+-		if (!S_ISREG(source_stat.st_mode))
++		if (!S_ISREG(source_stat.st_mode) || (copy_file_gnu.no_preserve & COPY_PRESERVE_MODE))
+ 			new_mode = 0666;
+ 
+-		if (ENABLE_FEATURE_NON_POSIX_CP || (flags & FILEUTILS_INTERACTIVE)) {
++		if (ENABLE_FEATURE_NON_POSIX_CP) {
+ 			/*
+ 			 * O_CREAT|O_EXCL: require that file did not exist before creation
+ 			 */
+ 			dst_fd = open(dest, O_WRONLY|O_CREAT|O_EXCL, new_mode);
+-		} else { /* POSIX, and not "cp -i" */
++		} else { /* POSIX, and GNU */
++			/* -i: ask first, then write into it as it is (its inode, mode, links stay) */
++			if (dest_exists && (flags & FILEUTILS_INTERACTIVE)) {
++				fprintf(stderr, "%s: overwrite '%s'? ", applet_name, dest);
++				if (!bb_ask_y_confirmation()) {
++					close(src_fd);
++					return -1;
++				}
++				flags &= ~FILEUTILS_INTERACTIVE;
++			}
+ 			/*
+ 			 * O_CREAT|O_TRUNC: create, or truncate (security problem versus (sym)link attacks)
+ 			 */
+@@ -425,25 +513,96 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
+ 	/* Cannot happen: */
+ 	/* && !(flags & (FILEUTILS_MAKE_SOFTLINK|FILEUTILS_MAKE_HARDLINK)) */
+ 	) {
+-		struct timeval times[2];
++		/* as GNU: atime and mtime, to the nanosecond */
++		struct timespec times[2];
+ 
+-		times[1].tv_sec = times[0].tv_sec = source_stat.st_mtime;
+-		times[1].tv_usec = times[0].tv_usec = 0;
+-		/* BTW, utimes sets usec-precision time - just FYI */
+-		if (utimes(dest, times) < 0)
++		times[0] = source_stat.st_atim;
++		times[1] = source_stat.st_mtim;
++		if ((preserve & COPY_PRESERVE_TIMES) && utimensat(AT_FDCWD, dest, times, 0) < 0)
+ 			bb_perror_msg("can't preserve %s of '%s'", "times", dest);
+-		if (chown(dest, source_stat.st_uid, source_stat.st_gid) < 0) {
++		if ((preserve & COPY_PRESERVE_OWNER) && chown(dest, source_stat.st_uid, source_stat.st_gid) < 0) {
+ 			source_stat.st_mode &= ~(S_ISUID | S_ISGID);
+ 			bb_perror_msg("can't preserve %s of '%s'", "ownership", dest);
+ 		}
+-		if (chmod(dest, source_stat.st_mode) < 0)
++		if ((preserve & COPY_PRESERVE_MODE) && chmod(dest, source_stat.st_mode) < 0)
+ 			bb_perror_msg("can't preserve %s of '%s'", "permissions", dest);
+ 	}
+ 
+  verb_and_exit:
+-	if (flags & FILEUTILS_VERBOSE) {
+-		printf("'%s' -> '%s'\n", source, dest);
++	if ((flags & FILEUTILS_VERBOSE) && !S_ISDIR(source_stat.st_mode)) {
++		if (backup)
++			printf("'%s' -> '%s' (backup: '%s')\n", source, dest, backup);
++		else
++			printf("'%s' -> '%s'\n", source, dest);
+ 	}
++	free(backup);
+ 
+ 	return retval;
+ }
++
++/* GNU's --backup[=CONTROL] (cp, ln, mv, install): none/off, simple/never, numbered/t,
++ * existing/nil; without one, $VERSION_CONTROL, else existing */
++int FAST_FUNC xget_backup_control(const char *arg)
++{
++	static const char names[] ALIGN1 = "none\0off\0simple\0never\0existing\0nil\0numbered\0t\0";
++	static const unsigned char kinds[] = {
++		BACKUP_NONE, BACKUP_NONE, BACKUP_SIMPLE, BACKUP_SIMPLE,
++		BACKUP_EXISTING, BACKUP_EXISTING, BACKUP_NUMBERED, BACKUP_NUMBERED
++	};
++	int i;
++
++	if (!arg)
++		arg = getenv("VERSION_CONTROL");
++	if (!arg || !*arg)
++		return BACKUP_EXISTING;
++	i = index_in_substrings(names, arg);
++	if (i < 0)
++		bb_error_msg_and_die("invalid argument '%s' for 'backup type'", arg);
++	return kinds[i];
++}
++
++/* the name to move PATH to before it is replaced, or NULL for none: PATH~ (or PATH SUFFIX,
++ * $SIMPLE_BACKUP_SUFFIX), or PATH.~N~ one past the highest there is */
++char* FAST_FUNC xmalloc_backup_name(const char *path, int control, const char *suffix)
++{
++	char *dir, *base;
++	DIR *d;
++	struct dirent *de;
++	unsigned long max = 0;
++	size_t blen;
++
++	if (control == BACKUP_NONE)
++		return NULL;
++	if (!suffix)
++		suffix = getenv("SIMPLE_BACKUP_SUFFIX");
++	if (!suffix || !*suffix || strchr(suffix, '/'))
++		suffix = "~";
++	if (control == BACKUP_SIMPLE)
++		return xasprintf("%s%s", path, suffix);
++	dir = xstrdup(path);
++	base = strrchr(dir, '/');
++	if (base) {
++		*base++ = '\0';
++		d = opendir(dir[0] ? dir : "/");
++	} else {
++		base = dir;
++		d = opendir(".");
++	}
++	blen = strlen(base);
++	while (d && (de = readdir(d)) != NULL) {
++		const char *p = de->d_name + blen;
++		char *end;
++		unsigned long n;
++		if (strncmp(de->d_name, base, blen) != 0 || p[0] != '.' || p[1] != '~' || !isdigit((unsigned char)p[2]))
++			continue;
++		n = strtoul(p + 2, &end, 10);
++		if (end[0] == '~' && !end[1] && n > max)
++			max = n;
++	}
++	if (d)
++		closedir(d);
++	free(dir);
++	if (control == BACKUP_EXISTING && max == 0)
++		return xasprintf("%s%s", path, suffix);
++	return xasprintf("%s.~%lu~", path, max + 1);
++}
+diff --git a/include/libbb.h b/include/libbb.h
+index 8a79ece..35b633f 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -520,6 +520,21 @@ extern int remove_file(const char *path, int flags) FAST_FUNC;
+  * This makes "cp /dev/null file" and "install /dev/null file" (!!!)
+  * work coreutils-compatibly. */
+ extern int copy_file(const char *source, const char *dest, int flags) FAST_FUNC;
++/* GNU's --backup (libbb/copy_file.c) */
++enum { BACKUP_NONE, BACKUP_SIMPLE, BACKUP_NUMBERED, BACKUP_EXISTING };
++int xget_backup_control(const char *arg) FAST_FUNC;
++char *xmalloc_backup_name(const char *path, int control, const char *suffix) FAST_FUNC RETURNS_MALLOC;
++/* cp's GNU options for copy_file, which cp sets */
++enum { COPY_PRESERVE_MODE = 1, COPY_PRESERVE_OWNER = 2, COPY_PRESERVE_TIMES = 4 };
++extern struct copy_file_gnu {
++	int backup;            /* BACKUP_*: --backup, -b */
++	const char *suffix;    /* -S */
++	unsigned preserve;     /* with FILEUTILS_PRESERVE_STATUS: COPY_PRESERVE_* */
++	unsigned no_preserve;  /* --no-preserve */
++	smallint attributes_only, one_fs;
++	smallint links;        /* hard links stay hard links: -a, -d, --preserve=links */
++	dev_t top_dev;         /* -x: of the source given */
++} copy_file_gnu;
+ 
+ enum {
+ 	ACTION_RECURSE        = (1 << 0),
+diff --git a/coreutils/cp.c b/coreutils/cp.c
+index ee40af5..7c3a27a 100644
+--- a/coreutils/cp.c
++++ b/coreutils/cp.c
+@@ -104,6 +104,13 @@
+ //usage:     "\n	-T	Refuse to copy if DEST is a directory"
+ //usage:     "\n	-t DIR	Copy all SOURCEs into DIR"
+ //usage:     "\n	-u	Copy only newer files"
++//usage:     "\n	-b	Make a backup of each DEST that is replaced (-S SUF: SUF, not ~)"
++//usage:     "\n	--backup[=CONTROL]	none, simple, numbered (DEST.~N~), existing (the default)"
++//usage:     "\n	--preserve[=LIST]	mode,ownership,timestamps (the default),all"
++//usage:     "\n	--no-preserve=LIST	Don't preserve these (mode: the new files' are 0666 & ~umask)"
++//usage:     "\n	-x	Stay on the source's filesystem"
++//usage:     "\n	--attributes-only	Don't copy the data, only the attributes"
++//usage:     "\n	--strip-trailing-slashes	Of each SOURCE"
+ 
+ #include "libbb.h"
+ #include "libcoreutils/coreutils.h"
+@@ -126,12 +133,59 @@ int cp_main(int argc, char **argv)
+ 		/*OPT_rmdest  = FILEUTILS_RMDEST = 1 << FILEUTILS_CP_OPTBITS */
+ 		OPT_parents = 1 << (FILEUTILS_CP_OPTBITS+1),
+ 		OPT_reflink = 1 << (FILEUTILS_CP_OPTBITS+2),
++		/* GNU's, after those: bits copy_file must not see */
++		OPT_b       = 1 << (FILEUTILS_CP_OPTBITS+3),
++		OPT_S       = 1 << (FILEUTILS_CP_OPTBITS+4),
++		OPT_x       = 1 << (FILEUTILS_CP_OPTBITS+5),
++		OPT_backup  = 1 << (FILEUTILS_CP_OPTBITS+6),
++		OPT_preserve = 1 << (FILEUTILS_CP_OPTBITS+7),
++		OPT_no_preserve = 1 << (FILEUTILS_CP_OPTBITS+8),
++		OPT_attr_only = 1 << (FILEUTILS_CP_OPTBITS+9),
++		OPT_strip   = 1 << (FILEUTILS_CP_OPTBITS+10),
++		OPT_sparse  = 1 << (FILEUTILS_CP_OPTBITS+11),
++		OPT_debug   = 1 << (FILEUTILS_CP_OPTBITS+12),
++		OPT_copy_contents = 1 << (FILEUTILS_CP_OPTBITS+13),
++		OPT_GNU     = OPT_b | OPT_S | OPT_x | OPT_backup | OPT_preserve | OPT_no_preserve
++		            | OPT_attr_only | OPT_strip | OPT_sparse | OPT_debug | OPT_copy_contents,
+ 	};
+ # if ENABLE_FEATURE_CP_REFLINK
+ 	char *reflink = NULL;
+ # endif
++	char *backup = NULL, *suffix = NULL, *sparse = NULL;
++	char *preserve = NULL, *no_preserve = NULL;
++
++	memset(&copy_file_gnu, 0, sizeof(copy_file_gnu));
++	{
++		/* -a and -d keep hard links (GNU: -d is --no-dereference --preserve=links), not -R
++		 * (which turns on -d below): look for them before that */
++		char **a;
++		for (a = argv + 1; *a && a[0][0] == '-' && a[0][1]; a++) {
++			const char *c = *a + 1;
++			if (*c == '-') {
++				if (!c[1])
++					break;
++				if (strcmp(c, "-archive") == 0)
++					copy_file_gnu.links = 1;
++				continue;
++			}
++			for (; *c; c++) {
++				if (*c == 'a' || *c == 'd')
++					copy_file_gnu.links = 1;
++				if (*c == 'S' || *c == 't') {
++					if (!c[1])
++						a++;
++					break;
++				}
++			}
++			if (!*a)
++				break;
++		}
++	}
+ 	flags = getopt32long(argv, "^"
+ 		FILEUTILS_CP_OPTSTR
++		/* the long ones' bits stay where they were: */
++		"\xff\xfe" IF_FEATURE_CP_REFLINK("\xfd::") IF_NOT_FEATURE_CP_REFLINK("\xfd")
++		"bS:x\xfc::\xfb::\xfa:\xf9\xf8\xf7:\xf6\xf5"
+ 		"\0"
+ 		// Need at least one argument. (Usually two+, but -t DIR can have only one)
+ 		// Soft- and hardlinking doesn't mix
+@@ -159,11 +213,83 @@ int cp_main(int argc, char **argv)
+ # if ENABLE_FEATURE_CP_REFLINK
+ 		"reflink\0"        Optional_argument "\xfd"
+ # endif
++		"suffix\0"         Required_argument "S"
++		"one-file-system\0" No_argument "x"
++		"backup\0"         Optional_argument "\xfc"
++		"preserve\0"       Optional_argument "\xfb"
++		"no-preserve\0"    Required_argument "\xfa"
++		"attributes-only\0" No_argument "\xf9"
++		"strip-trailing-slashes\0" No_argument "\xf8"
++		"sparse\0"         Required_argument "\xf7"
++		"debug\0"          No_argument "\xf6"
++		"copy-contents\0"  No_argument "\xf5"
+ 		, &last
+ # if ENABLE_FEATURE_CP_REFLINK
+ 		, &reflink
+ # endif
++		, &suffix, &backup, &preserve, &no_preserve, &sparse
+ 	);
++	/* GNU's options */
++	if (flags & OPT_backup)
++		copy_file_gnu.backup = xget_backup_control(backup);
++	else if (flags & (OPT_b | OPT_S))
++		copy_file_gnu.backup = xget_backup_control(NULL);
++	copy_file_gnu.suffix = suffix;
++	if (flags & FILEUTILS_PRESERVE_STATUS) /* -p, -a */
++		copy_file_gnu.preserve = COPY_PRESERVE_MODE | COPY_PRESERVE_OWNER | COPY_PRESERVE_TIMES;
++	if (flags & (OPT_preserve | OPT_no_preserve)) {
++		/* --preserve[=mode,ownership,timestamps,links,context,xattr,all] */
++		static const char attrs[] ALIGN1 = "mode\0ownership\0timestamps\0links\0context\0xattr\0all\0";
++		static const unsigned char bits[] = {
++			COPY_PRESERVE_MODE, COPY_PRESERVE_OWNER, COPY_PRESERVE_TIMES, 8 /* links */, 0, 0,
++			COPY_PRESERVE_MODE | COPY_PRESERVE_OWNER | COPY_PRESERVE_TIMES | 8
++		};
++		int i;
++		for (i = 0; i < 2; i++) {
++			if (!(flags & (i ? OPT_no_preserve : OPT_preserve)))
++				continue;
++			{
++				const char *arg = i ? no_preserve : preserve;
++				char *list = xstrdup(arg ? arg : "mode,ownership,timestamps");
++				char *a, *save = NULL;
++				for (a = strtok_r(list, ",", &save); a; a = strtok_r(NULL, ",", &save)) {
++					int k = index_in_strings(attrs, a);
++					if (k < 0)
++						bb_error_msg_and_die("invalid argument '%s' for '--%spreserve'", a, i ? "no-" : "");
++					if (i)
++						copy_file_gnu.no_preserve |= bits[k];
++					else
++						copy_file_gnu.preserve |= bits[k];
++				}
++				free(list);
++			}
++		}
++		if (copy_file_gnu.preserve & 8)
++			copy_file_gnu.links = 1;
++		if (copy_file_gnu.no_preserve & 8)
++			copy_file_gnu.links = 0;
++		copy_file_gnu.preserve &= 7;
++		copy_file_gnu.no_preserve &= 7;
++		if (copy_file_gnu.preserve)
++			flags |= FILEUTILS_PRESERVE_STATUS;
++	}
++	if ((flags & OPT_sparse) && index_in_strings("never\0auto\0always\0", sparse) < 0)
++		bb_error_msg_and_die("invalid argument '%s' for '--sparse'", sparse);
++	copy_file_gnu.attributes_only = !!(flags & OPT_attr_only);
++	copy_file_gnu.one_fs = !!(flags & OPT_x);
++	if (flags & OPT_debug)
++		flags |= FILEUTILS_VERBOSE;
++	if (flags & OPT_strip) {
++		/* --strip-trailing-slashes: of the sources */
++		int i;
++		for (i = optind; i < argc - !(flags & FILEUTILS_TARGET_DIR); i++) {
++			char *a = argv[i];
++			size_t n = strlen(a);
++			while (n > 1 && a[n - 1] == '/')
++				a[--n] = '\0';
++		}
++	}
++	flags &= ~OPT_GNU;
+ # if ENABLE_FEATURE_CP_REFLINK
+ 	BUILD_BUG_ON((int)OPT_reflink != (int)FILEUTILS_REFLINK);
+ 	if (flags & FILEUTILS_REFLINK) {
+@@ -206,9 +332,14 @@ int cp_main(int argc, char **argv)
+ 		if (argc < 2)
+ 			bb_show_usage();
+ 		if (argc != 2) {
++			struct stat st;
+ 			if (flags & FILEUTILS_NO_TARGET_DIR)
+ 				bb_show_usage();
+ 			/* "cp A B C... DIR" - target must be dir */
++			if (stat(last, &st) != 0)
++				bb_perror_msg_and_die("target '%s'", last);
++			if (!S_ISDIR(st.st_mode))
++				bb_error_msg_and_die("target '%s' is not a directory", last);
+ 		} else /* argc == 2 */ {
+ 			/* "cp A B" - only case where target can be not a dir */
+ 			s_flags = cp_mv_stat2(*argv, &source_stat,
+@@ -269,6 +400,11 @@ int cp_main(int argc, char **argv)
+ #endif
+ 		dest = concat_path_file(last, bb_get_last_path_component_strip(*argv));
+  DO_COPY:
++		if (copy_file_gnu.one_fs) {
++			struct stat st;
++			if (stat(*argv, &st) == 0)
++				copy_file_gnu.top_dev = st.st_dev;
++		}
+ 		if (copy_file(*argv, dest, flags) < 0) {
+ 			status = EXIT_FAILURE;
+ 		}
+diff --git a/coreutils/ln.c b/coreutils/ln.c
+index 080ba14..b68b1e1 100644
+--- a/coreutils/ln.c
++++ b/coreutils/ln.c
+@@ -21,15 +21,20 @@
+ /* http://www.opengroup.org/onlinepubs/007904975/utilities/ln.html */
+ 
+ //usage:#define ln_trivial_usage
+-//usage:       "[-sfnbtv] [-S SUF] TARGET... LINK|DIR"
++//usage:       "[-sfnbvTrLPdi] [-S SUF] [-t DIR] TARGET... LINK|DIR"
+ //usage:#define ln_full_usage "\n\n"
+-//usage:       "Create a link LINK or DIR/TARGET to the specified TARGET(s)\n"
++//usage:       "Create a link LINK or DIR/TARGET to the specified TARGET(s), as GNU ln\n"
+ //usage:     "\n	-s	Make symlinks instead of hardlinks"
++//usage:     "\n	-r	Make the symlink relative to where it is (with -s)"
+ //usage:     "\n	-f	Remove existing destinations"
++//usage:     "\n	-i	Ask before removing them"
+ //usage:     "\n	-n	Don't dereference symlinks - treat like normal file"
+ //usage:     "\n	-b	Make a backup of the target (if exists) before link operation"
++//usage:     "\n	--backup[=CONTROL]	none, simple, numbered (LINK.~N~), existing (the default)"
+ //usage:     "\n	-S SUF	Use suffix instead of ~ when making backup files"
++//usage:     "\n	-t DIR	Make the links in DIR"
+ //usage:     "\n	-T	Treat LINK as a file, not DIR"
++//usage:     "\n	-L	Hard link a symlink's target (-P: the symlink, the default)"
+ //usage:     "\n	-v	Verbose"
+ //usage:
+ //usage:#define ln_example_usage
+@@ -48,118 +53,162 @@
+ #define LN_SUFFIX           (1 << 4)
+ #define LN_VERBOSE          (1 << 5)
+ #define LN_LINKFILE         (1 << 6)
++#define LN_RELATIVE         (1 << 7)
++#define LN_LOGICAL          (1 << 8)
++#define LN_PHYSICAL         (1 << 9)
++#define LN_DIRECTORY        (1 << 10)
++#define LN_DIRECTORY_F      (1 << 11)
++#define LN_INTERACTIVE      (1 << 12)
++#define LN_TARGET_DIR       (1 << 13)
++#define LN_BACKUP_CONTROL   (1 << 14)
+ 
+ int ln_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int ln_main(int argc, char **argv)
+ {
++	static const char longopts[] ALIGN1 =
++		"symbolic\0"            No_argument       "s"
++		"force\0"               No_argument       "f"
++		"no-dereference\0"      No_argument       "n"
++		"suffix\0"              Required_argument "S"
++		"verbose\0"             No_argument       "v"
++		"no-target-directory\0" No_argument       "T"
++		"relative\0"            No_argument       "r"
++		"logical\0"             No_argument       "L"
++		"physical\0"            No_argument       "P"
++		"directory\0"           No_argument       "d"
++		"interactive\0"         No_argument       "i"
++		"target-directory\0"    Required_argument "t"
++		"backup\0"              Optional_argument "\xff"
++	;
+ 	exitcode_t status = EXIT_SUCCESS;
+-	int opts;
+-	char *last;
+-	char *src_name;
+-	char *src;
+-	char *suffix = (char*)"~";
+-	struct stat statbuf;
+-	int (*link_func)(const char *, const char *);
++	int opts, control = BACKUP_NONE;
++	char *dir = NULL, *suffix = NULL, *target_dir = NULL, *control_arg = NULL;
++	char **targets;
++	int n, i;
+ 
+-	opts = getopt32(argv, "^" "sfnbS:vT" "\0" "-1", &suffix);
+-/*
+-	-s, --symbolic		make symbolic links instead of hard links
+-	-f, --force		remove existing destination files
+-	-n, --no-dereference	treat LINK_NAME as a normal file if it is a symbolic link to a directory
+-	-b			like --backup but does not accept an argument
+-	--backup[=CONTROL]	make a backup of each existing destination file
+-	-S, --suffix=SUFFIX	override the usual backup suffix
+-	-v, --verbose
+-	-T, --no-target-directory
+-	-d, -F, --directory	allow the superuser to attempt to hard link directories
+-	-i, --interactive	prompt whether to remove destinations
+-	-L, --logical		dereference TARGETs that are symbolic links
+-	-P, --physical		make hard links directly to symbolic links
+-	-r, --relative		create symbolic links relative to link location
+-	-t, --target-directory=DIRECTORY	specify the DIRECTORY in which to create the links
+- */
+-	last = argv[argc - 1];
++	opts = getopt32long(argv, "^" "sfnbS:vTrLPdFit:\xff::" "\0" "-1:L--P:P--L:f--i:i--f",
++			longopts, &suffix, &target_dir, &control_arg);
+ 	argv += optind;
+ 	argc -= optind;
+-
+-	if ((opts & LN_LINKFILE) && argc > 2) {
+-		bb_simple_error_msg_and_die("-T accepts 2 args max");
++	if ((opts & LN_RELATIVE) && !(opts & LN_SYMLINK))
++		bb_simple_error_msg_and_die("cannot do --relative without --symbolic");
++	if (opts & LN_BACKUP_CONTROL)
++		control = xget_backup_control(control_arg);
++	else if (opts & (LN_BACKUP | LN_SUFFIX))
++		control = xget_backup_control(NULL);
++
++	/* where the links go: -t DIR; LINK (-T); the last argument if it is a folder; . */
++	targets = argv;
++	n = argc;
++	if (opts & LN_TARGET_DIR) {
++		struct stat st;
++		if (opts & LN_LINKFILE)
++			bb_simple_error_msg_and_die("cannot combine --target-directory and --no-target-directory");
++		if (stat(target_dir, &st) != 0)
++			bb_perror_msg_and_die("failed to access '%s'", target_dir);
++		if (!S_ISDIR(st.st_mode))
++			bb_error_msg_and_die("target directory '%s' is not a directory", target_dir);
++		dir = target_dir;
++	} else if (opts & LN_LINKFILE) {
++		if (argc != 2)
++			bb_error_msg_and_die(argc < 2 ? "missing destination file operand after '%s'"
++				: "extra operand '%s'", argc < 2 ? argv[0] : argv[2]);
++		n = 1;
++	} else if (argc == 1) {
++		dir = (char*)".";
++	} else if (is_directory(argv[argc - 1], !(opts & LN_NODEREFERENCE))) {
++		dir = argv[argc - 1];
++		n = argc - 1;
++	} else if (argc > 2) {
++		struct stat st;
++		if (stat(argv[argc - 1], &st) != 0)
++			bb_perror_msg_and_die("target '%s'", argv[argc - 1]);
++		bb_error_msg_and_die("target '%s' is not a directory", argv[argc - 1]);
++	} else {
++		n = 1;
+ 	}
+ 
+-	if (!argv[1]) {
+-		/* "ln PATH/TO/FILE" -> "ln PATH/TO/FILE FILE" */
+-		*--argv = last;
+-		/* xstrdup is needed: "ln -s PATH/TO/FILE/" is equivalent to
+-		 * "ln -s PATH/TO/FILE/ FILE", not "ln -s PATH/TO/FILE FILE"
+-		 */
+-		last = bb_get_last_path_component_strip(xstrdup(last));
+-	}
+-
+-	do {
+-		src_name = NULL;
+-		src = last;
+-
+-		if (is_directory(src,
+-				/*followlinks:*/ !(opts & (LN_NODEREFERENCE|LN_LINKFILE))
+-				/* Why LN_LINKFILE does not follow links:
+-				 * -T/--no-target-directory implies -n/--no-dereference
+-				 */
+-				)
+-		) {
+-			if (opts & LN_LINKFILE) {
+-				bb_error_msg_and_die("'%s' is a directory", src);
+-			}
+-			src_name = xstrdup(*argv);
+-			src = concat_path_file(src, bb_get_last_path_component_strip(src_name));
+-			free(src_name);
+-			src_name = src;
++	for (i = 0; i < n; i++) {
++		const char *target = targets[i];
++		char *name, *content, *backup = NULL;
++		struct stat st;
++
++		if (dir) {
++			char *copy = xstrdup(target);
++			name = concat_path_file(dir, bb_get_last_path_component_strip(copy));
++			free(copy);
++		} else {
++			name = xstrdup(targets[1]);
++		}
++		content = (char*)target;
++		if (opts & LN_RELATIVE) {
++			/* relative to the link's folder, both with their symlinks resolved */
++			char *slash, *ldir = xstrdup(name), *t, *d;
++			slash = strrchr(ldir, '/');
++			if (slash)
++				slash[slash == ldir] = '\0';
++			else
++				strcpy(ldir, ".");
++			t = xmalloc_canonicalize(target, CANON_MISSING);
++			d = xmalloc_canonicalize(ldir, CANON_MISSING);
++			if (t && d)
++				content = xmalloc_relative_path(t, d);
++			free(t);
++			free(d);
++			free(ldir);
+ 		}
+-		if (!(opts & LN_SYMLINK) && stat(*argv, &statbuf)) {
+-			// coreutils: "ln dangling_symlink new_hardlink" works
+-			if (lstat(*argv, &statbuf) || !S_ISLNK(statbuf.st_mode)) {
+-				bb_simple_perror_msg(*argv);
++		if (!(opts & LN_SYMLINK)) {
++			if ((opts & LN_LOGICAL) ? stat(target, &st) : lstat(target, &st)) {
++				bb_perror_msg("failed to access '%s'", target);
+ 				status = EXIT_FAILURE;
+-				free(src_name);
+-				continue;
++				goto next;
+ 			}
+-		}
+-
+-		if (opts & LN_BACKUP) {
+-			char *backup;
+-			backup = xasprintf("%s%s", src, suffix);
+-			if (rename(src, backup) < 0 && errno != ENOENT) {
+-				bb_simple_perror_msg(src);
++			if (S_ISDIR(st.st_mode) && !(opts & (LN_DIRECTORY | LN_DIRECTORY_F))) {
++				bb_error_msg("%s: hard link not allowed for directory", target);
+ 				status = EXIT_FAILURE;
+-				free(backup);
+-				continue;
++				goto next;
+ 			}
+-			free(backup);
+-			/*
+-			 * When the source and dest are both hard links to the same
+-			 * inode, a rename may succeed even though nothing happened.
+-			 * Therefore, always unlink().
+-			 */
+-			unlink(src);
+-		} else if (opts & LN_FORCE) {
+-			unlink(src);
+ 		}
+ 
+-		link_func = link;
+-		if (opts & LN_SYMLINK) {
+-			link_func = symlink;
+-		}
+-
+-		if (opts & LN_VERBOSE) {
+-			printf("'%s' -> '%s'\n", src, *argv);
++		if (lstat(name, &st) == 0) {
++			if (opts & LN_INTERACTIVE) {
++				fprintf(stderr, "%s: replace '%s'? ", applet_name, name);
++				if (!bb_ask_y_confirmation())
++					goto next;
++			}
++			backup = xmalloc_backup_name(name, control, suffix);
++			if (backup) {
++				if (rename(name, backup) < 0) {
++					bb_perror_msg("can't backup '%s'", name);
++					status = EXIT_FAILURE;
++					goto next;
++				}
++			} else if ((opts & (LN_FORCE | LN_INTERACTIVE)) && !S_ISDIR(st.st_mode)) {
++				unlink(name);
++			}
+ 		}
+ 
+-		if (link_func(*argv, src) != 0) {
+-			bb_simple_perror_msg(src);
++		if ((opts & LN_SYMLINK) ? symlink(content, name)
++		 : linkat(AT_FDCWD, target, AT_FDCWD, name, (opts & LN_LOGICAL) ? AT_SYMLINK_FOLLOW : 0)
++		) {
++			if ((opts & LN_SYMLINK) || errno == EEXIST)
++				bb_perror_msg("failed to create %s link '%s'", (opts & LN_SYMLINK) ? "symbolic" : "hard", name);
++			else
++				bb_perror_msg("failed to create hard link '%s' => '%s'", name, target);
+ 			status = EXIT_FAILURE;
++			goto next;
+ 		}
+-
+-		free(src_name);
+-	} while ((++argv)[1]);
++		if (opts & LN_VERBOSE) {
++			if (backup)
++				printf("'%s' ~ ", backup);
++			printf("'%s' %s '%s'\n", name, (opts & LN_SYMLINK) ? "->" : "=>", content);
++		}
++ next:
++		if (content != target)
++			free(content);
++		free(backup);
++		free(name);
++	}
+ 
+ 	return status;
+ }
+diff --git a/testsuite/cp.tests b/testsuite/cp.tests
+index 33cd876..503e72d 100755
+--- a/testsuite/cp.tests
++++ b/testsuite/cp.tests
+@@ -30,8 +30,8 @@ test ! -L file_symlink && test   -f file_symlink     || echo BAD: file_symlink
+ test ! -L dir          && test ! -e dir              || echo BAD: dir
+ test ! -L dir_symlink  && test ! -e dir_symlink      || echo BAD: dir_symlink
+ ' "\
+-cp: omitting directory ${sq}dir'
+-cp: omitting directory ${sq}dir_symlink'
++cp: -r not specified; omitting directory ${sq}dir'
++cp: -r not specified; omitting directory ${sq}dir_symlink'
+ 1
+ " "" ""
+ 
+@@ -43,7 +43,7 @@ test   -L file_symlink && test   -f file_symlink     || echo BAD: file_symlink
+ test ! -L dir          && test ! -e dir              || echo BAD: dir
+ test   -L dir_symlink  && test ! -e dir_symlink      || echo BAD: dir_symlink
+ ' "\
+-cp: omitting directory ${sq}dir'
++cp: -r not specified; omitting directory ${sq}dir'
+ 1
+ " "" ""
+ 
+@@ -55,7 +55,7 @@ test   -L file_symlink && test   -f file_symlink     || echo BAD: file_symlink
+ test ! -L dir          && test ! -e dir              || echo BAD: dir
+ test   -L dir_symlink  && test ! -e dir_symlink      || echo BAD: dir_symlink
+ ' "\
+-cp: omitting directory ${sq}dir'
++cp: -r not specified; omitting directory ${sq}dir'
+ 1
+ " "" ""
+ 
+@@ -67,8 +67,8 @@ test ! -L file_symlink && test   -f file_symlink     || echo BAD: file_symlink
+ test ! -L dir          && test ! -e dir              || echo BAD: dir
+ test ! -L dir_symlink  && test ! -e dir_symlink      || echo BAD: dir_symlink
+ ' "\
+-cp: omitting directory ${sq}dir'
+-cp: omitting directory ${sq}dir_symlink'
++cp: -r not specified; omitting directory ${sq}dir'
++cp: -r not specified; omitting directory ${sq}dir_symlink'
+ 1
+ " "" ""
+ 
+@@ -80,8 +80,8 @@ test ! -L file_symlink && test   -f file_symlink     || echo BAD: file_symlink
+ test ! -L dir          && test ! -e dir              || echo BAD: dir
+ test ! -L dir_symlink  && test ! -e dir_symlink      || echo BAD: dir_symlink
+ ' "\
+-cp: omitting directory ${sq}dir'
+-cp: omitting directory ${sq}dir_symlink'
++cp: -r not specified; omitting directory ${sq}dir'
++cp: -r not specified; omitting directory ${sq}dir_symlink'
+ 1
+ " "" ""
+ 

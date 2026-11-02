@@ -1,0 +1,270 @@
+diff --git a/findutils/xargs.c b/findutils/xargs.c
+index 890c375..9037ee3 100644
+--- a/findutils/xargs.c
++++ b/findutils/xargs.c
+@@ -110,6 +110,8 @@ struct globals {
+ 	char eol_ch;
+ #endif
+ 	const char *eof_str;
++	char delim;     /* -0 and -d: what ends an item */
++	int max_lines;  /* -L, -l */
+ 	int idx;
+ 	int fd_tty;
+ 	int fd_stdin;
+@@ -156,6 +158,11 @@ enum {
+ 	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   OPTBIT_ZEROTERM   ,)
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    OPTBIT_REPLSTR    ,)
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    OPTBIT_REPLSTR1   ,)
++	IF_FEATURE_XARGS_SUPPORT_PARALLEL(    OPTBIT_PARALLEL   ,)
++	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   OPTBIT_ARGS_FILE  ,)
++	OPTBIT_DELIM,
++	OPTBIT_MAX_LINES,
++	OPTBIT_MAX_LINES1,
+ 
+ 	OPT_VERBOSE     = 1 << OPTBIT_VERBOSE    ,
+ 	OPT_NO_EMPTY    = 1 << OPTBIT_NO_EMPTY   ,
+@@ -169,6 +176,9 @@ enum {
+ 	OPT_ZEROTERM    = IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   (1 << OPTBIT_ZEROTERM   )) + 0,
+ 	OPT_REPLSTR     = IF_FEATURE_XARGS_SUPPORT_REPL_STR(    (1 << OPTBIT_REPLSTR    )) + 0,
+ 	OPT_REPLSTR1    = IF_FEATURE_XARGS_SUPPORT_REPL_STR(    (1 << OPTBIT_REPLSTR1   )) + 0,
++	OPT_DELIM       = 1 << OPTBIT_DELIM,      /* -d DELIM */
++	OPT_MAX_LINES   = 1 << OPTBIT_MAX_LINES,  /* -L N */
++	OPT_MAX_LINES1  = 1 << OPTBIT_MAX_LINES1, /* -l[N] */
+ };
+ #define OPTION_STR "+trn:s:e::E:o" \
+ 	IF_FEATURE_XARGS_SUPPORT_CONFIRMATION("p") \
+@@ -176,7 +186,8 @@ enum {
+ 	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   "0") \
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    "I:i::") \
+ 	IF_FEATURE_XARGS_SUPPORT_PARALLEL(    "P:+") \
+-	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:")
++	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:") \
++	"d:L:l::"
+ 
+ 
+ /*
+@@ -445,7 +456,7 @@ static char* FAST_FUNC process_stdin(int n_max_chars, int n_max_arg, char *buf)
+ }
+ #endif /* FEATURE_XARGS_SUPPORT_QUOTES */
+ 
+-#if ENABLE_FEATURE_XARGS_SUPPORT_ZERO_TERM
++/* -0 and -d DELIM: items end at G.delim, nothing else is special */
+ static char* FAST_FUNC process0_stdin(int n_max_chars, int n_max_arg, char *buf)
+ {
+ 	char *s = buf;             /* start of the word */
+@@ -458,10 +469,11 @@ static char* FAST_FUNC process0_stdin(int n_max_chars, int n_max_arg, char *buf)
+ 		if (c == EOF) {
+ 			if (p == s)
+ 				goto ret;
+-			c = '\0';
++			c = G.delim;
+ 		}
+ 		*p++ = c;
+-		if (c == '\0') {   /* NUL or EOF detected */
++		if (c == G.delim) {   /* the delimiter or EOF detected */
++			p[-1] = '\0';
+ 			/* A full word is loaded */
+ 			store_param(s);
+ 			dbg_msg("args[]:'%s'", s);
+@@ -481,7 +493,80 @@ static char* FAST_FUNC process0_stdin(int n_max_chars, int n_max_arg, char *buf)
+ 	dbg_msg("return:'%s'", s);
+ 	return s;
+ }
+-#endif /* FEATURE_XARGS_SUPPORT_ZERO_TERM */
++
++/* -L N: the words of N nonblank lines (a line ending in a blank goes on into the next one) */
++static char* FAST_FUNC process_lines_stdin(int n_max_chars, int n_max_arg, char *buf)
++{
++	char *s = buf;             /* start of the word */
++	char *p = s + strlen(buf); /* end of the word */
++	int lines = 0, words = 0, last_blank = 0, quote = 0, backslash = 0;
++
++	buf += n_max_chars;        /* past buffer's end */
++
++	while (1) {
++		int c = getchar();
++		int end_word = 0;
++
++		if (c == EOF) {
++			if (quote)
++				bb_error_msg_and_die("unmatched %s quote", quote == '\'' ? "single" : "double");
++			end_word = 1;
++		} else if (backslash) {
++			backslash = 0;
++			last_blank = 0;
++			*p++ = c;
++		} else if (quote) {
++			last_blank = 0;
++			if (c == quote)
++				quote = 0;
++			else
++				*p++ = c;
++		} else if (c == '\n') {
++			end_word = 1;
++		} else if (ISSPACE(c)) {
++			end_word = 1;
++			last_blank = 1;
++		} else {
++			last_blank = 0;
++			if (c == '\\')
++				backslash = 1;
++			else if (c == '\'' || c == '"')
++				quote = c;
++			else
++				*p++ = c;
++		}
++		if (end_word && p != s) {
++			*p++ = '\0';
++			if (G.eof_str && strcmp(s, G.eof_str) == 0) {
++				while (getchar() != EOF)
++					continue;
++				p = s;
++				goto ret;
++			}
++			store_param(s);
++			s = p;
++			words++;
++			if (--n_max_arg == 0)
++				goto ret;
++		}
++		if (c == EOF)
++			goto ret;
++		if (c == '\n') {
++			/* a line ending in a blank goes on */
++			if (words && !last_blank) {
++				words = 0;
++				if (++lines >= G.max_lines)
++					goto ret;
++			}
++			last_blank = 0;
++		}
++		if (p == buf)
++			goto ret;
++	}
++ ret:
++	*p = '\0';
++	return s;
++}
+ 
+ #if ENABLE_FEATURE_XARGS_SUPPORT_REPL_STR
+ /*
+@@ -514,6 +599,9 @@ static char* FAST_FUNC process_stdin_with_replace(int n_max_chars, int n_max_arg
+ 		if (p == buf) {
+ 			if (c == EOF)
+ 				goto ret; /* last line is empty, return "" */
++			/* as GNU: with -0 or -d, an empty item and blanks are items' too */
++			if (option_mask32 & (OPT_ZEROTERM | OPT_DELIM))
++				goto take;
+ 			if (c == G.eol_ch)
+ 				continue; /* empty line, ignore */
+ 			/* Skip leading whitespace of each line: try
+@@ -522,6 +610,7 @@ static char* FAST_FUNC process_stdin_with_replace(int n_max_chars, int n_max_arg
+ 			if (ISSPACE(c))
+ 				continue;
+ 		}
++ take:
+ 		if (c == EOF || c == G.eol_ch) {
+ 			c = '\0';
+ 		}
+@@ -582,6 +671,8 @@ static int xargs_ask_confirmation(void)
+ //usage:	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(
+ //usage:     "\n	-0	NUL terminated input"
+ //usage:	)
++//usage:     "\n	-d DELIM	Items end at DELIM (a character, \\n \\t \\0 \\NNN \\xHH), no quoting"
++//usage:     "\n	-L N	At most N nonblank input lines per command (-l: one)"
+ //usage:	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(
+ //usage:     "\n	-a FILE	Read from FILE instead of stdin"
+ //usage:	)
+@@ -625,15 +716,31 @@ int xargs_main(int argc UNUSED_PARAM, char **argv)
+ #define read_args process_stdin
+ #endif
+ 	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(char *opt_a = NULL;)
++	char *opt_d = NULL, *opt_L = NULL, *opt_l = NULL;
+ 
+ 	INIT_G();
+ 
+ 	opt = getopt32long(argv, OPTION_STR,
+-		"no-run-if-empty\0" No_argument "r",
++		"no-run-if-empty\0" No_argument       "r"
++		"verbose\0"         No_argument       "t"
++		"max-args\0"        Required_argument "n"
++		"max-chars\0"       Required_argument "s"
++		"eof\0"             Optional_argument "e"
++		"open-tty\0"        No_argument       "o"
++		IF_FEATURE_XARGS_SUPPORT_CONFIRMATION("interactive\0" No_argument "p")
++		IF_FEATURE_XARGS_SUPPORT_TERMOPT(     "exit\0"        No_argument "x")
++		IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   "null\0"        No_argument "0")
++		IF_FEATURE_XARGS_SUPPORT_REPL_STR(    "replace\0"     Optional_argument "i")
++		IF_FEATURE_XARGS_SUPPORT_PARALLEL(    "max-procs\0"   Required_argument "P")
++		IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "arg-file\0"    Required_argument "a")
++		"delimiter\0"       Required_argument "d"
++		"max-lines\0"       Optional_argument "l"
++		,
+ 		&max_args, &max_chars, &G.eof_str, &G.eof_str
+ 		IF_FEATURE_XARGS_SUPPORT_REPL_STR(, &G.repl_str, &G.repl_str)
+ 		IF_FEATURE_XARGS_SUPPORT_PARALLEL(, &G.max_procs)
+ 		IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(, &opt_a)
++		, &opt_d, &opt_L, &opt_l
+ 	);
+ 
+ #if ENABLE_FEATURE_XARGS_SUPPORT_PARALLEL
+@@ -656,6 +763,59 @@ int xargs_main(int argc UNUSED_PARAM, char **argv)
+ 		IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(read_args = process0_stdin;)
+ 		IF_FEATURE_XARGS_SUPPORT_REPL_STR(G.eol_ch = '\0';)
+ 	}
++	if (opt & OPT_DELIM) {
++		/* -d C, or an escape: \n \t \0 \\ \NNN (octal) \xHH */
++		const char *d = opt_d;
++		int c = (unsigned char)d[0];
++		if (d[0] == '\\' && d[1]) {
++			const char *e = d + 1;
++			c = bb_process_escape_sequence(&e);
++			if (*e)
++				c = -1;
++		} else if (d[0] && d[1]) {
++			c = -1;
++		}
++		if (c < 0 || !d[0])
++			bb_error_msg_and_die("Invalid input delimiter specification %s: "
++				"the delimiter must be either a single character or an escape sequence starting with \\.", opt_d);
++		G.delim = c;
++		read_args = process0_stdin;
++		IF_FEATURE_XARGS_SUPPORT_REPL_STR(G.eol_ch = c;)
++		G.eof_str = NULL;
++	}
++	if ((opt & (OPT_MAX_LINES | OPT_MAX_LINES1)) && (opt & OPT_UPTO_NUMBER)) {
++		/* as GNU: the one given last wins */
++		int last = 0;
++		for (i = 1; i < optind; i++) {
++			const char *w = argv[i];
++			if (strncmp(w, "--max-args", 10) == 0)
++				last = 'n';
++			else if (strncmp(w, "--max-lines", 11) == 0)
++				last = 'l';
++			else if (w[0] == '-' && w[1] != '-') {
++				for (w++; *w; w++) {
++					if (*w == 'n') { last = 'n'; break; }
++					if (*w == 'L' || *w == 'l') { last = *w; break; }
++					if (strchr("seEIiPad", *w)) break; /* the rest is its argument */
++				}
++			}
++		}
++		if (last == 'n') {
++			bb_simple_error_msg("warning: options --max-lines and --max-args/-n are mutually exclusive, ignoring previous --max-lines value");
++			opt &= ~(OPT_MAX_LINES | OPT_MAX_LINES1);
++		} else {
++			bb_error_msg("warning: options --max-args and %s are mutually exclusive, ignoring previous --max-args value",
++				last == 'L' ? "-L" : "--max-lines/-l");
++			opt &= ~OPT_UPTO_NUMBER;
++		}
++		option_mask32 = opt;
++	}
++	if (opt & (OPT_MAX_LINES | OPT_MAX_LINES1)) {
++		G.max_lines = (opt & OPT_MAX_LINES) ? xatou_range(opt_L, 1, INT_MAX)
++			: opt_l ? xatou_range(opt_l, 1, INT_MAX) : 1;
++		if (!(opt & (OPT_ZEROTERM | OPT_DELIM)))
++			read_args = process_lines_stdin;
++	}
+ 
+ 	argv += optind;
+ 	//argc -= optind;

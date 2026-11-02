@@ -29,6 +29,11 @@ if [[ "${1:-}" != "--no-config" ]]; then
   config SH_IS_ASH n; config SH_IS_HUSH y; config SH_IS_NONE n
   config BASH_IS_ASH n; config BASH_IS_HUSH n; config BASH_IS_NONE y
   config FEATURE_FTPD_AUTHENTICATION n
+  # date +%N / +%3N: scripts time things with `date +%s%N`; without it %N printed nothing.
+  config FEATURE_DATE_NANO y
+  # cp over a file writes into it, as GNU cp: its inode, mode and hard links stay (the non-POSIX
+  # way unlinked it and made a new one).
+  config FEATURE_NON_POSIX_CP n
   # Embedding applet scripts (mim, nologin) needs host bzip2, which this machine lacks.
   config FEATURE_SH_EMBEDDED_SCRIPTS n
   # The kernel has no module support. Also, LLD 19 miscompiles the call to filename2modname()

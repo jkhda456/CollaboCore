@@ -1,0 +1,102 @@
+diff --git a/archival/libarchive/open_transformer.c b/archival/libarchive/open_transformer.c
+index 7697421..fb15123 100644
+--- a/archival/libarchive/open_transformer.c
++++ b/archival/libarchive/open_transformer.c
+@@ -185,6 +185,52 @@ void FAST_FUNC fork_transformer(int fd, const char *transform_prog)
+ }
+ 
+ 
++#if !BB_MMU
++/* NOMMU runs an external unzipper, which wants the file position at the start of the
++ * file: the signature we read is put back with lseek(). A pipe cannot seek back
++ * (curl ... | zcat). The clone here copies our memory, as fork does, so the child can
++ * unpack itself, knowing how much of the signature was read already. */
++struct inproc_args {
++	int fd;
++	struct fd_pair *fd_pipe;
++	int signature_skipped;
++	IF_DESKTOP(long long) int FAST_FUNC (*transformer)(transformer_state_t *xstate);
++};
++
++static int inproc_child_func(void *data)
++{
++	struct inproc_args *args = (struct inproc_args *)data;
++	IF_DESKTOP(long long) int r;
++	transformer_state_t xstate;
++
++	close(args->fd_pipe->rd);
++	init_transformer_state(&xstate);
++	xstate.signature_skipped = args->signature_skipped;
++	xstate.src_fd = args->fd;
++	xstate.dst_fd = args->fd_pipe->wr;
++	r = args->transformer(&xstate);
++	close(args->fd_pipe->wr); /* send EOF */
++	_exit(/*error if:*/ r < 0);
++	return 0;
++}
++
++static void fork_transformer_inproc(int fd, int signature_skipped,
++	IF_DESKTOP(long long) int FAST_FUNC (*transformer)(transformer_state_t *xstate))
++{
++	struct fd_pair fd_pipe;
++	struct inproc_args args;
++
++	xpiped_pair(fd_pipe);
++	args.fd = fd;
++	args.fd_pipe = &fd_pipe;
++	args.signature_skipped = signature_skipped;
++	args.transformer = transformer;
++	xclone(inproc_child_func, 0, &args);
++	close(fd_pipe.wr);
++	xmove_fd(fd_pipe.rd, fd);
++}
++#endif
++
+ #if SEAMLESS_COMPRESSION
+ 
+ /* Used by e.g. rpm which gives us a fd without filename,
+@@ -262,10 +308,14 @@ static void fork_transformer_and_free(transformer_state_t *xstate)
+ 	/* NOMMU version of fork_transformer execs
+ 	 * an external unzipper that wants
+ 	 * file position at the start of the file.
++	 * A pipe cannot go back: unpack in a clone instead.
+ 	 */
+-	xlseek(xstate->src_fd, - xstate->signature_skipped, SEEK_CUR);
+-	xstate->signature_skipped = 0;
+-	fork_transformer_with_sig(xstate->src_fd, xstate->xformer, xstate->xformer_prog);
++	if (lseek(xstate->src_fd, - xstate->signature_skipped, SEEK_CUR) < 0) {
++		fork_transformer_inproc(xstate->src_fd, xstate->signature_skipped, xstate->xformer);
++	} else {
++		xstate->signature_skipped = 0;
++		fork_transformer_with_sig(xstate->src_fd, xstate->xformer, xstate->xformer_prog);
++	}
+ # endif
+ 	free(xstate);
+ }
+@@ -341,12 +391,20 @@ int FAST_FUNC open_zipped(const char *fname, int fail_if_not_compressed)
+ 		xstate->signature_skipped = 0;
+ 	}
+ # else
+-	/* NOMMU can't avoid the seek :( */
+-	xlseek(fd, - xstate->signature_skipped, SEEK_CUR);
+-	xstate->signature_skipped = 0;
+-	if (xstate->xformer) {
+-		fork_transformer_with_sig(fd, xstate->xformer, xstate->xformer_prog);
+-	} /* else: the file is not compressed */
++	/* NOMMU can't avoid the seek :( but for a pipe (a FIFO, /dev/stdin),
++	 * where a compressed stream is unpacked in a clone instead */
++	if (xstate->xformer && lseek(fd, - xstate->signature_skipped, SEEK_CUR) < 0) {
++		fork_transformer_inproc(fd, xstate->signature_skipped, xstate->xformer);
++	} else {
++		if (xstate->xformer)
++			xstate->signature_skipped = 0;
++		else
++			xlseek(fd, - xstate->signature_skipped, SEEK_CUR);
++		xstate->signature_skipped = 0;
++		if (xstate->xformer) {
++			fork_transformer_with_sig(fd, xstate->xformer, xstate->xformer_prog);
++		} /* else: the file is not compressed */
++	}
+ # endif
+ 
+ 	free(xstate);

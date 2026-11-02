@@ -1,0 +1,104 @@
+diff --git a/archival/tar.c b/archival/tar.c
+index e886641..65952b0 100644
+--- a/archival/tar.c
++++ b/archival/tar.c
+@@ -137,6 +137,54 @@
+ #define INIT_G() do { setup_common_bufsiz(); } while (0)
+ 
+ 
++#if ENABLE_FEATURE_TAR_FROM
++/* As GNU tar matches --exclude: the name without the '/' a directory has at its end in an
++ * archive, a pattern without a leading '/' against each tail that starts a component, and '*' and
++ * '?' match '/' too (its default --wildcards-match-slash for exclusion). */
++static int exclude_file(const llist_t *excluded_files, const char *file)
++{
++	char *name = NULL;
++	size_t len = strlen(file);
++	int r = 0;
++
++	if (len > 1 && file[len - 1] == '/') {
++		while (len > 1 && file[len - 1] == '/')
++			len--;
++		file = name = xstrndup(file, len);
++	}
++	for (; excluded_files && !r; excluded_files = excluded_files->link) {
++		if (excluded_files->data[0] == '/') {
++			r = fnmatch(excluded_files->data, file, FNM_LEADING_DIR) == 0;
++		} else {
++			const char *p;
++
++			for (p = file; p[0] != '\0' && !r; p++) {
++				r = (p == file || p[-1] == '/')
++				 && p[0] != '/'
++				 && fnmatch(excluded_files->data, p, FNM_LEADING_DIR) == 0;
++			}
++		}
++	}
++	free(name);
++	return r;
++}
++
++/* -t and -x: what --exclude and -X leave out matches as it does for -c (any part of the
++ * name, as GNU tar's --no-anchored); the names to extract as before */
++static char FAST_FUNC tar_filter(archive_handle_t *archive_handle)
++{
++	const char *key = archive_handle->file_header->name;
++
++	if (exclude_file(archive_handle->reject, key))
++		return EXIT_FAILURE;
++	if (archive_handle->accept && !find_list_entry2(archive_handle->accept, key))
++		return EXIT_FAILURE;
++	return EXIT_SUCCESS;
++}
++#else
++# define exclude_file(excluded_files, file) 0
++#endif
++
+ #if ENABLE_FEATURE_TAR_CREATE
+ 
+ /*
+@@ -435,35 +483,7 @@ static int writeTarHeader(struct TarBallInfo *tbInfo,
+ 	return TRUE;
+ }
+ 
+-# if ENABLE_FEATURE_TAR_FROM
+-static int exclude_file(const llist_t *excluded_files, const char *file)
+-{
+-	while (excluded_files) {
+-		if (excluded_files->data[0] == '/') {
+-			if (fnmatch(excluded_files->data, file,
+-					FNM_PATHNAME | FNM_LEADING_DIR) == 0)
+-				return 1;
+-		} else {
+-			const char *p;
+ 
+-			for (p = file; p[0] != '\0'; p++) {
+-				if ((p == file || p[-1] == '/')
+-				 && p[0] != '/'
+-				 && fnmatch(excluded_files->data, p,
+-						FNM_PATHNAME | FNM_LEADING_DIR) == 0
+-				) {
+-					return 1;
+-				}
+-			}
+-		}
+-		excluded_files = excluded_files->link;
+-	}
+-
+-	return 0;
+-}
+-# else
+-#  define exclude_file(excluded_files, file) 0
+-# endif
+ 
+ static int FAST_FUNC writeFileToTarball(struct recursive_state *state,
+ 		const char *fileName,
+@@ -1129,7 +1149,7 @@ int tar_main(int argc UNUSED_PARAM, char **argv)
+ 	}
+ 
+ 	if (tar_handle->accept || tar_handle->reject)
+-		tar_handle->filter = filter_accept_reject_list;
++		tar_handle->filter = IF_FEATURE_TAR_FROM(tar_filter) IF_NOT_FEATURE_TAR_FROM(filter_accept_reject_list);
+ 
+ 	/* Open the tar file */
+ 	{

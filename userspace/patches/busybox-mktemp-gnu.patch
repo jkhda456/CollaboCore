@@ -1,0 +1,207 @@
+diff --git a/coreutils/mktemp.c b/coreutils/mktemp.c
+index 91b2be6..29af09d 100644
+--- a/coreutils/mktemp.c
++++ b/coreutils/mktemp.c
+@@ -39,18 +39,17 @@
+ //kbuild:lib-$(CONFIG_MKTEMP) += mktemp.o
+ 
+ //usage:#define mktemp_trivial_usage
+-//usage:       "[-dt] [-p DIR] [TEMPLATE]"
++//usage:       "[-dqtu] [-p DIR] [--suffix SUFF] [TEMPLATE]"
+ //usage:#define mktemp_full_usage "\n\n"
+-//usage:       "Create a temporary file with name based on TEMPLATE and print its name.\n"
+-//usage:       "TEMPLATE must end with XXXXXX (e.g. [/dir/]nameXXXXXX).\n"
+-//usage:       "Without TEMPLATE, -t tmp.XXXXXX is assumed.\n"
++//usage:       "Create a temporary file with name based on TEMPLATE and print its name, as GNU mktemp.\n"
++//usage:       "The last run of X's in TEMPLATE (at least 3) is made random; what follows them\n"
++//usage:       "is kept (fooXXX.txt). Without TEMPLATE, tmp.XXXXXXXXXX in the base directory.\n"
+ //usage:     "\n	-d	Make directory, not file"
+ //usage:     "\n	-q	Fail silently on errors"
+-//usage:     "\n	-t	Prepend base directory name to TEMPLATE"
+-//usage:     "\n	-p DIR	Use DIR as a base directory (implies -t)"
++//usage:     "\n	-t	TEMPLATE is a name in $TMPDIR, else -p DIR, else /tmp"
++//usage:     "\n	-p DIR,--tmpdir[=DIR]	TEMPLATE is relative to DIR (else $TMPDIR, else /tmp)"
++//usage:     "\n	--suffix SUFF	Append SUFF to TEMPLATE (which must end in X)"
+ //usage:     "\n	-u	Do not create anything; print a name"
+-//usage:     "\n"
+-//usage:     "\nBase directory is: -p DIR, else $TMPDIR, else /tmp"
+ //usage:
+ //usage:#define mktemp_example_usage
+ //usage:       "$ mktemp /tmp/temp.XXXXXX\n"
+@@ -60,74 +59,132 @@
+ 
+ #include "libbb.h"
+ 
++/* names need not be secret, only unlikely to be taken: xorshift from the clock and the pid */
++static unsigned random_byte(void)
++{
++	static unsigned long long state;
++	if (!state)
++		state = monotonic_ns() ^ ((unsigned long long)getpid() << 32) ^ (uintptr_t)&state ^ time(NULL);
++	state ^= state << 13;
++	state ^= state >> 7;
++	state ^= state << 17;
++	return (unsigned)(state >> 24);
++}
++
+ int mktemp_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int mktemp_main(int argc UNUSED_PARAM, char **argv)
+ {
+-	const char *path;
+-	char *chp;
+-	unsigned opts;
++	static const char chars[] ALIGN1 =
++		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
++	const char *tmpdir, *dir = NULL, *suffix = NULL;
++	char *tmpl, *name, *base, *x_end, *x_start;
++	unsigned opts, tries;
++	size_t len;
+ 	enum {
+ 		OPT_d = 1 << 0,
+ 		OPT_q = 1 << 1,
+ 		OPT_t = 1 << 2,
+ 		OPT_p = 1 << 3,
+ 		OPT_u = 1 << 4,
+-		OPT_tmpdir = (1 << 5) * ENABLE_LONG_OPTS,
++		OPT_tmpdir = 1 << 5,
++		OPT_suffix = 1 << 6,
+ 	};
+ 
+-	path = getenv("TMPDIR");
+-	if (!path || path[0] == '\0')
+-		path = "/tmp";
++	tmpdir = getenv("TMPDIR");
++	if (tmpdir && !tmpdir[0])
++		tmpdir = NULL;
+ 
+-#if ENABLE_LONG_OPTS
+ 	opts = getopt32long(argv, "^"
+-		"dqtp:u"
++		"dqtp:u\xff::\xfe:"
+ 		"\0"
+ 		"?1" /* 1 arg max */,
+ 		"directory\0" No_argument       "d"
+ 		"quiet\0"     No_argument       "q"
+ 		"dry-run\0"   No_argument       "u"
+ 		"tmpdir\0"    Optional_argument "\xff"
+-		, &path, &path
++		"suffix\0"    Required_argument "\xfe"
++		, &dir, &dir, &suffix
+ 	);
+-#else
+-	opts = getopt32(argv, "^" "dqtp:u" "\0" "?1"/*1 arg max*/, &path);
+-#endif
++	if (opts & OPT_q)
++		logmode = LOGMODE_NONE;
+ 
+-	chp = argv[optind];
+-	if (!chp) {
+-		/* GNU coreutils 8.4:
+-		 * bare "mktemp" -> "mktemp -t tmp.XXXXXX"
+-		 */
+-		chp = xstrdup("tmp.XXXXXX");
+-		opts |= OPT_t;
++	tmpl = argv[optind];
++	if (!tmpl) {
++		/* GNU: tmp.XXXXXXXXXX, in the base directory */
++		tmpl = (char*)"tmp.XXXXXXXXXX";
++		if (!(opts & (OPT_p | OPT_tmpdir)))
++			opts |= OPT_tmpdir;
+ 	}
+-#if 0
+-	/* Don't allow directory separator in template */
+-	if ((opts & OPT_t) && bb_basename(chp) != chp) {
+-		errno = EINVAL;
+-		goto error;
++	if (suffix) {
++		if (strchr(suffix, '/'))
++			bb_error_msg_and_die("invalid suffix '%s', contains directory separator", suffix);
++		len = strlen(tmpl);
++		if (!len || tmpl[len - 1] != 'X')
++			bb_error_msg_and_die("with --suffix, template '%s' must end in X", tmpl);
+ 	}
+-#endif
+-	if (opts & (OPT_t|OPT_p|OPT_tmpdir))
+-		chp = concat_path_file(path, chp);
+-
+-	if (opts & OPT_u) {
+-		chp = mktemp(chp);
+-		if (chp[0] == '\0')
+-			goto error;
+-	} else if (opts & OPT_d) {
+-		if (mkdtemp(chp) == NULL)
+-			goto error;
++	if (opts & OPT_t) {
++		/* the name, in $TMPDIR, else -p DIR, else /tmp */
++		if (strchr(tmpl, '/'))
++			bb_error_msg_and_die("invalid template, '%s', contains directory separator", tmpl);
++		dir = tmpdir ? tmpdir : dir ? dir : "/tmp";
++	} else if (opts & (OPT_p | OPT_tmpdir)) {
++		if (!dir || !dir[0])
++			dir = tmpdir ? tmpdir : "/tmp";
++		if (tmpl[0] == '/')
++			bb_error_msg_and_die("invalid template, '%s'; with --tmpdir, it may not be absolute", tmpl);
+ 	} else {
+-		if (mkstemp(chp) < 0)
+-			goto error;
++		dir = NULL;
+ 	}
+-	puts(chp);
+-	return EXIT_SUCCESS;
+- error:
+-	if (opts & OPT_q)
++	name = dir ? concat_path_file(dir, tmpl) : xstrdup(tmpl);
++	if (suffix) {
++		char *t = xasprintf("%s%s", name, suffix);
++		free(name);
++		name = t;
++	}
++
++	/* the last run of X's in the last component */
++	base = (char*)bb_basename(name);
++	x_end = NULL;
++	for (x_start = base + strlen(base); x_start > base; x_start--) {
++		if (x_start[-1] == 'X') {
++			x_end = x_start;
++			while (x_start > base && x_start[-1] == 'X')
++				x_start--;
++			break;
++		}
++	}
++	if (!x_end || x_end - x_start < 3) {
++		bb_error_msg("too few X's in template '%s'", tmpl);
+ 		return EXIT_FAILURE;
+-	/* don't use chp as it gets mangled in case of error */
+-	bb_perror_nomsg_and_die();
++	}
++
++	for (tries = 0; tries < 10000; tries++) {
++		char *c;
++		for (c = x_start; c < x_end; c++)
++			*c = chars[random_byte() % (sizeof(chars) - 1)];
++		if (opts & OPT_u) {
++			struct stat st;
++			if (lstat(name, &st) == 0)
++				continue;
++			break;
++		}
++		if (opts & OPT_d) {
++			if (mkdir(name, 0700) == 0)
++				break;
++		} else {
++			int fd = open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
++			if (fd >= 0) {
++				close(fd);
++				break;
++			}
++		}
++		if (errno != EEXIST) {
++			/* the template, as it was given */
++			memset(x_start, 'X', x_end - x_start);
++			bb_perror_msg("failed to create %s via template '%s'", (opts & OPT_d) ? "directory" : "file", name);
++			return EXIT_FAILURE;
++		}
++	}
++	puts(name);
++	return EXIT_SUCCESS;
+ }

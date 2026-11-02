@@ -1,0 +1,1956 @@
+diff --git a/miscutils/tree.c b/miscutils/tree.c
+index 0b142c8..72740a0 100644
+--- a/miscutils/tree.c
++++ b/miscutils/tree.c
+@@ -2,6 +2,10 @@
+ /*
+  * Copyright (C) 2022 Roger Knecht <rknecht@pm.me>
+  *
++ * The options, the output and the pattern rules follow tree 2.3.1 by Steve Baker
++ * and others (GPLv2+), which agents and scripts call with -L, -I, -a, -d,
++ * --gitignore and so on.
++ *
+  * Licensed under GPLv2, see file LICENSE in this source tree.
+  */
+ //config:config TREE
+@@ -14,118 +18,1475 @@
+ 
+ //kbuild:lib-$(CONFIG_TREE) += tree.o
+ 
+-//usage:#define tree_trivial_usage NOUSAGE_STR
+-//usage:#define tree_full_usage ""
++//usage:#define tree_trivial_usage
++//usage:       "[-adlfxisphugDFQqNvtcUrJ] [-L LEVEL] [-P|-I PATTERN]... [-o FILE] [--OPTION]... [DIR]..."
++//usage:#define tree_full_usage "\n\n"
++//usage:       "List the contents of DIRs (default .) as a tree, as tree 2.3.1 does\n"
++//usage:     "\n	-a		All files, also those starting with ."
++//usage:     "\n	-d		Directories only"
++//usage:     "\n	-l		Follow symlinks to directories"
++//usage:     "\n	-f		Full path prefix for each file"
++//usage:     "\n	-x		Stay on the filesystem of DIR"
++//usage:     "\n	-L LEVEL	Descend only LEVEL directories deep"
++//usage:     "\n	-P PATTERN	List only files matching PATTERN (a|b, *, ?, [..], **)"
++//usage:     "\n	-I PATTERN	Do not list files matching PATTERN"
++//usage:     "\n	--gitignore	Filter by .gitignore files (and .git/info/exclude)"
++//usage:     "\n	--gitfile FILE	Filter by FILE, written like a .gitignore"
++//usage:     "\n	--ignore-case	Patterns ignore case"
++//usage:     "\n	--matchdirs	-P also matches directory names (and all they contain)"
++//usage:     "\n	--prune		Leave out empty directories"
++//usage:     "\n	--filelimit N	Do not descend directories with more than N entries"
++//usage:     "\n	--noreport	No count of directories and files at the end"
++//usage:     "\n	--charset X	X=ascii: draw lines with |-- and `--"
++//usage:     "\n	-o FILE		Write to FILE"
++//usage:     "\n	-i		No indentation lines"
++//usage:     "\n	-Q		Quote names; -q: '?' for unprintable bytes; -N: as they are"
++//usage:     "\n	-p -u -g	Permissions, owner, group"
++//usage:     "\n	-s -h --si	Size in bytes, human readable (1024, --si: 1000)"
++//usage:     "\n	--du		Directory sizes add up their contents"
++//usage:     "\n	-D		Modification time (-c: status change), --timefmt FMT"
++//usage:     "\n	--inodes --device	Inode and device numbers"
++//usage:     "\n	-F		Append / * = | as ls -F does"
++//usage:     "\n	--metafirst	Put [information] before the indentation"
++//usage:     "\n	-v -t -c -U	Sort by version, mtime, ctime; do not sort"
++//usage:     "\n	--sort X	X: name, version, size, mtime, ctime, none"
++//usage:     "\n	-r		Reverse the sort"
++//usage:     "\n	--dirsfirst --filesfirst"
++//usage:     "\n	-J		JSON output"
++//usage:     "\n	-C -n		Accepted; output is never colored"
+ 
+ #include "libbb.h"
+-#include "common_bufsiz.h"
+ #include "unicode.h"
+ 
+-#define prefix_buf bb_common_bufsiz1
++struct ent {
++	char *name;
++	char *lnk;          /* symlink target */
++	char *err;          /* full tree: why the directory is not listed */
++	struct ent **child; /* full tree: the directory's entries */
++	off_t size;
++	time_t mtime, ctime;
++	ino_t ino, lino;    /* the target's (stat) and the link's own (lstat) */
++	dev_t dev, ldev;
++	uid_t uid;
++	gid_t gid;
++	mode_t mode;        /* lstat */
++	mode_t lnkmode;     /* stat of a link's target */
++	smallint isdir;
++	smallint orphan;
++};
++
++struct totals {
++	long dirs, files;
++	off_t size;
++};
++
++/* One .gitignore file's patterns, applied to the entries under its directory */
++struct pat {
++	struct pat *next;
++	char *pattern;
++	smallint anchored;  /* has a / that is not the last character */
++	smallint negate;
++};
++struct ignorefile {
++	struct ignorefile *next;
++	struct pat *pats;
++	char *base;         /* its directory, relative to the listed DIR ("" = DIR) */
++	char *up;           /* for one above DIR: DIR's path relative to its directory */
++};
++
++struct inonode {
++	struct inonode *next;
++	ino_t ino;
++	dev_t dev;
++};
++
++enum { SORT_NONE, SORT_NAME, SORT_VERSION, SORT_SIZE, SORT_MTIME, SORT_CTIME };
++
++struct globals {
++	FILE *out;
++	const char **ipat, **pat;
++	int nipat, npat;
++	int level;           /* -L minus 1, -1: no limit */
++	int flimit;
++	int *dirs;           /* per level: 1 more entries follow, 2 the last one */
++	int maxdirs;
++	int errors;
++	int basesort;
++	int topsort;         /* 0, 1 dirsfirst, 2 filesfirst */
++	const char *root;    /* the listed DIR, to make paths relative to it */
++	size_t rootlen;
++	const char *timefmt;
++	const char *vert, *vert_left, *corner;
++	struct ignorefile *igstack;
++	struct ignorefile *gitfiles; /* --gitfile: below all .gitignore files */
++	struct inonode *inotab[256];
++	smallint a, d, l, f, x, i, q, N, Q, p, u, g, s, h, si, du, D, c, F, inode, dev;
++	smallint reverse, noreport, prune, matchdirs, ignorecase, gitignore, metafirst, J;
++	smallint fulltree;
++	smallint utf8;
++};
++#define G (*ptr_to_globals)
++
++/* ---- patterns, as tree's patmatch(): | alternatives, * not across /, ** across, a
++ * trailing / matches only a directory */
++
++static int lower(int c)
++{
++	return G.ignorecase ? tolower((unsigned char)c) : (unsigned char)c;
++}
+ 
+-static void tree_print(unsigned count[2], const char* directory_name, char* prefix_pos)
++static int patmatch(const char *buf, const char *pat, int isdir)
+ {
+-	struct dirent **entries;
+-	int index, size;
+-	const char *bar = "|   ";
+-	const char *mid = "|-- ";
+-	const char *end = "`-- ";
++	int match = 1, n;
++	const char *bar;
++	char pprev = 0;
+ 
+-#if ENABLE_UNICODE_SUPPORT
+-	if (unicode_status == UNICODE_ON) {
+-		bar = "│   ";
+-		mid = "├── ";
+-		end = "└── ";
++	bar = strchr(pat, '|');
++	if (bar) {
++		char *one;
++		if (bar == pat || !bar[1])
++			return -1;
++		one = xstrndup(pat, bar - pat);
++		match = patmatch(buf, one, isdir);
++		free(one);
++		if (match != 1)
++			match = patmatch(buf, bar + 1, isdir);
++		return match;
+ 	}
+-#endif
+ 
+-	// read directory entries
+-	size = scandir(directory_name, &entries, NULL, alphasort);
++	while (*pat && match) {
++		switch (*pat) {
++		case '[': {
++			char m;
++			pat++;
++			if (*pat != '^') {
++				n = 1;
++				match = 0;
++			} else {
++				pat++;
++				n = 0;
++			}
++			while (*pat != ']') {
++				if (*pat == '\\')
++					pat++;
++				if (!*pat)
++					return -1;
++				if (pat[1] == '-') {
++					m = *pat;
++					pat += 2;
++					if (*pat == '\\' && *pat)
++						pat++;
++					if (lower(*buf) >= lower(m) && lower(*buf) <= lower(*pat))
++						match = n;
++					if (!*pat)
++						pat--;
++				} else if (lower(*buf) == lower(*pat))
++					match = n;
++				pat++;
++			}
++			buf++;
++			break;
++		}
++		case '*':
++			pat++;
++			if (!*pat)
++				return strchr(buf, '/') == NULL;
++			match = 0;
++			if (*pat == '*') {
++				pat++;
++				if (!*pat)
++					return 1;
++				while (*buf && !(match = patmatch(buf, pat, isdir))) {
++					/* ** between two /'s also matches no directory at all */
++					if (pprev == '/' && *pat == '/' && pat[1]
++					 && (match = patmatch(buf, pat + 1, isdir))
++					)
++						return match;
++					buf++;
++					while (*buf && *buf != '/')
++						buf++;
++				}
++			} else {
++				while (*buf && !(match = patmatch(buf++, pat, isdir)))
++					if (*buf == '/')
++						break;
++			}
++			if (!match && (!*buf || *buf == '/'))
++				match = patmatch(buf, pat, isdir);
++			return match;
++		case '?':
++			if (!*buf)
++				return 0;
++			buf++;
++			break;
++		case '/':
++			if (!pat[1] && !*buf)
++				return isdir;
++			match = (*buf++ == *pat);
++			break;
++		case '\\':
++			if (pat[1])
++				pat++;
++			/* fall through */
++		default:
++			match = (lower(*buf++) == lower(*pat));
++			break;
++		}
++		pprev = *pat++;
++		if (match < 1)
++			return match;
++	}
++	if (!*buf)
++		return match;
++	return 0;
++}
++
++/* NAME or, with checkpaths, PATH or any part of it after a / */
++static int patlist(const char **pats, int npats, const char *name, int isdir, int checkpaths)
++{
++	int k;
++	for (k = 0; k < npats; k++) {
++		const char *pc;
++		if (patmatch(name, pats[k], isdir) == 1)
++			return 1;
++		if (!checkpaths)
++			continue;
++		for (pc = strchr(name, '/'); pc && *pc; pc = strchr(pc + 1, '/'))
++			if (patmatch(pc + 1, pats[k], isdir) == 1)
++				return 1;
++	}
++	return 0;
++}
++
++/* ---- .gitignore */
++
++/* git's rules for a line: trailing spaces go unless escaped; \ escapes the next character */
++static void gittrim(char *s)
++{
++	ssize_t i, e = (ssize_t)strlen(s) - 1;
+ 
+-	if (size < 0) {
+-		fputs_stdout(directory_name);
+-		puts(" [error opening dir]");
++	while (e >= 0 && (s[e] == '\n' || s[e] == '\r'))
++		e--;
++	for (i = e; i >= 0; i--) {
++		if (s[i] != ' ')
++			break;
++		if (i && s[i - 1] == '\\')
++			break;
++		e--;
++	}
++	s[e + 1] = '\0';
++}
++
++static struct ignorefile *load_ignorefile(const char *file, const char *base, char *up)
++{
++	struct ignorefile *ig;
++	struct pat **tail;
++	FILE *fp;
++	char *line;
++
++	fp = fopen_for_read(file);
++	if (!fp)
++		return NULL;
++	ig = xzalloc(sizeof(*ig));
++	ig->base = xstrdup(base);
++	ig->up = up;
++	tail = &ig->pats;
++	while ((line = xmalloc_fgetline(fp)) != NULL) {
++		char *s = line, *sl;
++		struct pat *p;
++
++		gittrim(s);
++		if (s[0] == '#' || !s[0]) {
++			free(line);
++			continue;
++		}
++		p = xzalloc(sizeof(*p));
++		if (s[0] == '!') {
++			p->negate = 1;
++			s++;
++		} else if (s[0] == '\\' && (s[1] == '!' || s[1] == '#'))
++			s++;
++		sl = strchr(s, '/');
++		p->anchored = (sl && sl[1]);
++		if (s[0] == '/')
++			s++;
++		p->pattern = xstrdup(s);
++		free(line);
++		*tail = p;
++		tail = &p->next;
++	}
++	fclose(fp);
++	return ig;
++}
++
++static void push_ignorefile(struct ignorefile *ig)
++{
++	if (ig) {
++		ig->next = G.igstack;
++		G.igstack = ig;
++	}
++}
++
++static void pop_ignorefile(void)
++{
++	struct ignorefile *ig = G.igstack;
++	struct pat *p, *n;
++
++	G.igstack = ig->next;
++	for (p = ig->pats; p; p = n) {
++		n = p->next;
++		free(p->pattern);
++		free(p);
++	}
++	free(ig->base);
++	free(ig->up);
++	free(ig);
++}
++
++/* DIR's path from the directory REAL[0..TL) is in, NULL for that directory itself */
++static char *up_from(const char *real, size_t tl)
++{
++	const char *u = real + tl;
++	while (*u == '/')
++		u++;
++	return *u ? xstrdup(u) : NULL;
++}
++
++/* The .gitignore files from the directory that has .git (or /) down to DIR, the outer ones
++ * pushed first so that the inner ones decide, .git/info/exclude below them all. Each one's
++ * patterns are relative to its own directory. */
++static void gitignore_search(const char *dir)
++{
++	char *real = xmalloc_realpath(dir);
++	char *file, *d;
++	size_t rl, tl;
++
++	if (!real)
+ 		return;
++	rl = tl = strlen(real);
++	for (;;) {
++		int isgit;
++		d = xstrndup(real, tl);
++		file = concat_path_file(d, ".git");
++		isgit = is_directory(file, 1);
++		free(file);
++		free(d);
++		if (isgit || tl <= 1)
++			break;
++		while (tl > 1 && real[tl - 1] != '/')
++			tl--;
++		if (tl > 1)
++			tl--;
++	}
++	d = xstrndup(real, tl);
++	file = concat_path_file(d, ".git/info/exclude");
++	push_ignorefile(load_ignorefile(file, "", up_from(real, tl)));
++	free(file);
++	free(d);
++	for (;;) {
++		d = xstrndup(real, tl);
++		file = concat_path_file(d, ".gitignore");
++		push_ignorefile(load_ignorefile(file, "", up_from(real, tl)));
++		free(file);
++		free(d);
++		if (tl >= rl)
++			break;
++		tl++;
++		while (tl < rl && real[tl] != '/')
++			tl++;
+ 	}
++	free(real);
++}
+ 
+-	// print directory name
+-	puts(directory_name);
++/* What one file says of an entry: 1 ignored, 0 included again (!), -1 nothing.
++ * RELPATH is relative to the listed DIR; the last pattern that matches decides. */
++static int ig_decide(struct ignorefile *ig, const char *relpath, const char *name, int isdir)
++{
++	struct pat *p;
++	const char *rel = relpath;
++	char *joined = NULL;
++	int decided = -1;
+ 
+-	// switch to sub directory
+-	xchdir(directory_name);
++	if (ig->up) {
++		rel = joined = concat_path_file(ig->up, relpath);
++	} else if (ig->base[0]) {
++		size_t bl = strlen(ig->base);
++		if (strncmp(relpath, ig->base, bl) != 0 || relpath[bl] != '/')
++			return -1;
++		rel = relpath + bl + 1;
++	}
++	for (p = ig->pats; p; p = p->next) {
++		if (patmatch(p->anchored ? rel : name, p->pattern, isdir) == 1)
++			decided = !p->negate;
++	}
++	free(joined);
++	return decided;
++}
+ 
+-	// print all directory entries
+-	for (index = 0; index < size;) {
+-		struct dirent *dirent = entries[index++];
++/* true when the .gitignore files leave this entry out: as in git, the file nearest to it
++ * that has a matching pattern decides */
++static int gitignored(const char *relpath, const char *name, int isdir)
++{
++	struct ignorefile *ig;
++	int r;
++
++	for (ig = G.igstack; ig; ig = ig->next)
++		if ((r = ig_decide(ig, relpath, name, isdir)) >= 0)
++			return r;
++	for (ig = G.gitfiles; ig; ig = ig->next)
++		if ((r = ig_decide(ig, relpath, name, isdir)) >= 0)
++			return r;
++	return 0;
++}
+ 
+-		// filter hidden files and directories
+-		if (dirent->d_name[0] != '.') {
+-			int status;
+-			struct stat statBuf;
++/* ---- directories seen, for -l loops */
+ 
+-//TODO: when -l is implemented, use stat, not lstat, if -l
+-			status = lstat(dirent->d_name, &statBuf);
++static int findino(ino_t ino, dev_t dev)
++{
++	struct inonode *n;
++	for (n = G.inotab[ino & 255]; n; n = n->next)
++		if (n->ino == ino && n->dev == dev)
++			return 1;
++	return 0;
++}
++
++static void saveino(ino_t ino, dev_t dev)
++{
++	struct inonode *n = xmalloc(sizeof(*n));
++	n->ino = ino;
++	n->dev = dev;
++	n->next = G.inotab[ino & 255];
++	G.inotab[ino & 255] = n;
++}
++
++/* ---- reading */
++
++static const char *relative(const char *path)
++{
++	if (strncmp(path, G.root, G.rootlen) != 0)
++		return path;
++	path += G.rootlen;
++	while (*path == '/')
++		path++;
++	return path;
++}
+ 
+-			if (index == size) {
+-				strcpy(prefix_pos, end);
++static struct ent *getinfo(const char *name, const char *path)
++{
++	struct ent *e;
++	struct stat st, lst;
++	int rs = 0, isdir;
++
++	if (lstat(path, &lst) < 0)
++		return NULL;
++	if (S_ISLNK(lst.st_mode)) {
++		rs = stat(path, &st);
++		if (rs < 0)
++			memset(&st, 0, sizeof(st));
++	} else
++		st = lst;
++	isdir = S_ISDIR(st.st_mode);
++
++	if (G.gitignore && gitignored(relative(path), name, isdir))
++		return NULL;
++	if (!S_ISDIR(lst.st_mode) && !(G.l && isdir)) {
++		if (G.npat && !patlist(G.pat, G.npat, name, isdir, 0)
++		 && !patlist(G.pat, G.npat, path, isdir, 1))
++			return NULL;
++	}
++	if (G.nipat && (patlist(G.ipat, G.nipat, name, isdir, 0)
++	             || patlist(G.ipat, G.nipat, path, isdir, 1)))
++		return NULL;
++	if (G.d && !isdir)
++		return NULL;
++
++	e = xzalloc(sizeof(*e));
++	e->name = xstrdup(name);
++	e->mode = lst.st_mode;
++	e->uid = lst.st_uid;
++	e->gid = lst.st_gid;
++	e->size = lst.st_size;
++	e->dev = st.st_dev;
++	e->ino = st.st_ino;
++	e->ldev = lst.st_dev;
++	e->lino = lst.st_ino;
++	e->ctime = lst.st_ctime;
++	e->mtime = lst.st_mtime;
++	e->isdir = isdir;
++	if (S_ISLNK(lst.st_mode)) {
++		e->lnk = xmalloc_readlink(path);
++		if (!e->lnk) {
++			e->lnk = xstrdup("[Error reading symbolic link information]");
++			e->isdir = 0;
++		} else if (rs < 0)
++			e->orphan = 1;
++		e->lnkmode = st.st_mode;
++	}
++	return e;
++}
++
++static void free_dir(struct ent **d)
++{
++	int k;
++	if (!d)
++		return;
++	for (k = 0; d[k]; k++) {
++		free(d[k]->name);
++		free(d[k]->lnk);
++		free(d[k]->err);
++		free_dir(d[k]->child);
++		free(d[k]);
++	}
++	free(d);
++}
++
++static char *path_join(const char *dir, const char *name)
++{
++	if (last_char_is(dir, '/'))
++		return xasprintf("%s%s", dir, name);
++	return xasprintf("%s/%s", dir, name);
++}
++
++/* The entries of DIR left after the filters, unsorted; *n: how many, -1 when DIR cannot be read */
++static struct ent **read_dir(const char *dir, ssize_t *n)
++{
++	struct ent **dl = NULL;
++	struct dirent *de;
++	DIR *d;
++	size_t p = 0;
++
++	*n = -1;
++	d = opendir(dir);
++	if (!d)
++		return NULL;
++	while ((de = readdir(d)) != NULL) {
++		struct ent *e;
++		char *path;
++
++		if (DOT_OR_DOTDOT(de->d_name))
++			continue;
++		if (!G.a && de->d_name[0] == '.')
++			continue;
++		path = path_join(dir, de->d_name);
++		e = getinfo(de->d_name, path);
++		free(path);
++		if (e) {
++			dl = xrealloc_vector(dl, 6, p);
++			dl[p++] = e;
++		}
++	}
++	closedir(d);
++	*n = p;
++	if (p == 0) {
++		free(dl);
++		return NULL;
++	}
++	dl[p] = NULL;
++	return dl;
++}
++
++/* .gitignore of a directory we descend into */
++static int push_dir_ignorefile(const char *dir)
++{
++	struct ignorefile *ig;
++	char *file;
++
++	if (!G.gitignore)
++		return 0;
++	file = concat_path_file(dir, ".gitignore");
++	ig = load_ignorefile(file, relative(dir), NULL);
++	free(file);
++	push_ignorefile(ig);
++	return ig != NULL;
++}
++
++/* ---- sorting */
++
++static int basecmp(const struct ent *a, const struct ent *b)
++{
++	int v;
++	switch (G.basesort) {
++	case SORT_VERSION:
++		v = strverscmp(a->name, b->name);
++		break;
++	case SORT_SIZE:
++		v = a->size == b->size ? 0 : (a->size < b->size ? 1 : -1);
++		if (v == 0)
++			v = strcmp(a->name, b->name);
++		break;
++	case SORT_MTIME:
++	case SORT_CTIME: {
++		time_t ta = G.basesort == SORT_MTIME ? a->mtime : a->ctime;
++		time_t tb = G.basesort == SORT_MTIME ? b->mtime : b->ctime;
++		v = ta == tb ? strcmp(a->name, b->name) : (ta < tb ? -1 : 1);
++		break;
++	}
++	default:
++		v = strcmp(a->name, b->name);
++	}
++	return G.reverse ? -v : v;
++}
++
++static int sortcmp(const void *pa, const void *pb)
++{
++	const struct ent *a = *(const struct ent **)pa;
++	const struct ent *b = *(const struct ent **)pb;
++
++	if (G.topsort && a->isdir != b->isdir) {
++		int dirfirst = (G.topsort == 1);
++		return (a->isdir == dirfirst) ? -1 : 1;
++	}
++	return basecmp(a, b);
++}
++
++static void sort_dir(struct ent **d, ssize_t n)
++{
++	if (d && G.basesort != SORT_NONE)
++		qsort(d, n, sizeof(d[0]), sortcmp);
++}
++
++/* With --du, --prune or --matchdirs, the whole tree is read before it is printed */
++static struct ent **getfulltree(const char *d, unsigned long lev, dev_t dev, off_t *size, char **err)
++{
++	struct ent **dir, **sav;
++	ssize_t n;
++	int saved_npat = 0, pushed;
++	const char *last;
++
++	*err = NULL;
++	if (G.level >= 0 && lev > (unsigned long)G.level)
++		return NULL;
++	if (G.x && lev == 0) {
++		struct stat sb;
++		if (stat(d, &sb) == 0)
++			dev = sb.st_dev;
++	}
++	/* a directory that -P matches is listed with all it has */
++	last = strrchr(d, '/');
++	if (G.npat && (patlist(G.pat, G.npat, d, 1, 1) || (last && patlist(G.pat, G.npat, last + 1, 1, 0)))) {
++		saved_npat = G.npat;
++		G.npat = 0;
++	}
++	pushed = lev ? push_dir_ignorefile(d) : 0;
++	sav = dir = read_dir(d, &n);
++	if (!dir && n) {
++		*err = xstrdup("error opening dir");
++		goto out;
++	}
++	if (n == 0)
++		goto out;
++	if (G.flimit > 0 && n > G.flimit) {
++		*err = xasprintf("%ld entries exceeds filelimit, not opening dir", (long)n);
++		free_dir(sav);
++		sav = NULL;
++		goto out;
++	}
++	while (*dir) {
++		struct ent *e = *dir;
++		if (e->isdir && !(G.x && dev != e->dev)) {
++			if (e->lnk) {
++				if (G.l) {
++					if (findino(e->ino, e->dev))
++						e->err = xstrdup("recursive, not followed");
++					else {
++						char *path;
++						saveino(e->ino, e->dev);
++						path = e->lnk[0] == '/' ? xstrdup(e->lnk) : path_join(d, e->lnk);
++						e->child = getfulltree(path, lev + 1, dev, &e->size, &e->err);
++						free(path);
++					}
++				}
+ 			} else {
+-				strcpy(prefix_pos, mid);
+-			}
+-			fputs_stdout(prefix_buf);
+-
+-			if (status == 0 && S_ISLNK(statBuf.st_mode)) {
+-				// handle symlink
+-				char* symlink_path = xmalloc_readlink(dirent->d_name);
+-				printf("%s -> %s\n", dirent->d_name, symlink_path);
+-				free(symlink_path);
+-				count[1]++;
+-			} else if (status == 0 && S_ISDIR(statBuf.st_mode)
+-			 && (prefix_pos - prefix_buf) < (COMMON_BUFSIZE - 16)
++				char *path = path_join(d, e->name);
++				saveino(e->ino, e->dev);
++				e->child = getfulltree(path, lev + 1, dev, &e->size, &e->err);
++				free(path);
++			}
++			/* --prune: no empty directories, but for those -P matches with --matchdirs */
++			if (G.prune && !e->child
++			 && !(G.matchdirs && G.npat && patlist(G.pat, G.npat, e->name, 1, 0))
+ 			) {
+-				// handle directory
+-				char* pos;
+-				if (index == size) {
+-					pos = stpcpy(prefix_pos, "    ");
+-				} else {
+-					pos = stpcpy(prefix_pos, bar);
++				struct ent **p;
++				for (p = dir; *p; p++)
++					p[0] = p[1];
++				n--;
++				e->child = NULL;
++				free(e->name);
++				free(e->lnk);
++				free(e->err);
++				free(e);
++				continue;
++			}
++		}
++		if (G.du)
++			*size += e->size;
++		dir++;
++	}
++	sort_dir(sav, n);
++	if (n == 0) {
++		free_dir(sav);
++		sav = NULL;
++	}
++ out:
++	if (saved_npat)
++		G.npat = saved_npat;
++	if (pushed)
++		pop_ignorefile();
++	return sav;
++}
++
++/* ---- printing */
++
++static const char *prot(mode_t m)
++{
++	static char buf[11];
++	bb_mode_string(buf, m);
++	if (!strchr("-dlcbsp", buf[0]))
++		buf[0] = '?';
++	return buf;
++}
++
++static char *do_date(time_t t)
++{
++	static char buf[256];
++	struct tm *tm = localtime(&t);
++
++	if (G.timefmt)
++		strftime(buf, sizeof(buf) - 1, G.timefmt, tm);
++	else {
++		time_t now = time(NULL);
++		if (t > now || t + 6L * 31 * 24 * 60 * 60 < now)
++			strftime(buf, sizeof(buf) - 1, "%b %e  %Y", tm);
++		else
++			strftime(buf, sizeof(buf) - 1, "%b %e %R", tm);
++	}
++	return buf;
++}
++
++static int psize(char *buf, off_t size)
++{
++	static const char iec[] ALIGN1 = "BKMGTPEZY";
++	static const char si[] ALIGN1 = "dkMGTPEZY";
++	const char *unit = G.si ? si : iec;
++	int idx, usize = G.si ? 1000 : 1024;
++
++	if (G.h || G.si) {
++		for (idx = size < usize ? 0 : 1; size >= (off_t)usize * usize; idx++, size /= usize)
++			continue;
++		if (!idx)
++			return sprintf(buf, " %4d", (int)size);
++		return sprintf(buf, ((size + 52) / usize >= 10) ? " %3.0f%c" : " %3.1f%c",
++				(float)size / (float)usize, unit[idx]);
++	}
++	return sprintf(buf, " %11lld", (long long)size);
++}
++
++static char ftype_char(mode_t mode)
++{
++	if (!G.d && S_ISDIR(mode))
++		return '/';
++	if (S_ISSOCK(mode))
++		return '=';
++	if (S_ISFIFO(mode))
++		return '|';
++	if (S_ISLNK(mode))
++		return '@';
++	if (S_ISREG(mode) && (mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
++		return '*';
++	return 0;
++}
++
++static const char *ftype_name(mode_t mode)
++{
++	if (S_ISREG(mode)) return "file";
++	if (S_ISDIR(mode)) return "directory";
++	if (S_ISLNK(mode)) return "link";
++	if (S_ISCHR(mode)) return "char";
++	if (S_ISBLK(mode)) return "block";
++	if (S_ISSOCK(mode)) return "socket";
++	if (S_ISFIFO(mode)) return "fifo";
++	return "unknown";
++}
++
++static void fillinfo(char *buf, const struct ent *e)
++{
++	int n = 0;
++
++	buf[0] = '\0';
++	if (!e)
++		return;
++	if (G.inode)
++		n += sprintf(buf, " %7lld", (long long)e->lino);
++	if (G.dev)
++		n += sprintf(buf + n, " %3d", (int)e->ldev);
++	if (G.p)
++		n += sprintf(buf + n, " %s", prot(e->mode));
++	if (G.u)
++		n += sprintf(buf + n, " %-8.32s", uid2uname_utoa(e->uid));
++	if (G.g)
++		n += sprintf(buf + n, " %-8.32s", gid2group_utoa(e->gid));
++	if (G.s)
++		n += psize(buf + n, e->size);
++	if (G.D)
++		n += sprintf(buf + n, " %s", do_date(G.c ? e->ctime : e->mtime));
++	if (buf[0] == ' ') {
++		buf[0] = '[';
++		strcpy(buf + n, "]");
++	}
++}
++
++/* UTF-8 sequence length at S, 0 when it is not valid UTF-8; *cp: the code point */
++static int utf8_len(const unsigned char *s, unsigned *cp)
++{
++	int len, k;
++	unsigned c = s[0];
++
++	if (c < 0x80) { *cp = c; return 1; }
++	if (c < 0xc2) return 0;
++	if (c < 0xe0) { len = 2; c &= 0x1f; }
++	else if (c < 0xf0) { len = 3; c &= 0x0f; }
++	else if (c < 0xf5) { len = 4; c &= 0x07; }
++	else return 0;
++	for (k = 1; k < len; k++) {
++		if ((s[k] & 0xc0) != 0x80)
++			return 0;
++		c = (c << 6) | (s[k] & 0x3f);
++	}
++	*cp = c;
++	return len;
++}
++
++static int valid_utf8(const char *s)
++{
++	unsigned cp;
++	while (*s) {
++		int len = utf8_len((const unsigned char *)s, &cp);
++		if (!len)
++			return 0;
++		s += len;
++	}
++	return 1;
++}
++
++/* A name, as tree prints it: unprintable characters as \ooo (-q: ?, -N: as they are) */
++static void printit(const char *s)
++{
++	FILE *out = G.out;
++
++	if (G.N) {
++		fprintf(out, G.Q ? "\"%s\"" : "%s", s);
++		return;
++	}
++	if (G.Q)
++		putc('"', out);
++	if (G.utf8 && valid_utf8(s)) {
++		while (*s) {
++			unsigned cp;
++			int len = utf8_len((const unsigned char *)s, &cp);
++			if (cp >= 0x20 && cp != 0x7f && !(cp >= 0x80 && cp < 0xa0))
++				fwrite(s, 1, len, out);
++			else if (G.q)
++				putc('?', out);
++			else
++				fprintf(out, "\\%03o", cp);
++			s += len;
++		}
++	} else {
++		for (; *s; s++) {
++			int c = (unsigned char)*s;
++			if ((c >= 7 && c <= 13) || c == '\\' || (c == '"' && G.Q) || (c == ' ' && !G.Q)) {
++				putc('\\', out);
++				putc(c > 13 ? c : "abtnvfr"[c - 7], out);
++			} else if (c >= 0x20 && c < 0x7f)
++				putc(c, out);
++			else if (G.q)
++				putc((G.utf8 && c > 127) ? c : '?', out);
++			else
++				fprintf(out, "\\%03o", c);
++		}
++	}
++	if (G.Q)
++		putc('"', out);
++}
++
++static void indent(int maxlevel)
++{
++	int k;
++	for (k = 1; k <= maxlevel && G.dirs[k]; k++) {
++		fputs(G.dirs[k + 1]
++			? (G.dirs[k] == 1 ? G.vert : "   ")
++			: (G.dirs[k] == 1 ? G.vert_left : G.corner), G.out);
++		putc(' ', G.out);
++	}
++}
++
++static void json_encode(const char *s)
++{
++	static const char ctrl[] ALIGN1 = "0-------btn-fr------------------";
++	for (; *s; s++) {
++		unsigned char c = *s;
++		if (c < 32) {
++			if (ctrl[c] != '-')
++				fprintf(G.out, "\\%c", ctrl[c]);
++			else
++				fprintf(G.out, "\\u%04x", c);
++		} else if (c == '"' || c == '\\')
++			fprintf(G.out, "\\%c", c);
++		else
++			putc(c, G.out);
++	}
++}
++
++static void json_indent(int maxlevel)
++{
++	int k;
++	if (G.i)
++		return;
++	fputs("    ", G.out);
++	for (k = 0; k < maxlevel; k++)
++		fputs("    ", G.out);
++}
++
++static void printinfo(const struct ent *e, int level)
++{
++	char info[512];
++
++	if (G.J) {
++		json_indent(level);
++		fprintf(G.out, "{\"type\":\"%s\"", ftype_name(e ? e->mode : 0));
++		return;
++	}
++	fillinfo(info, e);
++	if (G.metafirst) {
++		if (info[0] == '[')
++			fprintf(G.out, "%s  ", info);
++		if (!G.i)
++			indent(level);
++	} else {
++		if (!G.i)
++			indent(level);
++		if (info[0] == '[')
++			fprintf(G.out, "%s  ", info);
++	}
++}
++
++/* true when the JSON object stays open for "contents" */
++static int printfile(const char *filename, const struct ent *e, int descend)
++{
++	char c;
++
++	if (G.J) {
++		fputs(",\"name\":\"", G.out);
++		json_encode(filename);
++		putc('"', G.out);
++		if (e) {
++			if (e->lnk) {
++				fputs(",\"target\":\"", G.out);
++				json_encode(e->lnk);
++				putc('"', G.out);
++			}
++			if (G.inode)
++				fprintf(G.out, ",\"inode\":%lld", (long long)e->ino);
++			if (G.dev)
++				fprintf(G.out, ",\"dev\":%d", (int)e->dev);
++			if (G.p)
++				fprintf(G.out, ",\"mode\":\"%04o\",\"prot\":\"%s\"", (unsigned)(e->mode & 07777), prot(e->mode));
++			if (G.u)
++				fprintf(G.out, ",\"user\":\"%s\"", uid2uname_utoa(e->uid));
++			if (G.g)
++				fprintf(G.out, ",\"group\":\"%s\"", gid2group_utoa(e->gid));
++			if (G.s) {
++				if (G.h || G.si) {
++					char nbuf[64];
++					psize(nbuf, e->size);
++					fprintf(G.out, ",\"size\":\"%s\"", skip_whitespace(nbuf));
++				} else
++					fprintf(G.out, ",\"size\":%lld", (long long)e->size);
++			}
++			if (G.D)
++				fprintf(G.out, ",\"time\":\"%s\"", do_date(G.c ? e->ctime : e->mtime));
++			if (e->isdir && e->err)
++				descend = 1;
++		}
++		if (descend)
++			fputs(",\"contents\":[", G.out);
++		else
++			putc('}', G.out);
++		return descend;
++	}
++
++	printit(filename);
++	if (e) {
++		if (G.F && !e->lnk && (c = ftype_char(e->mode)) != 0)
++			putc(c, G.out);
++		if (e->lnk) {
++			fputs(" -> ", G.out);
++			printit(e->lnk);
++			if (G.F && (c = ftype_char(e->lnkmode)) != 0)
++				putc(c, G.out);
++		}
++	}
++	return 0;
++}
++
++static void print_error(const char *err)
++{
++	if (G.J)
++		fprintf(G.out, "{\"error\": \"%s\"}", err);
++	else
++		fprintf(G.out, "  [%s]", err);
++}
++
++static void newline(int needcomma)
++{
++	if (G.J)
++		fprintf(G.out, "%s%s", needcomma ? "," : "", G.i ? "" : "\n");
++	else
++		putc('\n', G.out);
++}
++
++static void close_json(int level, int needcomma)
++{
++	json_indent(level);
++	fprintf(G.out, "]}%s%s", needcomma ? "," : "", G.i ? "" : "\n");
++}
++
++static struct totals listdir(const char *dirname, struct ent **dir, int lev, dev_t dev)
++{
++	struct totals tot = { 0, 0, 0 };
++	ssize_t n;
++
++	if (!dir || !*dir)
++		return tot;
++	for (n = 0; dir[n]; n++)
++		continue;
++	sort_dir(dir, n);
++
++	if (lev + 2 >= G.maxdirs) {
++		G.dirs = xrealloc(G.dirs, sizeof(int) * (G.maxdirs += 256));
++		memset(G.dirs + G.maxdirs - 256, 0, sizeof(int) * 256);
++	}
++	G.dirs[lev] = dir[1] ? 1 : 2;
++
++	for (; *dir; dir++) {
++		struct ent *e = *dir;
++		struct ent **subdir = NULL;
++		char *path, *newpath, *err = NULL, *errbuf = NULL;
++		const char *filename;
++		int descend = 0, needsclosed, pushed = 0;
++
++		printinfo(e, lev);
++		path = path_join(dirname, e->name);
++		newpath = path;
++		filename = G.f ? path : e->name;
++
++		if (e->isdir) {
++			int found = 0;
++			tot.dirs++;
++			if (!G.fulltree) {
++				found = findino(e->ino, e->dev);
++				if (!found)
++					saveino(e->ino, e->dev);
++			}
++			if (!(G.x && dev != e->dev) && (!e->lnk || G.l)) {
++				descend = 1;
++				if (e->lnk) {
++					newpath = e->lnk[0] == '/' ? xstrdup(e->lnk) : path_join(dirname, e->lnk);
++					if (found) {
++						err = (char *)"recursive, not followed";
++						if (G.level >= 0 && lev > G.level)
++							err = NULL;
++						descend = -1;
++					}
+ 				}
+-				tree_print(count, dirent->d_name, pos);
+-				count[0]++;
+-			} else {
+-				// handle file
+-				puts(dirent->d_name);
+-				count[1]++;
++				if (G.level >= 0 && lev > G.level)
++					descend = 0;
++				if (descend > 0) {
++					if (G.fulltree) {
++						subdir = e->child;
++						err = e->err;
++					} else {
++						pushed = push_dir_ignorefile(newpath);
++						subdir = read_dir(newpath, &n);
++						if (!subdir && n) {
++							err = (char *)"error opening dir";
++							G.errors++;
++						}
++						if (G.flimit > 0 && n > G.flimit) {
++							err = errbuf = xasprintf("%ld entries exceeds filelimit, not opening dir", (long)n);
++							G.errors++;
++							free_dir(subdir);
++							subdir = NULL;
++						}
++					}
++					if (!subdir)
++						descend = 0;
++				}
++			}
++		} else
++			tot.files++;
++
++		needsclosed = printfile(filename, e, descend + (G.J && G.errors));
++		if (err)
++			print_error(err);
++
++		if (descend > 0) {
++			struct totals sub;
++			newline(0);
++			sub = listdir(newpath, subdir, lev + 1, dev);
++			tot.dirs += sub.dirs;
++			tot.files += sub.files;
++		} else if (!needsclosed)
++			newline(dir[1] != NULL);
++
++		if (!G.fulltree)
++			free_dir(subdir);
++		if (needsclosed)
++			close_json(descend ? lev : -1, dir[1] != NULL);
++		if (dir[1] && !dir[2])
++			G.dirs[lev] = 2;
++		if (pushed)
++			pop_ignorefile();
++		if (newpath != path)
++			free(newpath);
++		free(path);
++		free(errbuf);
++	}
++	G.dirs[lev] = 0;
++	return tot;
++}
++
++static void report(struct totals tot)
++{
++	if (G.J) {
++		putc(',', G.out);
++		json_indent(0);
++		fputs("{\"type\":\"report\"", G.out);
++		if (G.du)
++			fprintf(G.out, ",\"size\":%lld", (long long)tot.size);
++		fprintf(G.out, ",\"directories\":%ld", tot.dirs);
++		if (!G.d)
++			fprintf(G.out, ",\"files\":%ld", tot.files);
++		putc('}', G.out);
++		return;
++	}
++	putc('\n', G.out);
++	if (G.du) {
++		char buf[64];
++		psize(buf, tot.size);
++		fprintf(G.out, "%s%s used in ", buf, (G.h || G.si) ? "" : " bytes");
++	}
++	if (G.d)
++		fprintf(G.out, "%ld director%s\n", tot.dirs, tot.dirs == 1 ? "y" : "ies");
++	else
++		fprintf(G.out, "%ld director%s, %ld file%s\n",
++			tot.dirs, tot.dirs == 1 ? "y" : "ies", tot.files, tot.files == 1 ? "" : "s");
++}
++
++static void emit_tree(char **dirname)
++{
++	struct totals tot = { 0, 0, 0 };
++	int k;
++
++	if (G.J)
++		fprintf(G.out, "[%s", G.i ? "" : "\n");
++
++	for (k = 0; dirname[k]; k++) {
++		struct totals sub = { 0, 0, 0 };
++		struct ent **dir = NULL, root, *info = NULL;
++		struct stat st;
++		ssize_t n = -1;
++		int needsclosed;
++		char *name = dirname[k];
++
++		if (G.f) {
++			size_t j = strlen(name);
++			while (j > 1 && name[j - 1] == '/')
++				name[--j] = '\0';
++		}
++		G.root = name;
++		G.rootlen = strlen(name);
++
++		if (lstat(name, &st) >= 0) {
++			memset(&root, 0, sizeof(root));
++			root.name = (char *)"";
++			root.mode = st.st_mode;
++			root.uid = st.st_uid;
++			root.gid = st.st_gid;
++			root.size = st.st_size;
++			root.mtime = st.st_mtime;
++			root.ctime = st.st_ctime;
++			root.ino = root.lino = st.st_ino;
++			root.dev = root.ldev = st.st_dev;
++			root.isdir = S_ISDIR(st.st_mode);
++			info = &root;
++			saveino(st.st_ino, st.st_dev);
++			if (G.gitignore)
++				gitignore_search(name);
++			if (G.fulltree) {
++				char *err;
++				dir = getfulltree(name, 0, st.st_dev, &root.size, &err);
++				n = err ? -1 : 0;
++				free(err);
++			} else
++				dir = read_dir(name, &n);
++		}
++		printinfo(info, 0);
++		needsclosed = printfile(name, info, dir != NULL || n);
++
++		if (!dir && n) {
++			print_error("error opening dir");
++			newline(dirname[k + 1] != NULL);
++			if (!info)
++				G.errors++;
++			else
++				sub.files++;
++		} else if (G.flimit > 0 && n > G.flimit) {
++			char *msg = xasprintf("%ld entries exceeds filelimit, not opening dir", (long)n);
++			print_error(msg);
++			free(msg);
++			newline(dirname[k + 1] != NULL);
++			sub.dirs++;
++		} else {
++			newline(0);
++			if (dir) {
++				sub = listdir(name, dir, 1, st.st_dev);
++				sub.dirs++;
+ 			}
+ 		}
++		free_dir(dir);
++		if (needsclosed)
++			close_json(0, dirname[k + 1] != NULL);
++		tot.files += sub.files;
++		tot.dirs += sub.dirs;
++		if (G.du && info)
++			tot.size += info->size;
++		while (G.igstack)
++			pop_ignorefile();
++	}
++
++	if (!G.noreport)
++		report(tot);
++	if (G.J)
++		fprintf(G.out, "%s]\n", G.i ? "" : "\n");
++}
++
++/* ---- options, parsed as tree parses them: each letter of a -group, the arguments of
++ * -L -P -I -o from the next words (or -L's digits right after it), long options
++ * anywhere, -- ends them */
++
++static NORETURN void bad_option(const char *fmt, const char *what)
++{
++	fprintf(stderr, "tree: ");
++	fprintf(stderr, fmt, what);
++	fputs("\nTry 'tree --help' for the options this tree has.\n", stderr);
++	exit(1);
++}
++
++/* --NAME=VALUE or --NAME VALUE */
++static char *long_arg(char **argv, int i, int *n, const char *prefix)
++{
++	size_t len = strlen(prefix);
++	char *s = argv[i];
+ 
+-		// release directory entry
+-		free(dirent);
++	if (strncmp(s, prefix, len) != 0 || (s[len] != '=' && s[len] != '\0'))
++		return NULL;
++	if (s[len] == '=') {
++		if (!s[len + 1]) {
++			fprintf(stderr, "tree: Missing argument to %s=\n", prefix);
++			exit(1);
++		}
++		return s + len + 1;
++	}
++	if (!argv[*n]) {
++		fprintf(stderr, "tree: Missing argument to %s\n", prefix);
++		exit(1);
+ 	}
++	return argv[(*n)++];
++}
+ 
+-	// release directory array
+-	free(entries);
++static const char *arg_of(char **argv, int *n, char opt)
++{
++	if (!argv[*n]) {
++		fprintf(stderr, "tree: Missing argument to -%c option.\n", opt);
++		exit(1);
++	}
++	return argv[(*n)++];
++}
+ 
+-	// switch to parent directory
+-	xchdir("..");
++static void add_pattern(const char ***list, int *count, const char *p)
++{
++	*list = xrealloc_vector(*list, 4, *count);
++	(*list)[(*count)++] = p;
+ }
+ 
++static const char *const unsupported[] ALIGN_PTR = {
++	"--nolinks", "--hintro", "--houtro", "--fromfile", "--fromtabfile", "--fflinks",
++	"--info", "--infofile", "--hyperlink", "--scheme", "--authority", "--opt-toggle",
++	"--condense", "--compress", "--acl", "--selinux", NULL
++};
++
+ int tree_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int tree_main(int argc UNUSED_PARAM, char **argv)
+ {
+-	unsigned count[2] = { 0, 0 };
++	char **dirname;
++	char *outfile = NULL, *charset = NULL;
++	int i, n, ndir = 0, optf = 1;
+ 
+-	setup_common_bufsiz();
++	SET_PTR_TO_GLOBALS(xzalloc(sizeof(G)));
++	G.out = stdout;
++	G.level = -1;
++	G.basesort = SORT_NAME;
++	G.maxdirs = 256;
++	G.dirs = xzalloc(sizeof(int) * G.maxdirs);
+ 	init_unicode();
++	dirname = xzalloc(sizeof(char *) * (argc + 1));
+ 
+-	if (!argv[1])
+-		*argv-- = (char*)".";
++	for (n = i = 1; argv[i]; i = n) {
++		char *arg = argv[i];
++		int j;
+ 
+-	// list directories given as command line arguments
+-	while (*(++argv))
+-		tree_print(count, *argv, prefix_buf);
++		n++;
++		if (!optf || arg[0] != '-' || !arg[1]) {
++			dirname[ndir++] = arg;
++			continue;
++		}
++		if (arg[1] == '-') {
++			const char *const *u;
++			char *v;
+ 
+-	// print statistic
+-	printf("\n%u directories, %u files\n", count[0], count[1]);
++			if (!arg[2]) {
++				optf = 0;
++				continue;
++			}
++			if (strcmp(arg, "--help") == 0)
++				bb_show_usage();
++			if (strcmp(arg, "--version") == 0) {
++				puts("tree v2.3.1 (the subset in BusyBox " BB_VER ")");
++				return 0;
++			}
++			if (strcmp(arg, "--inodes") == 0) { G.inode = 1; continue; }
++			if (strcmp(arg, "--device") == 0) { G.dev = 1; continue; }
++			if (strcmp(arg, "--noreport") == 0) { G.noreport = 1; continue; }
++			if (strcmp(arg, "--dirsfirst") == 0) { G.topsort = 1; continue; }
++			if (strcmp(arg, "--filesfirst") == 0) { G.topsort = 2; continue; }
++			if (strcmp(arg, "--si") == 0) { G.s = G.h = G.si = 1; continue; }
++			if (strcmp(arg, "--du") == 0) { G.s = G.du = 1; continue; }
++			if (strcmp(arg, "--prune") == 0) { G.prune = 1; continue; }
++			if (strcmp(arg, "--ignore-case") == 0) { G.ignorecase = 1; continue; }
++			if (strcmp(arg, "--matchdirs") == 0) { G.matchdirs = 1; continue; }
++			if (strcmp(arg, "--metafirst") == 0) { G.metafirst = 1; continue; }
++			if (strcmp(arg, "--gitignore") == 0) { G.gitignore = 1; continue; }
++			if ((v = long_arg(argv, i, &n, "--filelimit")) != NULL) { G.flimit = atoi(v); continue; }
++			if ((v = long_arg(argv, i, &n, "--charset")) != NULL) { charset = v; continue; }
++			if ((v = long_arg(argv, i, &n, "--timefmt")) != NULL) { G.timefmt = v; G.D = 1; continue; }
++			if ((v = long_arg(argv, i, &n, "--gitfile")) != NULL) {
++				struct ignorefile *ig = load_ignorefile(v, "", NULL);
++				if (!ig) {
++					fputs("tree: Could not load gitignore file\n", stderr);
++					return 1;
++				}
++				G.gitignore = 1;
++				ig->next = G.gitfiles;
++				G.gitfiles = ig;
++				continue;
++			}
++			if ((v = long_arg(argv, i, &n, "--sort")) != NULL) {
++				static const char names[] ALIGN1 = "name\0version\0size\0mtime\0ctime\0none\0";
++				static const uint8_t sorts[] = { SORT_NAME, SORT_VERSION, SORT_SIZE, SORT_MTIME, SORT_CTIME, SORT_NONE };
++				int idx = index_in_strings(names, str_tolower(xstrdup(v)));
++				if (idx < 0) {
++					fprintf(stderr, "tree: Sort type '%s' not valid, should be one of: "
++							"name,version,size,mtime,ctime,none\n", v);
++					return 1;
++				}
++				G.basesort = sorts[idx];
++				continue;
++			}
++			for (u = unsupported; *u; u++)
++				if (strncmp(arg, *u, strlen(*u)) == 0)
++					bad_option("%s is not supported by this tree.", *u);
++			bad_option("Invalid argument `%s'.", arg);
++		}
++		for (j = 1; arg[j]; j++) {
++			switch (arg[j]) {
++			case 'N': G.N = 1; break;
++			case 'q': G.q = 1; break;
++			case 'Q': G.Q = 1; break;
++			case 'd': G.d = 1; break;
++			case 'l': G.l = 1; break;
++			case 's': G.s = 1; break;
++			case 'h': G.s = G.h = 1; break;
++			case 'u': G.u = 1; break;
++			case 'g': G.g = 1; break;
++			case 'f': G.f = 1; break;
++			case 'F': G.F = 1; break;
++			case 'a': G.a = 1; break;
++			case 'p': G.p = 1; break;
++			case 'i': G.i = 1; break;
++			case 'C': case 'n': break; /* no colors here */
++			case 'x': G.x = 1; break;
++			case 'D': G.D = 1; break;
++			case 't': G.basesort = SORT_MTIME; break;
++			case 'c': G.basesort = SORT_CTIME; G.c = 1; break;
++			case 'r': G.reverse = 1; break;
++			case 'v': G.basesort = SORT_VERSION; break;
++			case 'U': G.basesort = SORT_NONE; break;
++			case 'J': G.J = 1; break;
++			case 'P': add_pattern(&G.pat, &G.npat, arg_of(argv, &n, 'P')); break;
++			case 'I': add_pattern(&G.ipat, &G.nipat, arg_of(argv, &n, 'I')); break;
++			case 'o': outfile = (char *)arg_of(argv, &n, 'o'); break;
++			case 'L': {
++				const char *lv;
++				if (isdigit((unsigned char)arg[j + 1])) {
++					lv = arg + j + 1;
++					while (isdigit((unsigned char)arg[j + 1]))
++						j++;
++				} else
++					lv = arg_of(argv, &n, 'L');
++				G.level = (int)strtoul(lv, NULL, 0) - 1;
++				if (G.level < 0) {
++					fputs("tree: Invalid level, must be greater than 0.\n", stderr);
++					return 1;
++				}
++				break;
++			}
++			case 'X': case 'H': case 'T': case 'R': case 'A': case 'S': {
++				char opt[3] = { '-', arg[j], '\0' };
++				bad_option("%s (HTML, XML, ANSI or CP437 lines) is not supported by this tree.", opt);
++			}
++			default: {
++				char opt[2] = { arg[j], '\0' };
++				bad_option("Invalid argument -`%s'.", opt);
++			}
++			}
++		}
++	}
++
++	if (outfile)
++		G.out = xfopen_for_write(outfile);
++	/* names follow the locale, the lines --charset */
++	G.utf8 = (unicode_status == UNICODE_ON);
++	if (charset ? (strcasecmp(charset, "UTF-8") == 0 || strcasecmp(charset, "utf8") == 0) : G.utf8) {
++		/* tree draws the vertical line with two no-break spaces after it */
++		G.vert = "│\302\240\302\240";
++		G.vert_left = "├──";
++		G.corner = "└──";
++	} else {
++		G.vert = "|  ";
++		G.vert_left = "|--";
++		G.corner = "`--";
++	}
++	if (!ndir)
++		dirname[ndir++] = (char *)".";
++	if (G.basesort == SORT_NONE)
++		G.topsort = 0;
++	if (G.d)
++		G.prune = 0;
++	G.fulltree = G.du || G.prune || G.matchdirs;
+ 
+-	return EXIT_SUCCESS;
++	emit_tree(dirname);
++	if (outfile)
++		fclose(G.out);
++	return G.errors ? 2 : 0;
+ }
+diff --git a/testsuite/tree.tests b/testsuite/tree.tests
+index 1fa66da..3bb6c5a 100755
+--- a/testsuite/tree.tests
++++ b/testsuite/tree.tests
+@@ -6,35 +6,16 @@
+ . ./testing.sh -v
+ 
+ # testing "description" "command" "result" "infile" "stdin"
+-
+-testing "tree error opening dir" \
+-	"tree tree.tempdir" \
+-	"\
+-tree.tempdir [error opening dir]\n\
+-\n\
+-0 directories, 0 files\n" \
+-	"" ""
++#
++# The results are what tree 2.3.1 prints for the same commands.
+ 
+ mkdir -p tree2.tempdir
+ touch tree2.tempdir/testfile
+-
+-optional UNICODE_SUPPORT
+-
+-testing "tree single file" \
+-	"cd tree2.tempdir && tree" \
+-	"\
+-.\n\
+-└── testfile\n\
+-\n\
+-0 directories, 1 files\n" \
+-	"" ""
+-
+ mkdir -p tree3.tempdir/test1 \
+ 	 tree3.tempdir/test2/a \
+ 	 tree3.tempdir/test2/b \
+ 	 tree3.tempdir/test3/c \
+ 	 tree3.tempdir/test3/d
+-
+ touch tree3.tempdir/test2/a/testfile1 \
+ 	tree3.tempdir/test2/a/testfile2 \
+ 	tree3.tempdir/test2/a/testfile3 \
+@@ -42,61 +23,319 @@ touch tree3.tempdir/test2/a/testfile1 \
+ 	tree3.tempdir/test3/c/testfile5 \
+ 	tree3.tempdir/test3/d/testfile6 \
+ 	tree3.tempdir/test3/d/.testfile7
+-
+ (cd tree3.tempdir/test2/a && ln -s ../b/testfile4 .)
+ (cd tree3.tempdir/test2/b && ln -s ../../test3 .)
++mkdir -p tree4.tempdir/src/sub tree4.tempdir/node_modules/pkg tree4.tempdir/build tree4.tempdir/empty
++echo x > tree4.tempdir/src/main.py
++echo x > tree4.tempdir/src/app.js
++echo x > tree4.tempdir/src/sub/deep.py
++echo x > tree4.tempdir/node_modules/pkg/index.js
++echo x > tree4.tempdir/build/out.o
++echo x > tree4.tempdir/debug.log
++echo x > tree4.tempdir/README.md
++echo x > tree4.tempdir/.hidden
++printf '#!/bin/sh\n' > tree4.tempdir/run.sh
++chmod 755 tree4.tempdir/run.sh
++printf '*.log\nbuild/\nnode_modules\n' > tree4.tempdir/.gitignore
++# the .gitignore search stops at the directory that has .git
++mkdir -p tree4.tempdir/.git
++
++testing "tree error opening dir" \
++	"LC_ALL=C tree tree.tempdir; echo \$?" \
++	"\
++tree.tempdir  [error opening dir]\n\
++\n\
++0 directories, 0 files\n\
++2\n\
++" \
++	"" ""
++
++optional UNICODE_SUPPORT
++testing "tree single file" \
++	"cd tree2.tempdir && LC_ALL=C.UTF-8 tree" \
++	"\
++.\n\
++└── testfile\n\
++\n\
++1 directory, 1 file\n\
++" \
++	"" ""
+ 
+ testing "tree nested directories and files" \
+-	"cd tree3.tempdir && tree" \
++	"cd tree3.tempdir && LC_ALL=C.UTF-8 tree" \
+ 	"\
+ .\n\
+ ├── test1\n\
+ ├── test2\n\
+-│   ├── a\n\
+-│   │   ├── testfile1\n\
+-│   │   ├── testfile2\n\
+-│   │   ├── testfile3\n\
+-│   │   └── testfile4 -> ../b/testfile4\n\
+-│   └── b\n\
+-│       ├── test3 -> ../../test3\n\
+-│       └── testfile4\n\
++│\0302\0240\0302\0240 ├── a\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile1\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile2\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile3\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 └── testfile4 -> ../b/testfile4\n\
++│\0302\0240\0302\0240 └── b\n\
++│\0302\0240\0302\0240     ├── test3 -> ../../test3\n\
++│\0302\0240\0302\0240     └── testfile4\n\
+ └── test3\n\
+     ├── c\n\
+-    │   └── testfile5\n\
++    │\0302\0240\0302\0240 └── testfile5\n\
+     └── d\n\
+         └── testfile6\n\
+ \n\
+-7 directories, 8 files\n" \
++9 directories, 7 files\n\
++" \
+ 	"" ""
+-#note: tree v2.0.1 says "8 directories, 7 files":
+-#it counts "test3 -> ../../test3" as a directory, even though it does not follow this symlink
+ 
+ testing "tree multiple directories" \
+-	"tree tree2.tempdir tree3.tempdir" \
++	"LC_ALL=C.UTF-8 tree tree2.tempdir tree3.tempdir" \
+ 	"\
+ tree2.tempdir\n\
+ └── testfile\n\
+ tree3.tempdir\n\
+ ├── test1\n\
+ ├── test2\n\
+-│   ├── a\n\
+-│   │   ├── testfile1\n\
+-│   │   ├── testfile2\n\
+-│   │   ├── testfile3\n\
+-│   │   └── testfile4 -> ../b/testfile4\n\
+-│   └── b\n\
+-│       ├── test3 -> ../../test3\n\
+-│       └── testfile4\n\
++│\0302\0240\0302\0240 ├── a\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile1\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile2\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 ├── testfile3\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 └── testfile4 -> ../b/testfile4\n\
++│\0302\0240\0302\0240 └── b\n\
++│\0302\0240\0302\0240     ├── test3 -> ../../test3\n\
++│\0302\0240\0302\0240     └── testfile4\n\
+ └── test3\n\
+     ├── c\n\
+-    │   └── testfile5\n\
++    │\0302\0240\0302\0240 └── testfile5\n\
+     └── d\n\
+         └── testfile6\n\
+ \n\
+-7 directories, 9 files\n" \
++10 directories, 8 files\n\
++" \
++	"" ""
++
++testing "tree -L 1" \
++	"LC_ALL=C.UTF-8 tree -L 1 tree3.tempdir" \
++	"\
++tree3.tempdir\n\
++├── test1\n\
++├── test2\n\
++└── test3\n\
++\n\
++4 directories, 0 files\n\
++" \
++	"" ""
++
++testing "tree -L2 -a" \
++	"LC_ALL=C.UTF-8 tree -L2 -a tree3.tempdir/test3" \
++	"\
++tree3.tempdir/test3\n\
++├── c\n\
++│\0302\0240\0302\0240 └── testfile5\n\
++└── d\n\
++    ├── .testfile7\n\
++    └── testfile6\n\
++\n\
++3 directories, 3 files\n\
++" \
++	"" ""
++
++testing "tree -d" \
++	"LC_ALL=C.UTF-8 tree -d tree3.tempdir" \
++	"\
++tree3.tempdir\n\
++├── test1\n\
++├── test2\n\
++│\0302\0240\0302\0240 ├── a\n\
++│\0302\0240\0302\0240 └── b\n\
++│\0302\0240\0302\0240     └── test3 -> ../../test3\n\
++└── test3\n\
++    ├── c\n\
++    └── d\n\
++\n\
++9 directories\n\
++" \
++	"" ""
++
++SKIP=
++testing "tree -fi" \
++	"LC_ALL=C tree -fi tree3.tempdir/test2" \
++	"\
++tree3.tempdir/test2\n\
++tree3.tempdir/test2/a\n\
++tree3.tempdir/test2/a/testfile1\n\
++tree3.tempdir/test2/a/testfile2\n\
++tree3.tempdir/test2/a/testfile3\n\
++tree3.tempdir/test2/a/testfile4 -> ../b/testfile4\n\
++tree3.tempdir/test2/b\n\
++tree3.tempdir/test2/b/test3 -> ../../test3\n\
++tree3.tempdir/test2/b/testfile4\n\
++\n\
++4 directories, 5 files\n\
++" \
++	"" ""
++
++optional UNICODE_SUPPORT
++testing "tree -I" \
++	"LC_ALL=C.UTF-8 tree -I 'node_modules|build' tree4.tempdir" \
++	"\
++tree4.tempdir\n\
++├── README.md\n\
++├── debug.log\n\
++├── empty\n\
++├── run.sh\n\
++└── src\n\
++    ├── app.js\n\
++    ├── main.py\n\
++    └── sub\n\
++        └── deep.py\n\
++\n\
++4 directories, 6 files\n\
++" \
++	"" ""
++
++testing "tree -I -I --noreport" \
++	"LC_ALL=C.UTF-8 tree -I node_modules -I '*.log' --noreport tree4.tempdir" \
++	"\
++tree4.tempdir\n\
++├── README.md\n\
++├── build\n\
++│\0302\0240\0302\0240 └── out.o\n\
++├── empty\n\
++├── run.sh\n\
++└── src\n\
++    ├── app.js\n\
++    ├── main.py\n\
++    └── sub\n\
++        └── deep.py\n\
++" \
++	"" ""
++
++testing "tree -P --prune" \
++	"LC_ALL=C.UTF-8 tree -P '*.py' --prune tree4.tempdir" \
++	"\
++tree4.tempdir\n\
++└── src\n\
++    ├── main.py\n\
++    └── sub\n\
++        └── deep.py\n\
++\n\
++3 directories, 2 files\n\
++" \
++	"" ""
++
++testing "tree -P --matchdirs" \
++	"LC_ALL=C.UTF-8 tree -P sub --matchdirs tree4.tempdir/src" \
++	"\
++tree4.tempdir/src\n\
++└── sub\n\
++    └── deep.py\n\
++\n\
++2 directories, 1 file\n\
++" \
++	"" ""
++
++testing "tree --gitignore -a" \
++	"LC_ALL=C.UTF-8 tree --gitignore -a -I .git tree4.tempdir" \
++	"\
++tree4.tempdir\n\
++├── .gitignore\n\
++├── .hidden\n\
++├── README.md\n\
++├── empty\n\
++├── run.sh\n\
++└── src\n\
++    ├── app.js\n\
++    ├── main.py\n\
++    └── sub\n\
++        └── deep.py\n\
++\n\
++4 directories, 7 files\n\
++" \
++	"" ""
++
++testing "tree --dirsfirst -F" \
++	"LC_ALL=C.UTF-8 tree --dirsfirst -F tree4.tempdir" \
++	"\
++tree4.tempdir/\n\
++├── build/\n\
++│\0302\0240\0302\0240 └── out.o\n\
++├── empty/\n\
++├── node_modules/\n\
++│\0302\0240\0302\0240 └── pkg/\n\
++│\0302\0240\0302\0240     └── index.js\n\
++├── src/\n\
++│\0302\0240\0302\0240 ├── sub/\n\
++│\0302\0240\0302\0240 │\0302\0240\0302\0240 └── deep.py\n\
++│\0302\0240\0302\0240 ├── app.js\n\
++│\0302\0240\0302\0240 └── main.py\n\
++├── README.md\n\
++├── debug.log\n\
++└── run.sh*\n\
++\n\
++7 directories, 8 files\n\
++" \
++	"" ""
++
++SKIP=
++testing "tree --charset=ascii" \
++	"LC_ALL=C tree --charset=ascii tree3.tempdir/test3" \
++	"\
++tree3.tempdir/test3\n\
++|-- c\n\
++|   \`-- testfile5\n\
++\`-- d\n\
++    \`-- testfile6\n\
++\n\
++3 directories, 2 files\n\
++" \
++	"" ""
++
++testing "tree -J" \
++	"LC_ALL=C tree -J tree3.tempdir/test2" \
++	"\
++[\n\
++    {\"type\":\"directory\",\"name\":\"tree3.tempdir/test2\",\"contents\":[\n\
++        {\"type\":\"directory\",\"name\":\"a\",\"contents\":[\n\
++            {\"type\":\"file\",\"name\":\"testfile1\"},\n\
++            {\"type\":\"file\",\"name\":\"testfile2\"},\n\
++            {\"type\":\"file\",\"name\":\"testfile3\"},\n\
++            {\"type\":\"link\",\"name\":\"testfile4\",\"target\":\"../b/testfile4\"}\n\
++        ]},\n\
++        {\"type\":\"directory\",\"name\":\"b\",\"contents\":[\n\
++            {\"type\":\"link\",\"name\":\"test3\",\"target\":\"../../test3\"},\n\
++            {\"type\":\"file\",\"name\":\"testfile4\"}\n\
++        ]}\n\
++    ]}\n\
++,    {\"type\":\"report\",\"directories\":4,\"files\":5}\n\
++]\n\
++" \
++	"" ""
++
++optional UNICODE_SUPPORT
++testing "tree --filelimit" \
++	"LC_ALL=C.UTF-8 tree --filelimit 2 tree4.tempdir/src" \
++	"\
++tree4.tempdir/src  [3 entries exceeds filelimit, not opening dir]\n\
++\n\
++1 directory, 0 files\n\
++" \
++	"" ""
++
++SKIP=
++testing "tree -L 0" \
++	"LC_ALL=C tree -L 0 . 2>&1; echo \$?" \
++	"\
++tree: Invalid level, must be greater than 0.\n\
++1\n\
++" \
++	"" ""
++
++testing "tree invalid option" \
++	"LC_ALL=C tree -Z 2>&1 | head -1; echo \$?" \
++	"\
++tree: Invalid argument -\`Z'.\n\
++0\n\
++" \
+ 	"" ""
+-#note: tree v2.0.1 says "8 directories, 7 files" (not "8 files", probably a/testfile4 -> ../b/testfile4 and b/testfile4 are counted as one file, not 2?)
+ 
+-rm -rf tree.tempdir tree2.tempdir tree3.tempdir
++rm -rf tree.tempdir tree2.tempdir tree3.tempdir tree4.tempdir
+ 
+ exit $FAILCOUNT

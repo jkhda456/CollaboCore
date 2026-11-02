@@ -1,0 +1,1019 @@
+diff --git a/procps/lsof.c b/procps/lsof.c
+index 57e385c..7877d05 100644
+--- a/procps/lsof.c
++++ b/procps/lsof.c
+@@ -4,75 +4,970 @@
+  *
+  * Copyright (C) 2012 by Sven Oliver 'SvOlli' Moll <svolli@svolli.de>
+  *
++ * The selections and the columns follow lsof 4.99 (what agents and scripts
++ * call: lsof -i :PORT, lsof -ti :PORT, -iTCP -sTCP:LISTEN -nP, -p PID, FILE).
++ *
+  * Licensed under GPLv2, see file LICENSE in this source tree.
+  */
+ //config:config LSOF
+ //config:	bool "lsof (3.7 kb)"
+ //config:	default y
+ //config:	help
+-//config:	Show open files in the format of:
+-//config:	PID <TAB> /path/to/executable <TAB> /path/to/opened/file
++//config:	List open files, in the columns lsof prints:
++//config:	COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+ 
+ //applet:IF_LSOF(APPLET(lsof, BB_DIR_USR_BIN, BB_SUID_DROP))
+ 
+ //kbuild:lib-$(CONFIG_LSOF) += lsof.o
+ 
+ //usage:#define lsof_trivial_usage
+-//usage:       ""
++//usage:       "[-tnPlaU] [-i [ADDR]] [-s PROTO:STATE] [-p PID] [-u USER] [-c NAME] [+D DIR] [FILE]..."
+ //usage:#define lsof_full_usage "\n\n"
+-//usage:       "Show all open files"
++//usage:       "List open files (all of them, or those the selections pick)\n"
++//usage:     "\n	-i [ADDR]	Internet sockets; ADDR: [46][tcp|udp][@HOST][:PORT[,PORT|-PORT]]"
++//usage:     "\n	-s P:S[,S]	With -i: only TCP/UDP sockets in states S (^S: not in S),"
++//usage:     "\n			e.g. -sTCP:LISTEN"
++//usage:     "\n	-U		Unix sockets"
++//usage:     "\n	-p PID[,PID]	Of these processes (^PID: not of it)"
++//usage:     "\n	-u USER[,USER]	Of these users (name or UID, ^ excludes)"
++//usage:     "\n	-c NAME		Of commands starting with NAME"
++//usage:     "\n	+D DIR		Files under DIR (+d DIR: in DIR itself)"
++//usage:     "\n	FILE		Those open on FILE"
++//usage:     "\n	-a		All selections must match (default: any)"
++//usage:     "\n	-t		Only the PIDs, one per line"
++//usage:     "\n	-n -P		Numeric addresses, ports (names come from /etc/hosts, /etc/services)"
++//usage:     "\n	-l		Numeric user IDs"
++//usage:     "\n"
++//usage:     "\nExit status 1 when the selections find nothing."
+ 
+ #include "libbb.h"
++#include <netdb.h>
+ 
+-/*
+- * Examples of "standard" lsof output:
+- *
+- * COMMAND    PID USER   FD   TYPE             DEVICE     SIZE       NODE NAME
+- * init         1 root  cwd    DIR                8,5     4096          2 /
+- * init         1 root  rtd    DIR                8,5     4096          2 /
+- * init         1 root  txt    REG                8,5   872400      63408 /app/busybox-1.19.2/busybox
+- * rpc.portm 1064 root  mem    REG                8,5    43494      47451 /app/glibc-2.11/lib/libnss_files-2.11.so
+- * rpc.portm 1064 root    3u  IPv4               2178                 UDP *:111
+- * rpc.portm 1064 root    4u  IPv4               1244                 TCP *:111 (LISTEN)
+- * runsvdir  1116 root    0r   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    1w   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    2w   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    3r   DIR                8,6     1560      58359 /.local/var/service
+- * gpm       1128 root    4u  unix 0xffff88007c09ccc0                1302 /dev/gpmctl
+- */
++/* One row of the output */
++struct row {
++	pid_t pid;
++	char *cmd, *user, *fd, *type, *device, *sizeoff, *node, *name;
++};
+ 
+-int lsof_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+-int lsof_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++/* An internet socket from /proc/net/{tcp,udp}{,6} */
++struct inet {
++	ino_t ino;
++	unsigned char af;       /* 4 or 6 */
++	unsigned char proto;    /* 't' or 'u' */
++	unsigned char state;
++	unsigned lport, rport;
++	unsigned char laddr[16], raddr[16];
++};
++
++/* A unix socket from /proc/net/unix */
++struct usock {
++	ino_t ino;
++	unsigned type, state, flags;
++	char *addr, *path;
++};
++
++/* -i ADDR */
++struct ispec {
++	unsigned char af;       /* 0 any, 4, 6 */
++	unsigned char proto;    /* 0 any, 't', 'u' */
++	smallint has_host;
++	unsigned char host[16];
++	unsigned char hostaf;
++	int nports;
++	unsigned *plo, *phi;
++};
++
++struct globals {
++	struct row *rows;
++	int nrows;
++	struct inet *inets;
++	int ninets;
++	struct usock *usocks;
++	int nusocks;
++	struct ispec *ispecs;
++	int nispecs;
++	smallint sel_i, sel_U;       /* -i given (even without ADDR), -U */
++	/* -s */
++	unsigned tcp_states, udp_states;  /* bit per state; 0: any */
++	smallint tcp_states_neg, udp_states_neg;
++	/* -p -u -c: the ones asked for, and the ^ ones left out */
++	llist_t *pids, *users, *cmds;
++	llist_t *xpids, *xusers, *xcmds;
++	/* files */
++	struct stat *fstats;
++	int nfstats;
++	char **dirs;                 /* +D/+d real paths */
++	smallint *dirs_recursive;
++	int ndirs;
++	smallint and_mode, terse, numeric_host, numeric_port, numeric_uid;
++	int selections;              /* how many kinds were asked for */
++};
++#define G (*ptr_to_globals)
++
++enum { SEL_I = 1, SEL_P = 2, SEL_U = 4, SEL_C = 8, SEL_F = 16, SEL_X = 32 };
++
++static const char *const tcp_state_names[] ALIGN_PTR = {
++	"", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT",
++	"CLOSE", "CLOSE_WAIT", "LAST_ACK", "LISTEN", "CLOSING", "NEW_SYN_RECV"
++};
++
++/* ---- /proc/net */
++
++static void parse_hex_addr(const char *s, unsigned char *out, int af)
++{
++	int words = (af == 4) ? 1 : 4, w, b;
++	for (w = 0; w < words; w++) {
++		uint32_t v = 0;
++		for (b = 0; b < 8 && s[w * 8 + b]; b++) {
++			int c = s[w * 8 + b];
++			v = v * 16 + (isdigit(c) ? c - '0' : (tolower(c) - 'a' + 10));
++		}
++		/* each 32-bit word is in host (little endian) order */
++		memcpy(out + w * 4, &v, 4);
++	}
++}
++
++static void read_inet(const char *file, int af, int proto)
++{
++	FILE *fp = fopen_for_read(file);
++	char *line;
++
++	if (!fp)
++		return;
++	free(xmalloc_fgetline(fp)); /* header */
++	while ((line = xmalloc_fgetline(fp)) != NULL) {
++		char la[40], ra[40];
++		unsigned lp, rp, st;
++		unsigned long ino;
++		/* sl local rem st tx:rx tr:when retr uid timeout inode */
++		if (sscanf(line, "%*s %39[0-9A-Fa-f]:%x %39[0-9A-Fa-f]:%x %x %*s %*s %*s %*s %*s %lu",
++				la, &lp, ra, &rp, &st, &ino) == 6 && ino) {
++			struct inet *n;
++			G.inets = xrealloc_vector(G.inets, 6, G.ninets);
++			n = &G.inets[G.ninets++];
++			memset(n, 0, sizeof(*n));
++			n->ino = ino;
++			n->af = af;
++			n->proto = proto;
++			n->state = st;
++			n->lport = lp;
++			n->rport = rp;
++			parse_hex_addr(la, n->laddr, af);
++			parse_hex_addr(ra, n->raddr, af);
++		}
++		free(line);
++	}
++	fclose(fp);
++}
++
++static void read_unix(void)
++{
++	FILE *fp = fopen_for_read("/proc/net/unix");
++	char *line;
++
++	if (!fp)
++		return;
++	free(xmalloc_fgetline(fp));
++	while ((line = xmalloc_fgetline(fp)) != NULL) {
++		char addr[40];
++		unsigned flags, type, st;
++		unsigned long ino;
++		int n = 0;
++		/* Num RefCount Protocol Flags Type St Inode Path */
++		if (sscanf(line, "%39[0-9A-Fa-f]: %*s %*s %x %x %x %lu %n",
++				addr, &flags, &type, &st, &ino, &n) >= 5) {
++			struct usock *u;
++			G.usocks = xrealloc_vector(G.usocks, 6, G.nusocks);
++			u = &G.usocks[G.nusocks++];
++			u->ino = ino;
++			u->type = type;
++			u->state = st;
++			u->flags = flags;
++			u->addr = xasprintf("0x%s", addr);
++			u->path = (n && line[n]) ? xstrdup(line + n) : NULL;
++		}
++		free(line);
++	}
++	fclose(fp);
++}
++
++static struct inet *find_inet(ino_t ino)
++{
++	int k;
++	for (k = 0; k < G.ninets; k++)
++		if (G.inets[k].ino == ino)
++			return &G.inets[k];
++	return NULL;
++}
++
++static struct usock *find_unix(ino_t ino)
++{
++	int k;
++	for (k = 0; k < G.nusocks; k++)
++		if (G.usocks[k].ino == ino)
++			return &G.usocks[k];
++	return NULL;
++}
++
++/* ---- names */
++
++static int is_any(const unsigned char *a, int af)
+ {
+-	procps_status_t *proc = NULL;
++	int k;
++	for (k = 0; k < (af == 4 ? 4 : 16); k++)
++		if (a[k])
++			return 0;
++	return 1;
++}
+ 
+-	while ((proc = procps_scan(proc, PSSCAN_PID|PSSCAN_EXE)) != NULL) {
+-		char name[sizeof("/proc/%u/fd/0123456789") + sizeof(int)*3];
+-		unsigned baseofs;
+-		DIR *d_fd;
+-		char *fdlink;
+-		struct dirent *entry;
++/* an address from /etc/hosts, or NULL */
++static char *hosts_name(const unsigned char *a, int af)
++{
++	FILE *fp = fopen_for_read("/etc/hosts");
++	char *line, *found = NULL;
+ 
+-		if (getpid() == proc->pid)
++	if (!fp)
++		return NULL;
++	while (!found && (line = xmalloc_fgetline(fp)) != NULL) {
++		char *s = line, *ip, *name;
++		unsigned char bin[16];
++		*strchrnul(s, '#') = '\0';
++		ip = strtok(s, " \t");
++		name = ip ? strtok(NULL, " \t") : NULL;
++		if (name && inet_pton(af == 4 ? AF_INET : AF_INET6, ip, bin) == 1
++		 && memcmp(bin, a, af == 4 ? 4 : 16) == 0)
++			found = xstrdup(name);
++		free(line);
++	}
++	fclose(fp);
++	return found;
++}
++
++static char *addr_str(const unsigned char *a, int af)
++{
++	char buf[INET6_ADDRSTRLEN + 2];
++	char *name;
++
++	if (!G.numeric_host && (name = hosts_name(a, af)) != NULL)
++		return name;
++	inet_ntop(af == 4 ? AF_INET : AF_INET6, a, buf + 1, sizeof(buf) - 2);
++	if (af == 6) {
++		buf[0] = '[';
++		strcat(buf, "]");
++		return xstrdup(buf);
++	}
++	return xstrdup(buf + 1);
++}
++
++static char *port_str(unsigned port, int proto)
++{
++	if (!G.numeric_port) {
++		struct servent *se = getservbyport(htons(port), proto == 't' ? "tcp" : "udp");
++		if (se)
++			return xstrdup(se->s_name);
++	}
++	return xasprintf("%u", port);
++}
++
++static char *inet_name(const struct inet *n)
++{
++	char *l, *lp, *res;
++
++	l = is_any(n->laddr, n->af) ? xstrdup("*") : addr_str(n->laddr, n->af);
++	lp = n->lport ? port_str(n->lport, n->proto) : xstrdup("*");
++	if (n->rport || !is_any(n->raddr, n->af)) {
++		char *r = addr_str(n->raddr, n->af);
++		char *rp = port_str(n->rport, n->proto);
++		res = xasprintf("%s:%s->%s:%s", l, lp, r, rp);
++		free(r);
++		free(rp);
++	} else
++		res = xasprintf("%s:%s", l, lp);
++	if (n->proto == 't' && n->state < ARRAY_SIZE(tcp_state_names)) {
++		char *t = xasprintf("%s (%s)", res, tcp_state_names[n->state]);
++		free(res);
++		res = t;
++	} else if (n->proto == 'u') {
++		/* lsof leaves the (empty) state after a space */
++		char *t = xasprintf("%s ", res);
++		free(res);
++		res = t;
++	}
++	free(l);
++	free(lp);
++	return res;
++}
++
++/* ---- selections */
++
++static int parse_ispec(const char *s, struct ispec *is)
++{
++	memset(is, 0, sizeof(*is));
++	if (*s == '4' || *s == '6')
++		is->af = *s++ - '0';
++	if (strncasecmp(s, "tcp", 3) == 0) {
++		is->proto = 't';
++		s += 3;
++	} else if (strncasecmp(s, "udp", 3) == 0) {
++		is->proto = 'u';
++		s += 3;
++	}
++	if (*s == '@') {
++		char host[256];
++		const char *e;
++		s++;
++		if (*s == '[') {
++			e = strchr(s, ']');
++			if (!e)
++				return 0;
++			safe_strncpy(host, s + 1, MIN((size_t)(e - s), sizeof(host)));
++			s = e + 1;
++		} else {
++			e = strchrnul(s, ':');
++			safe_strncpy(host, s, MIN((size_t)(e - s) + 1, sizeof(host)));
++			s = e;
++		}
++		if (inet_pton(AF_INET, host, is->host) == 1)
++			is->hostaf = 4;
++		else if (inet_pton(AF_INET6, host, is->host) == 1)
++			is->hostaf = 6;
++		else {
++			/* a name: /etc/hosts, then the resolver */
++			struct addrinfo hints, *ai = NULL;
++			memset(&hints, 0, sizeof(hints));
++			hints.ai_family = is->af == 4 ? AF_INET : is->af == 6 ? AF_INET6 : AF_UNSPEC;
++			if (getaddrinfo(host, NULL, &hints, &ai) != 0 || !ai)
++				return 0;
++			if (ai->ai_family == AF_INET) {
++				memcpy(is->host, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
++				is->hostaf = 4;
++			} else {
++				memcpy(is->host, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, 16);
++				is->hostaf = 6;
++			}
++			freeaddrinfo(ai);
++		}
++		is->has_host = 1;
++	}
++	if (*s == ':') {
++		s++;
++		while (*s) {
++			char *end;
++			unsigned lo, hi;
++			if (isdigit(*s)) {
++				lo = hi = strtoul(s, &end, 10);
++				if (*end == '-' && isdigit(end[1]))
++					hi = strtoul(end + 1, &end, 10);
++			} else {
++				char name[64];
++				struct servent *se;
++				size_t len = strcspn(s, ",");
++				safe_strncpy(name, s, MIN(len + 1, sizeof(name)));
++				se = getservbyname(name, is->proto == 'u' ? "udp" : "tcp");
++				if (!se)
++					return 0;
++				lo = hi = ntohs(se->s_port);
++				end = (char *)s + len;
++			}
++			is->plo = xrealloc_vector(is->plo, 3, is->nports);
++			is->phi = xrealloc_vector(is->phi, 3, is->nports);
++			is->plo[is->nports] = lo;
++			is->phi[is->nports++] = hi;
++			s = end;
++			if (*s == ',')
++				s++;
++			else if (*s)
++				return 0;
++		}
++	}
++	return *s == '\0';
++}
++
++/* does the next word look like -i's ADDR? */
++static int looks_like_ispec(const char *s)
++{
++	return s && (*s == ':' || *s == '@' || *s == '4' || *s == '6'
++		|| strncasecmp(s, "tcp", 3) == 0 || strncasecmp(s, "udp", 3) == 0);
++}
++
++static void parse_states(const char *arg)
++{
++	/* PROTO:STATE[,STATE], ^STATE excludes */
++	const char *colon = strchr(arg, ':');
++	unsigned *set;
++	smallint *neg;
++	char *list, *tok, *save;
++
++	if (!colon)
++		bb_error_msg_and_die("-s: '%s' is not PROTO:STATE", arg);
++	if (strncasecmp(arg, "TCP:", 4) == 0) {
++		set = &G.tcp_states;
++		neg = &G.tcp_states_neg;
++	} else if (strncasecmp(arg, "UDP:", 4) == 0) {
++		set = &G.udp_states;
++		neg = &G.udp_states_neg;
++	} else
++		bb_error_msg_and_die("-s: unknown protocol in '%s'", arg);
++	list = xstrdup(colon + 1);
++	for (tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
++		unsigned k;
++		if (*tok == '^') {
++			*neg = 1;
++			tok++;
++		}
++		for (k = 1; k < ARRAY_SIZE(tcp_state_names); k++)
++			if (strcasecmp(tok, tcp_state_names[k]) == 0)
++				break;
++		if (strcasecmp(tok, "IDLE") == 0 || strcasecmp(tok, "UNBOUND") == 0)
++			k = 7; /* UDP sockets without a peer read as CLOSE */
++		if (k >= ARRAY_SIZE(tcp_state_names))
++			bb_error_msg_and_die("-s: unknown state '%s'", tok);
++		*set |= 1u << k;
++	}
++	free(list);
++}
++
++static int addr_eq(const unsigned char *a, int af, const struct ispec *is)
++{
++	if (is->hostaf == af)
++		return memcmp(a, is->host, af == 4 ? 4 : 16) == 0;
++	/* ::ffff:a.b.c.d against a.b.c.d */
++	if (af == 6 && is->hostaf == 4) {
++		static const unsigned char v4mapped[12] = { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
++		return memcmp(a, v4mapped, 12) == 0 && memcmp(a + 12, is->host, 4) == 0;
++	}
++	return 0;
++}
++
++static int inet_selected(const struct inet *n)
++{
++	int k, any = (G.nispecs == 0);
++
++	for (k = 0; !any && k < G.nispecs; k++) {
++		const struct ispec *is = &G.ispecs[k];
++		int p;
++		if (is->af && is->af != n->af)
+ 			continue;
++		if (is->proto && is->proto != n->proto)
++			continue;
++		if (is->has_host && !addr_eq(n->laddr, n->af, is) && !addr_eq(n->raddr, n->af, is))
++			continue;
++		if (is->nports) {
++			for (p = 0; p < is->nports; p++) {
++				if ((n->lport >= is->plo[p] && n->lport <= is->phi[p])
++				 || (n->rport >= is->plo[p] && n->rport <= is->phi[p]))
++					break;
++			}
++			if (p == is->nports)
++				continue;
++		}
++		any = 1;
++	}
++	if (!any)
++		return 0;
++	/* -s PROTO:STATE */
++	if (n->proto == 't' && G.tcp_states) {
++		int in = !!(G.tcp_states & (1u << n->state));
++		if (in == G.tcp_states_neg)
++			return 0;
++	}
++	if (n->proto == 'u' && G.udp_states) {
++		int in = !!(G.udp_states & (1u << n->state));
++		if (in == G.udp_states_neg)
++			return 0;
++	}
++	return 1;
++}
++
++static int cmp_pid(const void *a, const void *b)
++{
++	return *(const int *)a - *(const int *)b;
++}
++
++/* -c NAME matches the start of the command */
++static int has_prefix_of(llist_t *l, const char *cmd)
++{
++	for (; l; l = l->link)
++		if (strncmp(cmd, l->data, strlen(l->data)) == 0)
++			return 1;
++	return 0;
++}
++
++/* ---- rows */
++
++static char *dev_str(dev_t d)
++{
++	return xasprintf("%u,%u", major(d), minor(d));
++}
++
++static void add_row(pid_t pid, const char *cmd, const char *user, char *fd, char *type,
++		char *device, char *sizeoff, char *node, char *name)
++{
++	struct row *r;
++	G.rows = xrealloc_vector(G.rows, 6, G.nrows);
++	r = &G.rows[G.nrows++];
++	r->pid = pid;
++	r->cmd = xstrdup(cmd);
++	r->user = xstrdup(user);
++	r->fd = fd;
++	r->type = type;
++	r->device = device;
++	r->sizeoff = sizeoff;
++	r->node = node;
++	r->name = name;
++}
++
++static const char *type_of(mode_t m)
++{
++	if (S_ISREG(m)) return "REG";
++	if (S_ISDIR(m)) return "DIR";
++	if (S_ISCHR(m)) return "CHR";
++	if (S_ISBLK(m)) return "BLK";
++	if (S_ISFIFO(m)) return "FIFO";
++	if (S_ISLNK(m)) return "LINK";
++	if (S_ISSOCK(m)) return "sock";
++	return "unknown";
++}
++
++/* true when FILE/+D selections pick this open file */
++static int file_selected(const struct stat *st, const char *path)
++{
++	int k;
++	for (k = 0; k < G.nfstats; k++)
++		if (st && st->st_dev == G.fstats[k].st_dev && st->st_ino == G.fstats[k].st_ino)
++			return 1;
++	for (k = 0; k < G.ndirs; k++) {
++		size_t len = strlen(G.dirs[k]);
++		if (path[0] != '/' || strncmp(path, G.dirs[k], len) != 0
++		 || (path[len] != '/' && !(len == 1 && path[0] == '/')))
++			continue;
++		if (G.dirs_recursive[k] || !strchr(path + len + (len > 1), '/'))
++			return 1;
++	}
++	return 0;
++}
++
++/* One open file of a process; returns 1 when it was listed */
++static int one_file(pid_t pid, const char *cmd, const char *user, int proc_selected,
++		const char *fdname, const char *linkpath, int fdnum)
++{
++	struct stat st;
++	int have_st = (stat(linkpath, &st) == 0);
++	/* "mem" passes the mapped file itself, the others a /proc link */
++	char *target = (fdnum == -2) ? xstrdup(linkpath) : xmalloc_readlink(linkpath);
++	char *fd, *type, *device, *sizeoff, *node, *name;
++	char mode = ' ';
++	int is_inet = 0, is_unix = 0, sel;
++	struct inet *in = NULL;
++	struct usock *us = NULL;
++	unsigned long sockino = 0;
++	unsigned long long pos = 0;
++
++	if (!target)
++		return 0;
++	if (fdnum >= 0) {
++		/* the access mode and the offset, from fdinfo */
++		char *info = xasprintf("/proc/%u/fdinfo/%d", (unsigned)pid, fdnum);
++		FILE *fp = fopen_for_read(info);
++		free(info);
++		if (fp) {
++			char *line;
++			while ((line = xmalloc_fgetline(fp)) != NULL) {
++				unsigned long flags;
++				if (sscanf(line, "flags: %lo", &flags) == 1)
++					mode = "rwu"[MIN(flags & O_ACCMODE, 2u)];
++				sscanf(line, "pos: %llu", &pos);
++				free(line);
++			}
++			fclose(fp);
++		}
++	}
++	if (sscanf(target, "socket:[%lu]", &sockino) == 1) {
++		in = find_inet(sockino);
++		if (in)
++			is_inet = 1;
++		else if ((us = find_unix(sockino)) != NULL)
++			is_unix = 1;
++	}
++
++	/* is it selected? */
++	if (G.selections) {
++		int file_sel = (G.selections & (SEL_I | SEL_F | SEL_X))
++			? ((is_inet && G.sel_i && inet_selected(in))
++			   || (is_unix && G.sel_U)
++			   || ((G.selections & SEL_F) && file_selected(have_st ? &st : NULL, target)))
++			: -1;
++		if (G.and_mode)
++			sel = proc_selected && file_sel != 0;
++		else
++			sel = proc_selected > 0 || file_sel > 0;
++		if (!sel) {
++			free(target);
++			return 0;
++		}
++	}
++
++	fd = (fdnum >= 0) ? xasprintf("%d%c", fdnum, mode) : xstrdup(fdname);
++	if (is_inet) {
++		type = xstrdup(in->af == 4 ? "IPv4" : "IPv6");
++		device = xasprintf("%lu", sockino);
++		sizeoff = xasprintf("0t%llu", pos);
++		node = xstrdup(in->proto == 't' ? "TCP" : "UDP");
++		name = inet_name(in);
++	} else if (is_unix) {
++		static const char *const utypes[] = { "", "STREAM", "DGRAM", "RAW", "RDM", "SEQPACKET" };
++		type = xstrdup("unix");
++		device = xstrdup(us->addr);
++		sizeoff = xasprintf("0t%llu", pos);
++		node = xasprintf("%lu", sockino);
++		name = xasprintf("%s%stype=%s%s", us->path ? us->path : "", us->path ? " " : "",
++			us->type < ARRAY_SIZE(utypes) ? utypes[us->type] : "?",
++			(us->flags & 0x10000) ? " (LISTEN)" : us->state == 3 ? " (CONNECTED)" : "");
++	} else if (sockino) {
++		type = xstrdup("sock");
++		device = have_st ? dev_str(st.st_dev) : xstrdup("0,0");
++		sizeoff = xasprintf("0t%llu", pos);
++		node = xasprintf("%lu", sockino);
++		name = xstrdup("protocol: unknown");
++	} else if (strncmp(target, "pipe:", 5) == 0) {
++		type = xstrdup("FIFO");
++		device = have_st ? dev_str(st.st_dev) : xstrdup("0,0");
++		sizeoff = xasprintf("0t%llu", pos);
++		node = have_st ? xasprintf("%lu", (unsigned long)st.st_ino) : xstrdup("0");
++		name = xstrdup("pipe");
++	} else if (strncmp(target, "anon_inode:", 11) == 0) {
++		type = xstrdup("a_inode");
++		device = have_st ? dev_str(st.st_dev) : xstrdup("0,0");
++		sizeoff = xstrdup("0");
++		node = have_st ? xasprintf("%lu", (unsigned long)st.st_ino) : xstrdup("0");
++		name = xstrdup(target + 11);
++	} else {
++		type = xstrdup(have_st ? type_of(st.st_mode) : "unknown");
++		if (have_st && (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
++			device = dev_str(st.st_rdev);
++			sizeoff = xasprintf("0t%llu", pos);
++		} else {
++			device = have_st ? dev_str(st.st_dev) : xstrdup("");
++			sizeoff = have_st ? (S_ISFIFO(st.st_mode)
++					? xasprintf("0t%llu", pos)
++					: xasprintf("%llu", (unsigned long long)st.st_size))
++				: xstrdup("");
++		}
++		node = have_st ? xasprintf("%lu", (unsigned long)st.st_ino) : xstrdup("");
++		name = xstrdup(target);
++	}
++	free(target);
++	add_row(pid, cmd, user, fd, type, device, sizeoff, node, name);
++	return 1;
++}
++
++static void scan_process(pid_t pid)
++{
++	char path[64], *cmd, *user, *exe;
++	struct stat pst;
++	int proc_selected = 1, k;
++	DIR *d;
++	struct dirent *de;
++	FILE *maps;
++	llist_t *seen = NULL;
++
++	sprintf(path, "/proc/%u", (unsigned)pid);
++	if (stat(path, &pst) != 0)
++		return;
++	sprintf(path, "/proc/%u/comm", (unsigned)pid);
++	cmd = xmalloc_open_read_close(path, NULL);
++	if (!cmd)
++		return;
++	*strchrnul(cmd, '\n') = '\0';
++	user = G.numeric_uid ? xasprintf("%u", (unsigned)pst.st_uid) : xstrdup(uid2uname_utoa(pst.st_uid));
++
++	/* ^PID, ^USER, ^NAME leave a process out in any case */
++	{
++		char *uid = xasprintf("%u", (unsigned)pst.st_uid);
++		int out = llist_find_str(G.xpids, utoa(pid)) || llist_find_str(G.xusers, user)
++			|| llist_find_str(G.xusers, uid) || has_prefix_of(G.xcmds, cmd);
++		int any = 0, all = 1;
++		if (!out && (G.selections & (SEL_P | SEL_U | SEL_C))) {
++			/* the process selections: -p -u -c */
++			if (G.pids) {
++				if (llist_find_str(G.pids, utoa(pid))) any = 1; else all = 0;
++			}
++			if (G.users) {
++				if (llist_find_str(G.users, user) || llist_find_str(G.users, uid)) any = 1; else all = 0;
++			}
++			if (G.cmds) {
++				if (has_prefix_of(G.cmds, cmd)) any = 1; else all = 0;
++			}
++			/* -a: all of them; else any (files may still pick one in this process) */
++			proc_selected = G.and_mode ? all : any;
++		} else
++			proc_selected = G.and_mode ? 1 : -1;
++		free(uid);
++		if (out)
++			goto done;
++	}
++
++	/* cwd, rtd, txt */
++	{
++		static const char *const special[] = { "cwd", "rtd", "txt" };
++		static const char *const link[] = { "cwd", "root", "exe" };
++		for (k = 0; k < 3; k++) {
++			sprintf(path, "/proc/%u/%s", (unsigned)pid, link[k]);
++			one_file(pid, cmd, user, proc_selected, special[k], path, -1);
++		}
++	}
++	/* mem: the files mapped in, but for the program itself */
++	sprintf(path, "/proc/%u/exe", (unsigned)pid);
++	exe = xmalloc_readlink(path);
++	sprintf(path, "/proc/%u/maps", (unsigned)pid);
++	maps = fopen_for_read(path);
++	if (maps) {
++		char *line;
++		while ((line = xmalloc_fgetline(maps)) != NULL) {
++			unsigned long ino = 0;
++			int n = 0;
++			sscanf(line, "%*s %*s %*s %*s %lu %n", &ino, &n);
++			if (ino && n && line[n] == '/' && !strstr(line + n, " (deleted)")
++			 && (!exe || strcmp(line + n, exe) != 0)
++			 && !llist_find_str(seen, line + n)
++			) {
++				char *file = xstrdup(line + n);
++				llist_add_to(&seen, file);
++				/* one_file reads the link: give it a path that leads there */
++				one_file(pid, cmd, user, proc_selected, "mem", file, -2);
++			}
++			free(line);
++		}
++		fclose(maps);
++	}
++	llist_free(seen, free);
++	free(exe);
++
++	/* the descriptors, in numeric order */
++	sprintf(path, "/proc/%u/fd", (unsigned)pid);
++	d = opendir(path);
++	if (d) {
++		int *fds = NULL, nfds = 0;
++		while ((de = readdir(d)) != NULL) {
++			if (!isdigit(de->d_name[0]))
++				continue;
++			fds = xrealloc_vector(fds, 5, nfds);
++			fds[nfds++] = atoi(de->d_name);
++		}
++		closedir(d);
++		qsort(fds, nfds, sizeof(fds[0]), cmp_pid);
++		for (k = 0; k < nfds; k++) {
++			char fdpath[80];
++			sprintf(fdpath, "/proc/%u/fd/%d", (unsigned)pid, fds[k]);
++			one_file(pid, cmd, user, proc_selected, NULL, fdpath, fds[k]);
++		}
++		free(fds);
++	}
++ done:
++	free(cmd);
++	free(user);
++}
+ 
+-		baseofs = sprintf(name, "/proc/%u/fd/", proc->pid);
+-		d_fd = opendir(name);
+-		if (d_fd) {
+-			while ((entry = readdir(d_fd)) != NULL) {
+-				/* Skip entries '.' and '..' (and any hidden file) */
+-				if (entry->d_name[0] == '.')
+-					continue;
+-
+-				safe_strncpy(name + baseofs, entry->d_name, 10);
+-				if ((fdlink = xmalloc_readlink(name)) != NULL) {
+-					printf("%d\t%s\t%s\t%s\n", proc->pid, proc->exe, entry->d_name, fdlink);
+-					free(fdlink);
++static void print_rows(void)
++{
++	int w[9] = { 7, 3, 4, 0, 4, 6, 8, 4, 0 };
++	int k;
++	pid_t last = 0;
++
++	if (G.terse) {
++		for (k = 0; k < G.nrows; k++)
++			if (G.rows[k].pid != last) {
++				printf("%u\n", (unsigned)G.rows[k].pid);
++				last = G.rows[k].pid;
++			}
++		return;
++	}
++	if (!G.nrows)
++		return;
++	for (k = 0; k < G.nrows; k++) {
++		struct row *r = &G.rows[k];
++		char pid[sizeof(int) * 3];
++		int fdlen;
++		sprintf(pid, "%u", (unsigned)r->pid);
++		w[0] = MAX(w[0], (int)MIN(strlen(r->cmd), 9));
++		w[1] = MAX(w[1], (int)strlen(pid));
++		w[2] = MAX(w[2], (int)strlen(r->user));
++		/* the number (or cwd...) without its access letter */
++		fdlen = strlen(r->fd) - (isdigit(r->fd[0]) ? 1 : 0);
++		w[3] = MAX(w[3], fdlen);
++		w[4] = MAX(w[4], (int)strlen(r->type));
++		w[5] = MAX(w[5], (int)strlen(r->device));
++		w[6] = MAX(w[6], (int)strlen(r->sizeoff));
++		w[7] = MAX(w[7], (int)strlen(r->node));
++	}
++	printf("%-*s %*s %-*s %*s   %*s %*s %*s %*s NAME\n",
++		w[0], "COMMAND", w[1], "PID", w[2], "USER", w[3], "FD",
++		w[4], "TYPE", w[5], "DEVICE", w[6], "SIZE/OFF", w[7], "NODE");
++	for (k = 0; k < G.nrows; k++) {
++		struct row *r = &G.rows[k];
++		char fdnum[32], mode = ' ';
++		int isnum = isdigit(r->fd[0]);
++		safe_strncpy(fdnum, r->fd, sizeof(fdnum));
++		if (isnum) {
++			mode = fdnum[strlen(fdnum) - 1];
++			fdnum[strlen(fdnum) - 1] = '\0';
++		}
++		printf("%-*.*s %*u %-*s %*s%c  %*s %*s %*s %*s %s\n",
++			w[0], 9, r->cmd, w[1], (unsigned)r->pid, w[2], r->user,
++			w[3], fdnum, mode, w[4], r->type, w[5], r->device,
++			w[6], r->sizeoff, w[7], r->node, r->name);
++	}
++}
++
++int lsof_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int lsof_main(int argc UNUSED_PARAM, char **argv)
++{
++	DIR *proc;
++	struct dirent *de;
++	int i;
++	pid_t self = getpid();
++
++	SET_PTR_TO_GLOBALS(xzalloc(sizeof(G)));
++
++	/* lsof's own option syntax: -x[ARG] or -x ARG, +D DIR, -- */
++	for (i = 1; argv[i]; i++) {
++		char *a = argv[i];
++		if (a[0] == '+' && (a[1] == 'D' || a[1] == 'd')) {
++			const char *dir = a[2] ? a + 2 : argv[++i];
++			char *real;
++			if (!dir)
++				bb_error_msg_and_die("+%c needs a directory", a[1]);
++			real = xmalloc_realpath(dir);
++			if (!real) {
++				bb_perror_msg("%s", dir);
++				return 1;
++			}
++			G.dirs = xrealloc_vector(G.dirs, 3, G.ndirs);
++			G.dirs_recursive = xrealloc_vector(G.dirs_recursive, 3, G.ndirs);
++			G.dirs_recursive[G.ndirs] = (a[1] == 'D');
++			G.dirs[G.ndirs++] = real;
++			G.selections |= SEL_F;
++			continue;
++		}
++		if (a[0] != '-' || !a[1]) {
++			struct stat st;
++			if (stat(a, &st) != 0) {
++				bb_perror_msg("status error on %s", a);
++				return 1;
++			}
++			G.fstats = xrealloc_vector(G.fstats, 3, G.nfstats);
++			G.fstats[G.nfstats++] = st;
++			G.selections |= SEL_F;
++			continue;
++		}
++		if (strcmp(a, "--") == 0) {
++			for (i++; argv[i]; i++) {
++				struct stat st;
++				if (stat(argv[i], &st) != 0) {
++					bb_perror_msg("status error on %s", argv[i]);
++					return 1;
+ 				}
++				G.fstats = xrealloc_vector(G.fstats, 3, G.nfstats);
++				G.fstats[G.nfstats++] = st;
++				G.selections |= SEL_F;
+ 			}
+-			closedir(d_fd);
++			break;
++		}
++		if (strcmp(a, "--help") == 0)
++			bb_show_usage();
++		for (a++; *a; a++) {
++			char opt = *a;
++			char *arg = NULL;
++			switch (opt) {
++			case 't': G.terse = 1; continue;
++			case 'n': G.numeric_host = 1; continue;
++			case 'P': G.numeric_port = 1; continue;
++			case 'l': G.numeric_uid = 1; continue;
++			case 'a': G.and_mode = 1; continue;
++			case 'w': case 'b': case 'V': case 'X': case 'O': continue;
++			case 'U':
++				G.sel_U = 1;
++				G.selections |= SEL_X;
++				continue;
++			case 'i':
++				/* the address may follow, or be the next word */
++				if (a[1])
++					arg = a + 1;
++				else if (looks_like_ispec(argv[i + 1]))
++					arg = argv[++i];
++				G.sel_i = 1;
++				G.selections |= SEL_I;
++				if (arg) {
++					G.ispecs = xrealloc_vector(G.ispecs, 3, G.nispecs);
++					if (!parse_ispec(arg, &G.ispecs[G.nispecs]))
++						bb_error_msg_and_die("unacceptable Internet address: %s", arg);
++					G.nispecs++;
++				}
++				break;
++			case 's':
++				/* -sTCP:LISTEN, -s TCP:LISTEN; -s alone (sizes) we show anyway */
++				if (a[1] && strchr(a + 1, ':')) {
++					parse_states(a + 1);
++					break;
++				}
++				if (!a[1] && argv[i + 1] && strchr(argv[i + 1], ':')
++				 && (strncasecmp(argv[i + 1], "tcp:", 4) == 0 || strncasecmp(argv[i + 1], "udp:", 4) == 0))
++					parse_states(argv[++i]);
++				continue;
++			case 'p': case 'u': case 'c': {
++				char *list, *tok, *save;
++				arg = a[1] ? a + 1 : argv[++i];
++				if (!arg)
++					bb_error_msg_and_die("-%c needs an argument", opt);
++				list = xstrdup(arg);
++				for (tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
++					int neg = (*tok == '^');
++					if (opt == 'p' && !isdigit(tok[neg]))
++						bb_error_msg_and_die("illegal process ID: %s", tok);
++					if (neg)
++						llist_add_to_end(opt == 'p' ? &G.xpids : opt == 'u' ? &G.xusers : &G.xcmds,
++							xstrdup(tok + 1));
++					else {
++						llist_add_to_end(opt == 'p' ? &G.pids : opt == 'u' ? &G.users : &G.cmds,
++							xstrdup(tok));
++						G.selections |= (opt == 'p' ? SEL_P : opt == 'u' ? SEL_U : SEL_C);
++					}
++				}
++				free(list);
++				break;
++			}
++			default:
++				bb_error_msg("unsupported option: -%c", opt);
++				bb_show_usage();
++			}
++			/* the option took the rest of this word (or the next one) */
++			break;
++		}
++	}
++
++	read_inet("/proc/net/tcp", 4, 't');
++	read_inet("/proc/net/tcp6", 6, 't');
++	read_inet("/proc/net/udp", 4, 'u');
++	read_inet("/proc/net/udp6", 6, 'u');
++	read_unix();
++
++	proc = xopendir("/proc");
++	{
++		pid_t *pids = NULL;
++		int npids = 0, k;
++		while ((de = readdir(proc)) != NULL) {
++			if (!isdigit(de->d_name[0]))
++				continue;
++			pids = xrealloc_vector(pids, 6, npids);
++			pids[npids++] = atoi(de->d_name);
+ 		}
++		closedir(proc);
++		qsort(pids, npids, sizeof(pids[0]), cmp_pid);
++		for (k = 0; k < npids; k++)
++			if (pids[k] != self)
++				scan_process(pids[k]);
+ 	}
+ 
+-	return EXIT_SUCCESS;
++	print_rows();
++	return (G.selections && !G.nrows) ? 1 : 0;
+ }

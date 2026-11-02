@@ -1,0 +1,132 @@
+diff --git a/editors/diff.c b/editors/diff.c
+--- a/editors/diff.c
++++ b/editors/diff.c
+@@ -103,7 +103,7 @@
+ //usage:       "[-abBcdiNqrTstw] [-C LINES] [-L LABEL] [-S FILE] [-U LINES] FILE1 FILE2"
+ //usage:#define diff_full_usage "\n\n"
+ //usage:       "Compare files line by line and output the differences between them.\n"
+-//usage:       "This implementation supports unified and context diffs.\n"
++//usage:       "Normal (GNU's default), unified (-u) and context (-c) diffs.\n"
+ //usage:     "\n	-a	Treat all files as text"
+ //usage:     "\n	-b	Ignore changes in the amount of whitespace"
+ //usage:     "\n	-B	Ignore changes whose lines are all blank"
+@@ -158,6 +158,8 @@
+ 	FLAG_E,         /* not implemented */
+ 	FLAG_c,         /* the context format, not the unified one */
+ 	FLAG_C,         /* -c with LINES of context (opt_U_context) */
++	FLAG_unified,   /* --unified[=LINES] */
++	FLAG_normal,    /* --normal: the default, without -u/-U/-c/-C */
+ };
+ #define FLAG(x) (1 << FLAG_##x)
+ 
+@@ -169,6 +171,7 @@
+ 
+ struct globals {
+ 	smallint exit_status;
++	smallint normal_fmt;
+ 	int opt_U_context;
+ 	const char *other_dir;
+ 	char *label[2];
+@@ -418,8 +421,8 @@
+ 	for (i = a; i <= b; i++) {
+ 		seek_ft(ft, ix[i - 1]);
+ 		putchar(ch);
+-		if (option_mask32 & (FLAG(c) | FLAG(C)))
+-			putchar(' ');   /* the context format's "  ", "- ", "+ ", "! " */
++		if (option_mask32 & (FLAG(c) | FLAG(C)) || G.normal_fmt)
++			putchar(' ');   /* the context format's "  ", "- ", "+ ", "! "; "< ", "> " */
+ 		if (option_mask32 & FLAG(T))
+ 			putchar('\t');
+ 		for (j = 0, col = 0; j < ix[i] - ix[i - 1]; j++) {
+@@ -643,6 +646,34 @@
+ 	}
+ }
+ 
++/* "a,b", or "b" for one line or none (where an insertion goes) */
++static void print_normal_range(int a, int b)
++{
++	if (a < b)
++		printf("%d,%d", a, b);
++	else
++		printf("%d", b);
++}
++
++/* The normal format, GNU diff's default: each change as "2c2", "3a4,5" or "6,7d5",
++ * the old lines as "< ", "---", the new ones as "> " */
++static void print_normal_hunk(FILE_and_pos_t ft[2], off_t *ix[2], vec_t *vec, int idx)
++{
++	int k;
++	for (k = 0; k <= idx; k++) {
++		int del = vec[k][0].a <= vec[k][0].b;
++		int add = vec[k][1].a <= vec[k][1].b;
++		print_normal_range(vec[k][0].a, vec[k][0].b);
++		putchar(del ? (add ? 'c' : 'd') : 'a');
++		print_normal_range(vec[k][1].a, vec[k][1].b);
++		putchar('\n');
++		fetch(&ft[0], ix[0], vec[k][0].a, vec[k][0].b, '<');
++		if (del && add)
++			puts("---");
++		fetch(&ft[1], ix[1], vec[k][1].a, vec[k][1].b, '>');
++	}
++}
++
+ static bool diff(FILE* fp[2], char *file[2])
+ {
+ 	int nlen[2];
+@@ -711,6 +742,10 @@
+ 			int lowa;
+ 			vec_t span, *cvp = vec;
+ 
++			if (G.normal_fmt) {
++				print_normal_hunk(ft, ix, vec, idx);
++				goto printed;
++			}
+ 			if (option_mask32 & (FLAG(c) | FLAG(C))) {
+ 				if (!anychange) {
+ 					printf("*** %s\n", label[0] ? label[0] : file[0]);
+@@ -1011,7 +1046,8 @@
+ 	"ignore-all-space\0"         No_argument       "w"
+ 	"ignore-blank-lines\0"       No_argument       "B"
+ 	"text\0"                     No_argument       "a"
+-	"unified\0"                  Required_argument "U"
++	"unified\0"                  Optional_argument "\xfd"
++	"normal\0"                   No_argument       "\xfc"
+ 	"label\0"                    Required_argument "L"
+ 	"show-c-function\0"          No_argument       "p"
+ 	"brief\0"                    No_argument       "q"
+@@ -1034,16 +1070,20 @@
+ int diff_main(int argc UNUSED_PARAM, char **argv)
+ {
+ 	int gotstdin = 0, i;
+-	char *file[2], *s_start = NULL;
++	char *file[2], *s_start = NULL, *unified_arg = NULL;
+ 	llist_t *L_arg = NULL;
+ 
+ 	INIT_G();
+ 
+ 	/* exactly 2 params; collect multiple -L <label>; -U N */
+-	GETOPT32(argv, "^" "abdiL:*NqrsS:tTU:+wupBEcC:+" "\0" "=2"
++	GETOPT32(argv, "^" "abdiL:*NqrsS:tTU:+wupBEcC:+\xfd::\xfc" "\0" "=2"
+ 			LONGOPTS,
+-			&L_arg, &s_start, &opt_U_context, &opt_U_context);
++			&L_arg, &s_start, &opt_U_context, &opt_U_context, &unified_arg);
+ 	argv += optind;
++	if (unified_arg)
++		opt_U_context = xatou(unified_arg);
++	/* as GNU diff: the normal format unless one of the others is asked for */
++	G.normal_fmt = !(option_mask32 & (FLAG(u) | FLAG(U) | FLAG(c) | FLAG(C) | FLAG(unified)));
+ 	while (L_arg)
+ 		label[!!label[0]] = llist_pop(&L_arg);
+ 
+@@ -1087,7 +1127,10 @@
+ 	 && stb[0].st_uid == stb[1].st_uid
+ 	 && stb[0].st_gid == stb[1].st_gid
+ 	) {
+-		/* files are physically the same; no need to compare them */
++		/* files are physically the same; no need to compare them
++		 * (but -s says so, as GNU diff does for files) */
++		if (!S_ISDIR(stb[0].st_mode))
++			print_status(STATUS_SAME, file);
+ 		return STATUS_SAME;
+ 	}
+ 
