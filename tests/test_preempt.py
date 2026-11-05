@@ -49,7 +49,7 @@ subprocess.run([sys.executable, str(ROOT / "userspace/mkinitramfs.py"), "--overl
 # Without the tick each of these never ends (not even the engine: the outer timeout fires).
 SCRIPT = r'''
 timeout -s KILL 2 busy-loop spin; echo "rc[kill]=$?"
-timeout 2 busy-loop spin; echo "rc[term]=$?"
+timeout -p 2 busy-loop spin; echo "rc[term]=$?"
 timeout -s KILL 2 busy-loop recurse; echo "rc[recurse]=$?"
 busy-loop alarm; echo "rc[alarm]=$?"
 busy-loop spin & a=$!; busy-loop spin & b=$!; busy-loop spin & c=$!

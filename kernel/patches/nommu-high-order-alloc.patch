@@ -1,0 +1,70 @@
+Allocations of more than one page (kmalloc above 128 KiB, vmalloc = kmalloc on nommu) no longer go
+to the OOM killer while clean page cache is left. nommu has no compaction, and since `can_compact`
+gates should_compact_retry() the !CONFIG_COMPACTION version of it (keep reclaiming while order-0
+watermarks are fine) is never reached: after a single reclaim round of 32 pages the allocator calls
+the OOM killer, even with gigabytes of page cache in single pages around the free ones. Here the
+processes' memory is not the kernel's (each has its own WebAssembly.Memory), so killing one frees
+nothing, and every later exec does the same until the shell and agentd are gone. Now it reclaims
+until a block of that order forms, at most enough rounds to free every page once.
+
+exec reads a program through a 256 KiB buffer (order 2): it now takes that only if one is free and
+otherwise reads a page at a time, instead of reclaiming for it on every exec.
+
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4297,6 +4297,16 @@
+ 		return false;
+ 
+ 	/*
++	 * Reclaim frees pages in LRU order, not by address, so a free block of
++	 * this order can take many rounds to appear. Each round reclaims at
++	 * least SWAP_CLUSTER_MAX pages: after enough rounds to have freed every
++	 * page once, stop (reclaim that keeps making progress only because
++	 * others refill the page cache must not loop forever).
++	 */
++	if (++(*compaction_retries) > totalram_pages() / SWAP_CLUSTER_MAX)
++		return false;
++
++	/*
+ 	 * There are setups with compaction disabled which would prefer to loop
+ 	 * inside the allocator rather than hit the oom killer prematurely.
+ 	 * Let's give them a good hope and keep retrying while the order-0
+@@ -4901,8 +4911,15 @@
+ 	 * reclaim is not able to make any progress because the current
+ 	 * implementation of the compaction depends on the sufficient amount
+ 	 * of free memory (see __compaction_suitable)
++	 *
++	 * Without compaction at all (nommu has none), the !CONFIG_COMPACTION
++	 * should_compact_retry() is the only way to a free block of this order:
++	 * reclaim until one forms. can_compact alone would skip it and go OOM
++	 * after a single round, with gigabytes of clean page cache left in
++	 * single pages.
+ 	 */
+-	if (did_some_progress > 0 && can_compact &&
++	if (did_some_progress > 0 &&
++	    (can_compact || !IS_ENABLED(CONFIG_COMPACTION)) &&
+ 			should_compact_retry(ac, order, alloc_flags,
+ 				compact_result, &compact_priority,
+ 				&compaction_retries))
+--- a/arch/wasm/kernel/binfmt_wasm.c
++++ b/arch/wasm/kernel/binfmt_wasm.c
+@@ -421,8 +421,18 @@
+ 	if (filesize > U32_MAX)
+ 		return -EFBIG;
+ 
++	/*
++	 * Once the page cache has filled memory, free memory is mostly single
++	 * pages (nommu has no compaction): take a large buffer only if one is
++	 * free, else read a page at a time rather than reclaim for it.
++	 */
+ 	chunk_size = min_t(loff_t, filesize, WASM_EXEC_MAX_CHUNK_SIZE);
+-	chunk = kmalloc(chunk_size, GFP_KERNEL);
++	if (chunk_size > PAGE_SIZE)
++		chunk = kmalloc(chunk_size, GFP_NOWAIT | __GFP_NOWARN);
++	if (!chunk) {
++		chunk_size = min_t(u32, chunk_size, PAGE_SIZE);
++		chunk = kmalloc(chunk_size, GFP_KERNEL);
++	}
+ 	if (!chunk)
+ 		return -ENOMEM;
+ 

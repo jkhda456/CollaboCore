@@ -1,0 +1,360 @@
+Every ramfs and tmpfs mount shares one limit (ramfs.limit, half of RAM by default) and takes tmpfs's
+size= for one of its own; a new page past either is ENOSPC, written or read in from a hole (ramfs
+keeps a zeroed page for a hole it reads, so reading a sparse file filled memory too). Without
+CONFIG_SHMEM (it needs an MMU) tmpfs is ramfs, which ignores size= and has no limit at all: files in
+/tmp, an overlay's upper layer or the root could take the whole 4 GiB, and there is no swap and
+nothing the OOM killer could free. Pages are counted in i_blocks (du and stat show them), brought to
+the page cache's nrpages when a file is written, truncated or evicted; df shows a mount's own use
+and the room left.
+
+--- a/fs/ramfs/inode.c
++++ b/fs/ramfs/inode.c
+@@ -40,15 +40,20 @@
+ #include <linux/fs_parser.h>
+ #include <linux/seq_file.h>
+ #include <linux/xattr.h>
++#include <linux/moduleparam.h>
++#include <linux/statfs.h>
+ #include "internal.h"
+ 
+ struct ramfs_mount_opts {
+ 	umode_t mode;
++	unsigned long max_pages;	/* size=, in pages; 0: no limit of its own */
++	bool size_given;		/* size= was on this mount (or remount) */
+ };
+ 
+ struct ramfs_fs_info {
+ 	struct ramfs_mount_opts mount_opts;
+ 	struct simple_xattr_cache xattr_cache;
++	atomic_long_t used;		/* pages of this mount's files */
+ };
+ 
+ #define RAMFS_DEFAULT_MODE	0755
+@@ -134,12 +139,172 @@
+ 	return simple_xattr_list(inode, ramfs_xattrs(inode), buffer, size);
+ }
+ 
++/*
++ * Limits. Without CONFIG_SHMEM (nommu) tmpfs is this filesystem, and ramfs has none: files in /tmp,
++ * an overlay's upper layer or the root could take all of memory, and with no swap and nothing the
++ * OOM killer could free, that ends the machine. Every ramfs and tmpfs mount, the root's too, shares
++ * one limit, ramfs.limit: half of RAM unless the kernel command line or
++ * /sys/module/ramfs/parameters/limit says otherwise (a size, N% of RAM, or 0 for none). A mount
++ * also takes tmpfs's size= (bytes, k/m/g, or N% of RAM; a remount changes it) for a limit of its
++ * own. A new page of a file past either is ENOSPC.
++ *
++ * A file's pages are counted in its i_blocks (du and stat show them, as on tmpfs). Pages leave the
++ * page cache by truncation, eviction and invalidation, and a read of a hole adds one, so the counts
++ * are brought to the page cache's own (nrpages) whenever a file is written, truncated or evicted,
++ * as shmem does with its alloced count.
++ */
++#define RAMFS_BLOCKS_PER_PAGE	(PAGE_SIZE / 512)
++
++static unsigned int ramfs_limit_percent = 50;	/* of RAM; 0: ramfs_limit_bytes */
++static unsigned long long ramfs_limit_bytes;	/* 0 with no percent: no limit */
++static atomic_long_t ramfs_used = ATOMIC_LONG_INIT(0);
++
++static unsigned long ramfs_limit_pages(void)
++{
++	unsigned int percent = READ_ONCE(ramfs_limit_percent);
++
++	if (percent)
++		return mult_frac(totalram_pages(), percent, 100);
++	return READ_ONCE(ramfs_limit_bytes) >> PAGE_SHIFT;
++}
++
++static int ramfs_limit_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long long size;
++	char *rest;
++	bool percent;
++
++	size = memparse(val, &rest);
++	percent = *rest == '%';
++	rest += percent;
++	if (*rest == '\n')
++		rest++;
++	if (rest == val || *rest || (percent && size > 100))
++		return -EINVAL;
++	WRITE_ONCE(ramfs_limit_percent, percent ? size : 0);
++	WRITE_ONCE(ramfs_limit_bytes, percent ? 0 : size);
++	return 0;
++}
++
++static int ramfs_limit_get(char *buffer, const struct kernel_param *kp)
++{
++	unsigned int percent = READ_ONCE(ramfs_limit_percent);
++
++	if (percent)
++		return scnprintf(buffer, PAGE_SIZE, "%u%%\n", percent);
++	return scnprintf(buffer, PAGE_SIZE, "%llu\n", READ_ONCE(ramfs_limit_bytes));
++}
++
++static const struct kernel_param_ops ramfs_limit_ops = {
++	.set = ramfs_limit_set,
++	.get = ramfs_limit_get,
++};
++module_param_cb(limit, &ramfs_limit_ops, NULL, 0644);
++MODULE_PARM_DESC(limit, "most memory all ramfs and tmpfs files together may use: bytes (k, m, g), N% of RAM, 0 for no limit (default 50%)");
++
++/* Pages that are already there (or gone): counted, never refused. */
++static void ramfs_account(struct ramfs_fs_info *fsi, long pages)
++{
++	atomic_long_add(pages, &fsi->used);
++	atomic_long_add(pages, &ramfs_used);
++}
++
++/* Takes pages for new pages of a file, or ENOSPC past the mount's limit or the shared one. */
++int ramfs_charge(struct inode *inode, long pages)
++{
++	struct ramfs_fs_info *fsi = inode->i_sb->s_fs_info;
++	unsigned long max = READ_ONCE(fsi->mount_opts.max_pages);
++	unsigned long limit = ramfs_limit_pages();
++
++	if ((unsigned long)atomic_long_add_return(pages, &fsi->used) > max && max)
++		goto full;
++	if ((unsigned long)atomic_long_add_return(pages, &ramfs_used) > limit && limit) {
++		atomic_long_sub(pages, &ramfs_used);
++		goto full;
++	}
++	spin_lock(&inode->i_lock);
++	inode->i_blocks += (blkcnt_t)pages * RAMFS_BLOCKS_PER_PAGE;
++	spin_unlock(&inode->i_lock);
++	return 0;
++full:
++	atomic_long_sub(pages, &fsi->used);
++	return -ENOSPC;
++}
++
++/* Brings the file's count, and the mount's and the shared one with it, to its page cache's. */
++void ramfs_recalc(struct inode *inode)
++{
++	long delta;
++
++	spin_lock(&inode->i_lock);
++	delta = (long)READ_ONCE(inode->i_mapping->nrpages) -
++		(long)(inode->i_blocks / RAMFS_BLOCKS_PER_PAGE);
++	/* in 64 bits: delta * an unsigned long is a huge 32-bit number when pages left */
++	inode->i_blocks += (blkcnt_t)delta * RAMFS_BLOCKS_PER_PAGE;
++	spin_unlock(&inode->i_lock);
++	if (delta)
++		ramfs_account(inode->i_sb->s_fs_info, delta);
++}
++
++/*
++ * Only a hole is read in: ramfs keeps the zeroed page in the file (tmpfs reads holes without one),
++ * so reading a sparse file could fill memory too. It is a new page within the limits like a
++ * written one, and past them the read fails with ENOSPC. The folio, unlocked and not uptodate,
++ * stays in the cache for the next read to try again; recalc counts it meanwhile.
++ */
++static int ramfs_read_folio(struct file *file, struct folio *folio)
++{
++	int err = ramfs_charge(folio->mapping->host, folio_nr_pages(folio));
++
++	if (err) {
++		folio_unlock(folio);
++		return err;
++	}
++	return ram_aops.read_folio(file, folio);
++}
++
++/* Writes hold the inode lock: no recalc runs between the charge and the folio's arrival. */
++static int ramfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
++			     loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
++{
++	struct inode *inode = mapping->host;
++	struct folio *folio;
++	int err;
++
++	ramfs_recalc(inode);
++	folio = filemap_get_folio(mapping, pos >> PAGE_SHIFT);
++	if (IS_ERR(folio)) {
++		err = ramfs_charge(inode, 1);
++		if (err)
++			return err;
++	} else {
++		folio_put(folio);
++	}
++	/* if this fails, the next recalc gives the page back */
++	return simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
++}
++
++static int ramfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
++			   loff_t pos, unsigned len, unsigned copied,
++			   struct folio *folio, void *fsdata)
++{
++	return ram_aops.write_end(iocb, mapping, pos, len, copied, folio, fsdata);
++}
++
++static const struct address_space_operations ramfs_aops = {
++	.read_folio	= ramfs_read_folio,
++	.write_begin	= ramfs_write_begin,
++	.write_end	= ramfs_write_end,
++	.dirty_folio	= noop_dirty_folio,
++};
++
+ static void ramfs_evict_inode(struct inode *inode)
+ {
+ 	struct ramfs_fs_info *fsi = inode->i_sb->s_fs_info;
+ 	struct list_head *xattrs = inode->i_private;
+ 
+ 	truncate_inode_pages_final(&inode->i_data);
++	ramfs_recalc(inode);
+ 	clear_inode(inode);
+ 	if (xattrs) {
+ 		simple_xattrs_free(&fsi->xattr_cache, xattrs, NULL);
+@@ -155,7 +320,7 @@
+ 	if (inode) {
+ 		inode->i_ino = get_next_ino();
+ 		inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+-		inode->i_mapping->a_ops = &ram_aops;
++		inode->i_mapping->a_ops = &ramfs_aops;
+ 		mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+ 		mapping_set_unevictable(inode->i_mapping);
+ 		simple_inode_init_ts(inode);
+@@ -327,14 +492,43 @@
+ static int ramfs_show_options(struct seq_file *m, struct dentry *root)
+ {
+ 	struct ramfs_fs_info *fsi = root->d_sb->s_fs_info;
++	unsigned long max = READ_ONCE(fsi->mount_opts.max_pages);
+ 
+ 	if (fsi->mount_opts.mode != RAMFS_DEFAULT_MODE)
+ 		seq_printf(m, ",mode=%o", fsi->mount_opts.mode);
++	if (max)
++		seq_printf(m, ",size=%luk", max << (PAGE_SHIFT - 10));
++	return 0;
++}
++
++/*
++ * Used is this mount's files; available is what both its own limit and the shared one still
++ * allow, so every mount shows the same room while the shared limit is the nearer one. With
++ * neither limit, zeros, as ramfs always gave.
++ */
++static int ramfs_statfs(struct dentry *dentry, struct kstatfs *buf)
++{
++	struct ramfs_fs_info *fsi = dentry->d_sb->s_fs_info;
++	unsigned long max = READ_ONCE(fsi->mount_opts.max_pages);
++	unsigned long limit = ramfs_limit_pages();
++	long used = max(atomic_long_read(&fsi->used), 0L);
++	long all = max(atomic_long_read(&ramfs_used), 0L);
++	unsigned long avail = ULONG_MAX;
++
++	simple_statfs(dentry, buf);
++	if (max)
++		avail = max > used ? max - used : 0;
++	if (limit)
++		avail = min(avail, limit > all ? limit - all : 0);
++	if (avail != ULONG_MAX) {
++		buf->f_blocks = used + avail;
++		buf->f_bfree = buf->f_bavail = avail;
++	}
+ 	return 0;
+ }
+ 
+ static const struct super_operations ramfs_ops = {
+-	.statfs		= simple_statfs,
++	.statfs		= ramfs_statfs,
+ 	.drop_inode	= inode_just_drop,
+ 	.evict_inode	= ramfs_evict_inode,
+ 	.show_options	= ramfs_show_options,
+@@ -342,10 +536,12 @@
+ 
+ enum ramfs_param {
+ 	Opt_mode,
++	Opt_size,
+ };
+ 
+ const struct fs_parameter_spec ramfs_fs_parameters[] = {
+ 	fsparam_u32oct("mode",	Opt_mode),
++	fsparam_string("size",	Opt_size),
+ 	{}
+ };
+ 
+@@ -353,6 +549,8 @@
+ {
+ 	struct fs_parse_result result;
+ 	struct ramfs_fs_info *fsi = fc->s_fs_info;
++	unsigned long long size;
++	char *rest;
+ 	int opt;
+ 
+ 	opt = fs_parse(fc, ramfs_fs_parameters, param, &result);
+@@ -375,11 +573,40 @@
+ 	case Opt_mode:
+ 		fsi->mount_opts.mode = result.uint_32 & S_IALLUGO;
+ 		break;
++	case Opt_size:
++		/* as tmpfs reads it: bytes with k, m, g..., or N% of RAM; 0 is no limit */
++		size = memparse(param->string, &rest);
++		if (*rest == '%') {
++			size <<= PAGE_SHIFT;
++			size *= totalram_pages();
++			do_div(size, 100);
++			rest++;
++		}
++		if (*rest)
++			return invalfc(fc, "Bad value for '%s'", param->key);
++		fsi->mount_opts.max_pages = DIV_ROUND_UP_ULL(size, PAGE_SIZE);
++		fsi->mount_opts.size_given = true;
++		break;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/* A remount changes size= (not below what the mount holds, as on tmpfs); mode stays. */
++static int ramfs_reconfigure(struct fs_context *fc)
++{
++	struct ramfs_fs_info *new = fc->s_fs_info;
++	struct ramfs_fs_info *fsi = fc->root->d_sb->s_fs_info;
++	unsigned long max = new->mount_opts.max_pages;
++
++	if (!new->mount_opts.size_given)
++		return 0;
++	if (max && atomic_long_read(&fsi->used) > (long)max)
++		return invalfc(fc, "Too small a size for current use");
++	WRITE_ONCE(fsi->mount_opts.max_pages, max);
++	return 0;
++}
++
+ static int ramfs_fill_super(struct super_block *sb, struct fs_context *fc)
+ {
+ 	struct ramfs_fs_info *fsi = sb->s_fs_info;
+@@ -416,6 +643,7 @@
+ 	.free		= ramfs_free_fc,
+ 	.parse_param	= ramfs_parse_param,
+ 	.get_tree	= ramfs_get_tree,
++	.reconfigure	= ramfs_reconfigure,
+ };
+ 
+ int ramfs_init_fs_context(struct fs_context *fc)
+--- a/fs/ramfs/file-nommu.c
++++ b/fs/ramfs/file-nommu.c
+@@ -78,6 +78,11 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* every page now, within the limits (on failure the caller's recalc gives them back) */
++	ret = ramfs_charge(inode, (newsize + PAGE_SIZE - 1) >> PAGE_SHIFT);
++	if (ret)
++		return ret;
++
+ 	i_size_write(inode, newsize);
+ 
+ 	/* allocate enough contiguous pages to be able to satisfy the
+@@ -177,6 +182,7 @@
+ 
+ 		if (ia->ia_size != size) {
+ 			ret = ramfs_nommu_resize(inode, ia->ia_size, size);
++			ramfs_recalc(inode);
+ 			if (ret < 0 || ia->ia_valid == ATTR_SIZE)
+ 				goto out;
+ 		} else {
+--- a/fs/ramfs/internal.h
++++ b/fs/ramfs/internal.h
+@@ -8,3 +8,5 @@
+ 
+ extern const struct inode_operations ramfs_file_inode_operations;
+ ssize_t ramfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
++int ramfs_charge(struct inode *inode, long pages);
++void ramfs_recalc(struct inode *inode);

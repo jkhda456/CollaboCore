@@ -58,13 +58,26 @@ case "$cmd" in
   clean)     "${MAKE[@]}" clean ;;
   distclean) "${MAKE[@]}" distclean ;;
   build)
-    for patch in "$ROOT"/patches/*.patch; do
-      [[ -f "$patch" ]] || continue
-      if git apply --reverse --check "$patch" 2>/dev/null; then
-        echo "== patch already applied: $(basename "$patch")"
+    # Which patches the tree already has: undo them from the last to the first on a copy of the
+    # files they touch. Checked one by one, a patch whose lines a later one changed (ramfs-xattr,
+    # then tmpfs-size-limit) would look missing and be applied again.
+    patches=()
+    for patch in "$ROOT"/patches/*.patch; do [[ -f "$patch" ]] && patches+=("$patch"); done
+    probe="$(mktemp -d)"
+    trap 'rm -rf "$probe"' EXIT
+    for patch in "${patches[@]}"; do sed -n 's|^+++ b/||p' "$patch"; done | sort -u | while read -r f; do
+      if [[ -f "$f" ]]; then mkdir -p "$probe/$(dirname "$f")"; cp "$f" "$probe/$f"; fi
+    done
+    applied=()
+    for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
+      (cd "$probe" && git apply --reverse "${patches[i]}" 2>/dev/null) && applied[i]=1
+    done
+    for i in "${!patches[@]}"; do
+      if [[ -n "${applied[i]:-}" ]]; then
+        echo "== patch already applied: $(basename "${patches[i]}")"
       else
-        echo "== apply patch: $(basename "$patch")"
-        git apply "$patch"
+        echo "== apply patch: $(basename "${patches[i]}")"
+        git apply "${patches[i]}"
       fi
     done
     [[ -f .config ]] || "${MAKE[@]}" defconfig

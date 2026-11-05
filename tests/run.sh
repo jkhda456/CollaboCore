@@ -76,6 +76,14 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   python3 "$T/test_preempt.py" >"$progs/preempt.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/preempt.txt" | head -40; echo "FAIL: preemption (kernel/patches/user-interrupt.patch, engine/src/user.rs on_epoch)"; exit 1; }
   tail -1 "$progs/preempt.txt"
 
+  echo "== guest boot: with memory full of page cache in single pages, 256 KiB allocations reclaim instead of the OOM killer; exec still works"
+  python3 "$T/test_high_order_alloc.py" >"$progs/high-order.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/high-order.txt" | head -40; echo "FAIL: high-order allocations (kernel/patches/nommu-high-order-alloc.patch)"; exit 1; }
+  tail -1 "$progs/high-order.txt"
+
+  echo "== guest boot: tmpfs and the root share a limit (half of RAM), size= limits a mount; past it ENOSPC, not out of memory"
+  python3 "$T/test_tmpfs_limit.py" >"$progs/tmpfs-limit.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/tmpfs-limit.txt" | head -40; echo "FAIL: tmpfs limits (kernel/patches/tmpfs-size-limit.patch)"; exit 1; }
+  tail -1 "$progs/tmpfs-limit.txt"
+
   echo "== guest boot: dlopen of a shared library (functions, data, TLS, threads, setjmp)"
   python3 "$T/test_dlopen.py" >"$progs/dlopen.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/dlopen.txt" | head -40; echo "FAIL: dlopen (addons/mod/0019, 0020)"; exit 1; }
   tail -1 "$progs/dlopen.txt"
