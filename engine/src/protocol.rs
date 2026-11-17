@@ -1030,7 +1030,8 @@ fn network_policy(value: Option<&Value>) -> std::result::Result<http::Policy, St
 
 /// Applies what the app sent onto a policy, leaving out what it did not mention. `policy.update`
 /// is a change to the policy the sandbox started with, not a replacement for it. A value that
-/// would loosen it by mistake (an unknown `privateNetworks`) is refused, and nothing changes.
+/// would loosen it by mistake (an unknown `privateNetworks`, an allow or deny rule that matches
+/// nothing) is refused, and nothing changes.
 fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) -> std::result::Result<(), String> {
     let fields = match value {
         Some(Value::Bool(false)) => {
@@ -1051,19 +1052,27 @@ fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) -> std
                 .ok_or_else(|| format!("network.privateNetworks must be \"allow\", \"deny\" or \"only\", not {value}"))?,
         ),
     };
-    if let Some(private_networks) = private_networks {
-        policy.private_networks = private_networks;
-    }
     let list = |name: &str| -> Option<Vec<String>> {
         fields
             .get(name)
             .and_then(Value::as_array)
             .map(|items| items.iter().filter_map(Value::as_str).map(|text| text.trim().to_lowercase()).collect())
     };
-    if let Some(allow) = list("allow") {
+    // A rule written wrong (a CIDR block that is not one, a * inside a name) would match
+    // nothing: refused, before anything changes.
+    let (allow, deny) = (list("allow"), list("deny"));
+    for (name, rules) in [("allow", &allow), ("deny", &deny)] {
+        for rule in rules.iter().flatten() {
+            http::check_rule(rule).map_err(|why| format!("network.{name}: {why}"))?;
+        }
+    }
+    if let Some(private_networks) = private_networks {
+        policy.private_networks = private_networks;
+    }
+    if let Some(allow) = allow {
         policy.allow = allow;
     }
-    if let Some(deny) = list("deny") {
+    if let Some(deny) = deny {
         policy.deny = deny;
     }
     if let Some(headers) = list("extraAllowedHeaders") {
@@ -1145,5 +1154,27 @@ mod tests {
         assert!(wrong.unwrap_err().contains("\"allow\", \"deny\" or \"only\""));
         assert_eq!((policy.private_networks, policy.allow.as_slice()), (PrivateNetworks::Only, &["*".to_string()][..]));
         assert!(network_policy(Some(&json!({"privateNetworks": true}))).is_err());
+    }
+
+    #[test]
+    fn the_app_sets_cidr_rules_and_wrong_ones_change_nothing() {
+        let mut policy = network_policy(Some(&json!({"allow": ["*", " 192.168.1.0/24 "], "deny": ["10.0.0.0/8", "FD00::/8"]}))).unwrap();
+        assert_eq!(policy.allow, ["*", "192.168.1.0/24"]);
+        assert_eq!(policy.deny, ["10.0.0.0/8", "fd00::/8"]);
+        assert!(policy.refuses_host("10.1.2.3").is_some() && policy.refuses_host("192.168.1.9").is_none());
+        // Bits past the prefix, a prefix too long, a * inside: refused, and nothing changes,
+        // not even what the same update got right.
+        for (wrong, says) in [
+            (json!({"deny": ["10.1.2.3/8"]}), "network.deny: \"10.1.2.3/8\" has bits set past its /8 (the block is 10.0.0.0/8)"),
+            (json!({"allow": ["10.0.0.0/33"], "privateNetworks": "deny"}), "network.allow: \"10.0.0.0/33\": the prefix length is 0 to 32"),
+            (json!({"deny": ["10.*.0.1"], "allow": []}), "network.deny: \"10.*.0.1\": * stands for whole octets"),
+            (json!({"deny": ["fd00::*"]}), "network.deny: \"fd00::*\": IPv6 takes no *"),
+        ] {
+            let error = apply_network_policy(&mut policy, Some(&wrong)).unwrap_err();
+            assert!(error.starts_with(says), "{error}");
+        }
+        assert_eq!((policy.allow.len(), policy.deny.len(), policy.private_networks), (2, 2, http::PrivateNetworks::Allow));
+        assert!(network_policy(Some(&json!({"allow": ["example.com/x"]}))).err().unwrap().contains("not a CIDR block"));
+        assert_eq!(network_policy(Some(&json!({"deny": ["192.168.1.*"]}))).unwrap().deny, ["192.168.1.*"]);
     }
 }

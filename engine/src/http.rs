@@ -17,8 +17,10 @@
 //! The policy's `private_networks` (the app's `privateNetworks`) refuses the private networks'
 //! addresses, or everything but them, by the address a host has: here an IP in the URL, and
 //! the addresses a name resolves to (`PolicyResolver`, each redirect too); in net.rs the
-//! guest's DNS answers and connections. This computer is judged by address here too: a name
-//! that resolves to 127.0.0.1 needs `allow_loopback` as `localhost` does.
+//! guest's DNS answers and connections. The lists' address rules (an IP, a CIDR block such as
+//! 10.0.0.0/8, an IPv4 wildcard such as 10.*: `AddressRule`) are judged the same way, so a
+//! deny rule's addresses are refused by whatever name. This computer is judged by address here
+//! too: a name that resolves to 127.0.0.1 needs `allow_loopback` as `localhost` does.
 //!
 //! Redirects are followed here, not by ureq: each hop is checked as the guest's own request is
 //! (the lists, `ask`, the addresses), gets the app's secrets for its own host only, and takes
@@ -105,9 +107,12 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
 /// Which hosts the guest may reach, and what the host adds to those requests.
 #[derive(Clone)]
 pub struct Policy {
-    /// Host patterns: "example.com", "*.example.com" (subdomains only) or "*".
+    /// Host patterns: "example.com", "*.example.com" (subdomains only) or "*"; and address rules
+    /// (`AddressRule`): "192.168.0.22", "10.0.0.0/8", "192.168.1.*", by address. A name still needs a pattern:
+    /// an address rule lets an address in, it does not make the host resolve any name for it.
     pub allow: Vec<String>,
-    /// Checked first; a match always refuses.
+    /// Checked first; a match always refuses. An address rule here refuses its addresses by any
+    /// name that resolves to them too.
     pub deny: Vec<String>,
     /// May the guest reach this computer (localhost, 127.0.0.0/8, ::1)?
     pub allow_loopback: bool,
@@ -150,6 +155,146 @@ impl Default for Policy {
     }
 }
 
+/// An address rule in the allow and deny lists: an IP address ("192.168.0.22", "::1"), a CIDR
+/// block ("10.0.0.0/8", "fd00::/8"), or an IPv4 address whose last octets are * ("192.168.1.*"
+/// is 192.168.1.0/24, "10.*" 10.0.0.0/8). A host pattern is about a name; this is about the
+/// address a host has, whatever name reaches it (`Policy::refuses_address`). IPv4 written as
+/// IPv6 (::ffff:a.b.c.d, or ::ffff:0:0/96 and longer) is IPv4.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AddressRule {
+    network: IpAddr,
+    prefix: u8,
+}
+
+/// An IPv4 address written as IPv6 is the IPv4 one.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// `ip` with the bits past `prefix` cleared.
+fn masked(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0)).into()),
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & u128::MAX.checked_shl(128 - prefix as u32).unwrap_or(0)).into()),
+    }
+}
+
+impl AddressRule {
+    /// The address rule `text` is: None for a host pattern, an error for what is not a valid
+    /// CIDR block (anything with a "/": a prefix out of range, bits set past it) or IPv4
+    /// wildcard (`wildcard`), so that a rule written wrong is refused rather than matching
+    /// nothing.
+    pub fn parse(text: &str) -> std::result::Result<Option<AddressRule>, String> {
+        let text = text.trim();
+        if text.contains('*') {
+            return AddressRule::wildcard(text);
+        }
+        let (address, prefix) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let Ok(ip) = address.trim_matches(['[', ']']).parse::<IpAddr>() else {
+            return match prefix {
+                None => Ok(None),
+                Some(_) => Err(format!("\"{text}\" is not a CIDR block (an address and a prefix length, such as 10.0.0.0/8 or fd00::/8)")),
+            };
+        };
+        let bits = if ip.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => bits,
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|prefix| *prefix <= bits)
+                .ok_or_else(|| format!("\"{text}\": the prefix length is 0 to {bits}"))?,
+        };
+        let network = masked(ip, prefix);
+        if network != ip {
+            return Err(format!("\"{text}\" has bits set past its /{prefix} (the block is {network}/{prefix})"));
+        }
+        Ok(Some(match network {
+            IpAddr::V6(v6) if prefix >= 96 && v6.to_ipv4_mapped().is_some() => {
+                AddressRule { network: canonical(network), prefix: prefix - 96 }
+            }
+            _ => AddressRule { network, prefix },
+        }))
+    }
+
+    /// An IPv4 address with * for its last whole octets, as the CIDR block that makes:
+    /// "192.168.1.*" /24, "192.168.*" or "192.168.*.*" /16, "10.*" /8. None for what is no
+    /// address (a host pattern: "*", "*.example.com"). Refused: a * before a number
+    /// ("10.*.0.1", "*.168.1.1": no CIDR block is that), inside an octet ("192.168.1*"), and in
+    /// IPv6 ("fd00::*"), which takes a CIDR block.
+    fn wildcard(text: &str) -> std::result::Result<Option<AddressRule>, String> {
+        if text.contains(':') {
+            return Err(format!("\"{text}\": IPv6 takes no *, only a CIDR block such as fd00::/8"));
+        }
+        if text.contains('/') {
+            return Err(format!("\"{text}\": a CIDR block takes no *"));
+        }
+        let parts: Vec<&str> = text.split('.').collect();
+        let numeric = |part: &&str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit() || byte == b'*');
+        if !parts.iter().all(numeric) || !text.bytes().any(|byte| byte.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let wrong = || format!("\"{text}\": * stands for whole octets at the end of an IPv4 address (192.168.1.*, 10.*), or write a CIDR block");
+        let Some(at) = parts.iter().position(|part| *part == "*").filter(|at| *at > 0 && parts.len() <= 4 && parts[*at..].iter().all(|part| *part == "*")) else {
+            return Err(wrong());
+        };
+        let mut octets = [0u8; 4];
+        for (octet, part) in octets.iter_mut().zip(&parts[..at]) {
+            // 010 is 8 to some tools and 10 to others: written as neither.
+            if part.len() > 1 && part.starts_with('0') {
+                return Err(wrong());
+            }
+            *octet = part.parse().map_err(|_| wrong())?;
+        }
+        Ok(Some(AddressRule { network: IpAddr::V4(octets.into()), prefix: 8 * at as u8 }))
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = canonical(ip);
+        ip.is_ipv4() == self.network.is_ipv4() && masked(ip, self.prefix) == self.network
+    }
+}
+
+/// The address rule an allow or deny list entry is, if it is one (`check_rule` has refused the
+/// entries that are neither one nor a host pattern).
+fn address_rule(rule: &str) -> Option<AddressRule> {
+    AddressRule::parse(rule).ok().flatten()
+}
+
+/// Is this an allow or deny list entry the policy understands? A host pattern ("example.com",
+/// "*.example.com", "*") or an address rule ("192.168.0.22", "10.0.0.0/8", "192.168.1.*").
+/// Anything else would match nothing, which in the deny list lets through what it was meant to
+/// stop.
+pub fn check_rule(rule: &str) -> std::result::Result<(), String> {
+    if AddressRule::parse(rule)?.is_some() {
+        return Ok(());
+    }
+    let rule = rule.trim();
+    let wildcard = rule.strip_prefix("*.").unwrap_or(rule);
+    if rule.is_empty() || (rule != "*" && wildcard.contains('*')) {
+        return Err(format!(
+            "\"{rule}\": a host is \"example.com\", \"*.example.com\" (its subdomains) or \"*\", and addresses an IP, a CIDR block such as 192.168.1.0/24 or an IPv4 address ending in * such as 192.168.1.*"
+        ));
+    }
+    Ok(())
+}
+
+/// Does an allow or deny list entry match this host? A host pattern by name (`host_matches`);
+/// an address rule by address, when the host is one (an IP in a URL, the guest's connection).
+/// What a name resolves to is `refuses_address`'s.
+fn rule_matches(rule: &str, host: &str) -> bool {
+    match address_rule(rule) {
+        Some(rule) => host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| rule.contains(ip)),
+        None => host_matches(rule, host),
+    }
+}
+
 fn host_matches(pattern: &str, host: &str) -> bool {
     let host = host.trim_end_matches('.').to_lowercase();
     if pattern == "*" {
@@ -178,31 +323,43 @@ impl Policy {
     /// stack asks this about names it resolves and addresses it is asked to reach; loopback is
     /// its own question there (`allow_loopback`).
     pub fn refuses_host(&self, host: &str) -> Option<String> {
-        if let Some(rule) = self.deny.iter().find(|rule| host_matches(rule, host)) {
+        if let Some(rule) = self.deny.iter().find(|rule| rule_matches(rule, host)) {
             return Some(format!("\"{host}\" matches the deny rule \"{rule}\""));
         }
-        match self.allow.iter().any(|rule| host_matches(rule, host)) {
+        match self.allow.iter().any(|rule| rule_matches(rule, host)) {
             true => None,
             false => Some(format!("\"{host}\" is not in the allow list")),
         }
     }
 
-    /// Why `private_networks` refuses `ip`, the address `host` (a name, or the address itself)
-    /// has, if it does. A host the allow list names exactly (no `*`) is exempt: it was named on
-    /// purpose, while `*` and `*.example.com` also let through names whose addresses whoever runs
-    /// their DNS picks. Loopback is `allow_loopback`'s, not this rule's.
+    /// Why the policy refuses `ip`, the address `host` (a name, or the address itself) has, by
+    /// that address, if it does: a deny list address rule (an IP, a CIDR block), whatever the
+    /// name, as deny always wins; then `private_networks`. From that one, a host the allow list
+    /// names exactly (no `*`) is exempt, and so is an address an allow list address rule holds:
+    /// named on purpose, while `*` and `*.example.com` also let through names whose addresses
+    /// whoever runs their DNS picks. Loopback is `allow_loopback`'s, not these rules'.
     pub fn refuses_address(&self, host: &str, ip: IpAddr) -> Option<String> {
-        if self.private_networks == PrivateNetworks::Allow || is_loopback_ip(ip) {
+        if is_loopback_ip(ip) {
             return None;
         }
         let host = host.trim_matches(['[', ']']);
-        if self.allow.iter().any(|rule| !rule.contains('*') && host_matches(rule, host)) {
-            return None;
-        }
         let shown = match host.parse::<IpAddr>() {
             Ok(_) => format!("{ip}"),
             Err(_) => format!("\"{host}\" is {ip}, which"),
         };
+        if let Some(rule) = self.deny.iter().find(|rule| address_rule(rule).is_some_and(|rule| rule.contains(ip))) {
+            return Some(format!("{shown} matches the deny rule \"{rule}\""));
+        }
+        if self.private_networks == PrivateNetworks::Allow {
+            return None;
+        }
+        let named = |rule: &String| match address_rule(rule) {
+            Some(rule) => rule.contains(ip),
+            None => !rule.contains('*') && host_matches(rule, host),
+        };
+        if self.allow.iter().any(named) {
+            return None;
+        }
         match (self.private_networks, is_private(ip)) {
             (PrivateNetworks::Deny, true) => Some(format!("{shown} is in a private network (privateNetworks is deny)")),
             (PrivateNetworks::Only, false) => Some(format!("{shown} is not in a private network (privateNetworks is only)")),
@@ -212,8 +369,8 @@ impl Policy {
 
     /// Why the request API may not connect to `ip`, an address `host` resolved to
     /// (PolicyResolver): this computer without `allow_loopback` — a name says nothing about
-    /// where it points, so `is_loopback`'s look at the name is not enough — or the private
-    /// networks' rule.
+    /// where it points, so `is_loopback`'s look at the name is not enough — or the rules by
+    /// address (`refuses_address`).
     fn refuses_resolved(&self, host: &str, ip: IpAddr) -> Option<String> {
         if !is_loopback_ip(ip) {
             return self.refuses_address(host, ip);
@@ -228,8 +385,8 @@ impl Policy {
     /// Neither list names this host (and it is not this computer): what `ask` asks about.
     pub fn unlisted(&self, host: &str) -> bool {
         !is_loopback(host)
-            && !self.deny.iter().any(|rule| host_matches(rule, host))
-            && !self.allow.iter().any(|rule| host_matches(rule, host))
+            && !self.deny.iter().any(|rule| rule_matches(rule, host))
+            && !self.allow.iter().any(|rule| rule_matches(rule, host))
     }
 
     /// Why this host is refused, if it is. The wording is the app's and the guest's, so it
@@ -237,9 +394,9 @@ impl Policy {
     fn refuses(&self, host: &str) -> Option<String> {
         let reason = if is_loopback(host) && !self.allow_loopback {
             format!("\"{host}\" is this computer (allowHostLoopback is off)")
-        } else if let Some(rule) = self.deny.iter().find(|rule| host_matches(rule, host)) {
+        } else if let Some(rule) = self.deny.iter().find(|rule| rule_matches(rule, host)) {
             format!("\"{host}\" matches the deny rule \"{rule}\"")
-        } else if !self.allow.iter().any(|rule| host_matches(rule, host)) {
+        } else if !self.allow.iter().any(|rule| rule_matches(rule, host)) {
             format!("\"{host}\" is not in the allow list")
         } else if let Some(reason) = host.trim_matches(['[', ']']).parse::<IpAddr>().ok().and_then(|ip| self.refuses_address(host, ip)) {
             // An address in the URL; a name's addresses are PolicyResolver's.
@@ -527,8 +684,8 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 /// Resolves as ureq does, then keeps the addresses the URL's host may be reached at
-/// (`Policy::refuses_resolved`): this computer only with `allow_loopback`, and what
-/// `private_networks` lets through. A name that resolves to 127.0.0.1, or into a private network
+/// (`Policy::refuses_resolved`): this computer only with `allow_loopback`, and what the deny
+/// list's address rules and `private_networks` let through. A name that resolves to 127.0.0.1, or into a private network
 /// or out of one, is only told apart here; every redirect handle() follows comes here too. The
 /// live policy, so a `policy.update` applies at once. A proxy the host is configured with
 /// (`HTTPS_PROXY`) is the host's own: its address is not checked, and the names it resolves
@@ -1043,6 +1200,118 @@ mod tests {
     }
 
     #[test]
+    fn address_rules_are_ips_and_cidr_blocks() {
+        let rule = |text: &str| AddressRule::parse(text).unwrap().unwrap();
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        assert!(rule("10.0.0.0/8").contains(ip("10.255.0.1")) && !rule("10.0.0.0/8").contains(ip("11.0.0.1")));
+        assert!(rule("192.168.1.0/24").contains(ip("192.168.1.200")) && !rule("192.168.1.0/24").contains(ip("192.168.2.1")));
+        assert!(rule("192.168.1.7").contains(ip("192.168.1.7")) && !rule("192.168.1.7").contains(ip("192.168.1.8")));
+        assert!(rule("0.0.0.0/0").contains(ip("8.8.8.8")) && !rule("0.0.0.0/0").contains(ip("2606:4700::1")));
+        assert!(rule("fd00::/8").contains(ip("fd12::1")) && !rule("fd00::/8").contains(ip("fe80::1")));
+        assert!(rule("[::1]").contains(ip("::1")) && rule("2001:db8::/32").contains(ip("2001:db8:ffff::1")));
+        // IPv4 written as IPv6 is IPv4, in the address and in the rule.
+        assert!(rule("10.0.0.0/8").contains(ip("::ffff:10.1.2.3")));
+        assert_eq!(rule("::ffff:10.0.0.0/104"), rule("10.0.0.0/8"));
+        assert!(rule("::ffff:192.168.0.22").contains(ip("192.168.0.22")));
+        // Host patterns are not address rules; what has a "/" must be a CIDR block.
+        for pattern in ["example.com", "*.example.com", "*", "10.0.0.1.nip.io"] {
+            assert_eq!(AddressRule::parse(pattern), Ok(None), "{pattern}");
+        }
+        assert!(AddressRule::parse("10.0.0.0/33").unwrap_err().contains("0 to 32"));
+        assert!(AddressRule::parse("fd00::/129").unwrap_err().contains("0 to 128"));
+        assert!(AddressRule::parse("10.0.0.0/x").is_err() && AddressRule::parse("10.0.0.0/").is_err());
+        assert_eq!(AddressRule::parse("10.1.2.3/8").unwrap_err(), "\"10.1.2.3/8\" has bits set past its /8 (the block is 10.0.0.0/8)");
+        assert!(AddressRule::parse("example.com/24").unwrap_err().contains("not a CIDR block"));
+        // The lists' entries: these or host patterns, nothing that would match nothing.
+        for good in ["example.com", "*.example.com", "*", "10.0.0.0/8", "::1", "192.168.0.22", "192.168.1.*"] {
+            assert_eq!(check_rule(good), Ok(()), "{good}");
+        }
+        for bad in ["*.*.example.com", "api*.example.com", "", "10.0.0.0/40", "*.*.*.*"] {
+            assert!(check_rule(bad).is_err(), "{bad}");
+        }
+        assert!(check_rule("api*.example.com").unwrap_err().contains("CIDR block such as 192.168.1.0/24 or an IPv4 address ending in *"));
+    }
+
+    #[test]
+    fn ipv4_wildcards_are_the_cidr_blocks_of_their_last_octets() {
+        let rule = |text: &str| AddressRule::parse(text).unwrap().unwrap();
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        assert_eq!(rule("192.168.1.*"), rule("192.168.1.0/24"));
+        assert_eq!(rule("192.168.*"), rule("192.168.0.0/16"));
+        assert_eq!(rule("192.168.*.*"), rule("192.168.0.0/16"));
+        assert_eq!(rule("10.*"), rule("10.0.0.0/8"));
+        assert_eq!(rule("10.*.*.*"), rule("10.0.0.0/8"));
+        assert_eq!(rule(" 0.* "), rule("0.0.0.0/8"));
+        assert!(rule("192.168.1.*").contains(ip("192.168.1.254")) && !rule("192.168.1.*").contains(ip("192.168.2.1")));
+        assert!(rule("10.*").contains(ip("::ffff:10.9.9.9")));
+        // Host patterns stay host patterns.
+        for pattern in ["*", "*.example.com", "*.10.in-addr.arpa"] {
+            assert_eq!(AddressRule::parse(pattern), Ok(None), "{pattern}");
+        }
+        // No CIDR block is a * before a number, part of an octet, or more than four octets.
+        for wrong in ["10.*.0.1", "*.168.1.1", "*.10", "192.168.1*", "192.168.1.1*", "192.168.1.1.*", "256.*", "010.*", "192..*"] {
+            let error = check_rule(wrong).unwrap_err();
+            assert!(error.contains("192.168.1.*") || error.contains("a host is"), "{wrong}: {error}");
+        }
+        assert!(AddressRule::parse("10.*.0.1").unwrap_err().contains("* stands for whole octets at the end of an IPv4 address"));
+        // IPv6 takes a CIDR block; a CIDR block takes no *.
+        for wrong in ["fd00::*", "[fd00::*]", "fe80:*::1", "*::1"] {
+            assert!(AddressRule::parse(wrong).unwrap_err().contains("IPv6 takes no *, only a CIDR block"), "{wrong}");
+        }
+        assert!(AddressRule::parse("192.168.*/16").unwrap_err().contains("a CIDR block takes no *"));
+        // By address in the lists, as any address rule: a name into the block is refused, and
+        // an allow wildcard is exempt from privateNetworks.
+        let deny = Policy { deny: vec!["10.*".into()], ..Policy::default() };
+        assert_eq!(deny.refuses_host("10.1.2.3").unwrap(), "\"10.1.2.3\" matches the deny rule \"10.*\"");
+        assert_eq!(deny.refuses_address("x.nip.io", ip("10.1.2.3")).unwrap(), "\"x.nip.io\" is 10.1.2.3, which matches the deny rule \"10.*\"");
+        assert_eq!(deny.refuses_host("11.1.2.3"), None);
+        let subnet = Policy { allow: vec!["*".into(), "192.168.1.*".into()], private_networks: PrivateNetworks::Deny, ..Policy::default() };
+        assert_eq!(subnet.refuses_address("nas.lan", ip("192.168.1.40")), None);
+        assert!(subnet.refuses_address("nas.lan", ip("192.168.2.40")).is_some());
+    }
+
+    #[test]
+    fn address_rules_in_the_lists_go_by_address() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        // By address, whether the host is written as one or a name resolves to it.
+        let deny = Policy { deny: vec!["10.0.0.0/8".into(), "192.168.0.22".into()], ..Policy::default() };
+        assert_eq!(deny.refuses_host("10.9.8.7").unwrap(), "\"10.9.8.7\" matches the deny rule \"10.0.0.0/8\"");
+        assert_eq!(deny.refuses_host("10.9.8.7.nip.io"), None); // a name: its address decides
+        assert_eq!(
+            deny.refuses_address("10.9.8.7.nip.io", ip("10.9.8.7")).unwrap(),
+            "\"10.9.8.7.nip.io\" is 10.9.8.7, which matches the deny rule \"10.0.0.0/8\""
+        );
+        assert_eq!(deny.refuses_address("10.9.8.7", ip("10.9.8.7")).unwrap(), "10.9.8.7 matches the deny rule \"10.0.0.0/8\"");
+        assert!(deny.refuses_address("nas.lan", ip("192.168.0.22")).unwrap().contains("deny rule \"192.168.0.22\""));
+        assert_eq!(deny.refuses_address("nas.lan", ip("192.168.0.23")), None);
+        assert!(deny.refuses("[::ffff:10.0.0.1]").unwrap().contains("deny rule \"10.0.0.0/8\""));
+        assert!(deny.refuses_resolved("x.test", ip("::ffff:10.0.0.1")).unwrap().contains("deny rule"));
+        // Deny wins over an exact allow too, as it does for names.
+        let both = Policy { allow: vec!["*".into(), "nas.corp.test".into()], ..deny.clone() };
+        assert!(both.refuses_address("nas.corp.test", ip("10.0.0.5")).is_some());
+        // Loopback stays allow_loopback's.
+        let all = Policy { deny: vec!["0.0.0.0/0".into(), "::/0".into()], allow_loopback: true, ..Policy::default() };
+        assert_eq!(all.refuses_resolved("localhost", ip("127.0.0.1")), None);
+        assert!(all.refuses_resolved("example.com", ip("93.184.215.14")).is_some());
+        // In the allow list: the addresses in it, by address only; a name still needs a pattern.
+        let allow = Policy { allow: vec!["192.168.1.0/24".into(), "fd00::/8".into()], ..Policy::default() };
+        assert_eq!(allow.refuses_host("192.168.1.40"), None);
+        assert_eq!(allow.refuses("[fd00::9]"), None);
+        assert!(allow.refuses_host("192.168.2.40").unwrap().contains("not in the allow list"));
+        assert!(allow.refuses_host("nas.lan").unwrap().contains("not in the allow list"));
+        assert!(!allow.unlisted("192.168.1.40") && allow.unlisted("192.168.2.40") && allow.unlisted("nas.lan"));
+        // ...and they are exempt from privateNetworks, by any name: the LAN's one subnet.
+        let subnet = Policy { allow: vec!["*".into(), "192.168.1.0/24".into()], private_networks: PrivateNetworks::Deny, ..Policy::default() };
+        assert_eq!(subnet.refuses_address("nas.lan", ip("192.168.1.40")), None);
+        assert_eq!(subnet.refuses_address("192.168.1.40", ip("192.168.1.40")), None);
+        assert!(subnet.refuses_address("192.168.2.40", ip("192.168.2.40")).unwrap().contains("privateNetworks is deny"));
+        assert!(subnet.refuses_address("metadata", ip("169.254.169.254")).is_some());
+        let public = Policy { allow: vec!["*".into(), "1.1.1.0/24".into()], private_networks: PrivateNetworks::Only, ..Policy::default() };
+        assert_eq!(public.refuses_address("one.one.one.one", ip("1.1.1.1")), None);
+        assert!(public.refuses_address("dns.google", ip("8.8.8.8")).is_some());
+    }
+
+    #[test]
     fn the_resolver_keeps_the_addresses_the_rule_lets_through() {
         use ureq::unversioned::resolver::Resolver;
         let resolver = |mode| PolicyResolver { policy: Arc::new(RwLock::new(Policy { private_networks: mode, ..Policy::default() })), inner: Default::default() };
@@ -1063,6 +1332,10 @@ mod tests {
         let live = resolver(PrivateNetworks::Deny);
         live.policy.write().unwrap().private_networks = PrivateNetworks::Allow;
         assert_eq!(resolve(&live, "http://10.1.2.3/").unwrap().len(), 1);
+        // A deny list CIDR block, on what was resolved (here a decimal 10.1.2.3, which only the
+        // resolver reads as an address).
+        live.policy.write().unwrap().deny = vec!["10.0.0.0/8".into()];
+        assert_eq!(reason(resolve(&live, "http://167838211/").unwrap_err()), "blocked by the network policy: \"167838211\" is 10.1.2.3, which matches the deny rule \"10.0.0.0/8\"");
     }
 
     #[test]

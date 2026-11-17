@@ -62,15 +62,20 @@ Machine:
                             that is not an option counts as one too)
 
 Network (the guest's sockets and its request API go through the same policy):
-  --allow HOST              a host the guest may reach (repeatable; default: any)
-  --deny HOST               a host it may not (repeatable, checked first)
+  --allow RULE              a host the guest may reach (repeatable; default: any): example.com,
+                            *.example.com (its subdomains), *, or an address: an IP, a CIDR
+                            block (192.168.1.0/24, fd00::/8) or IPv4 with * for its last
+                            octets (192.168.1.*, 10.*; IPv6 takes a CIDR block)
+  --deny RULE               one it may not (repeatable, checked first); an address rule is
+                            refused by whatever name resolves into it too
   --no-network              no outbound connections at all
   --allow-loopback          let the guest reach this computer's own services
   --private-networks allow|deny|only
                             the private networks' addresses (10/8, 172.16/12, 192.168/16,
                             100.64/10, 169.254/16, fc00::/7, fe80::/10), whatever name reaches
                             them: allow (default), deny (the internet only) or only (the local
-                            networks only); a host --allow names exactly (no *) is exempt
+                            networks only); a host --allow names exactly (no *) is exempt,
+                            and so is an address an --allow address rule holds
   --secret HOST:HEADER=VALUE
                             a header the host adds to https requests to HOST (repeatable);
                             the guest never sees it, and it is never logged
@@ -549,8 +554,12 @@ fn main() -> Result<()> {
                 let spec = argv.next().context("--mount needs HOST:GUEST[:ro]")?;
                 mounts.push(parse_mount(&spec, mounts.len())?);
             }
-            "--allow" => allow.extend(argv.next()),
-            "--deny" => policy.deny.extend(argv.next()),
+            // As the app's lists are: trimmed, lower case, and refused when written wrong.
+            "--allow" | "--deny" => {
+                let rule = argv.next().with_context(|| format!("{argument} needs a host, an IP, a CIDR block or an IPv4 wildcard"))?.trim().to_lowercase();
+                http::check_rule(&rule).map_err(|why| anyhow::anyhow!("{argument} {why}"))?;
+                if argument == "--allow" { allow.push(rule) } else { policy.deny.push(rule) }
+            }
             "--no-network" => network = false,
             "--allow-loopback" => policy.allow_loopback = true,
             "--private-networks" => {

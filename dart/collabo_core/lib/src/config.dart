@@ -241,8 +241,16 @@ class Mount {
 }
 
 /// The sandbox's network rules. Patterns: `example.com` (exactly), `*.example.com`
-/// (subdomains), `*` (anything). [deny] wins over [allow]. [privateNetworks] acts on the
-/// addresses hosts have, beside the names.
+/// (subdomains), `*` (anything), and addresses: an IP, a CIDR block (`192.168.1.0/24`,
+/// `fd00::/8`) or IPv4 with `*` for its last octets (`192.168.1.*` = 192.168.1.0/24, `10.*` =
+/// 10.0.0.0/8; IPv6 takes a CIDR block). [deny] wins over [allow]. [privateNetworks] and the
+/// address rules act on the addresses hosts have, beside the names. A rule written wrong
+/// (`10.1.2.3/8`, with bits past its prefix; `10.*.0.1`; `fd00::*`) is refused:
+/// [CollaboCore.start] and [CollaboCore.updatePolicy] fail with bad-request, and the policy
+/// stays as it was.
+///
+///   NetworkPolicy(deny: ['10.0.0.0/8', '172.16.*'])              // by any name
+///   NetworkPolicy(allow: ['*', '192.168.1.0/24'], privateNetworks: PrivateNetworks.deny)
 class NetworkPolicy {
   const NetworkPolicy({
     this.allow = const ['*'],
@@ -255,7 +263,13 @@ class NetworkPolicy {
     this.privateNetworks = PrivateNetworks.allow,
   });
 
+  /// Who the sandbox may reach. An address rule here lets those addresses in (and
+  /// exempts them from [privateNetworks]); a name still needs a pattern: a block alone does
+  /// not make this computer look up names for the sandbox.
   final List<String> allow;
+
+  /// Who it may never reach, checked first. An address rule here is refused by whatever
+  /// name resolves into it too: the address decides, not the name.
   final List<String> deny;
 
   /// May the sandbox reach services on this computer (localhost, 127.0.0.0/8, ::1, and any name
@@ -292,6 +306,8 @@ class NetworkPolicy {
   /// only the ones allowed), each redirect. A host [allow] names exactly (no `*`) is exempt,
   /// e.g. `allow: ['*', 'api.anthropic.com'], privateNetworks: PrivateNetworks.only` for the
   /// LAN and one API; a wildcard is not, since whoever runs a domain's DNS picks its addresses.
+  /// So is an address an [allow] address rule holds, by any name: `allow: ['*',
+  /// '192.168.1.0/24'], privateNetworks: PrivateNetworks.deny` for the internet and one subnet.
   /// Loopback stays [allowHostLoopback]'s. Not asked about with [ask]: a refusal.
   final PrivateNetworks privateNetworks;
 

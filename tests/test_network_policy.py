@@ -5,6 +5,10 @@
     and the request API (hfetch: http.rs), by address, by a name that resolves into a private
     network (nip.io), through a redirect, the exemption of a host the allow list names exactly,
     loopback left to --allow-loopback, and the app's start and policy.update (--stdio);
+  - the lists' address rules (--allow/--deny IP, CIDR block or IPv4 wildcard such as 192.168.1.*,
+    network.allow/deny): by address and
+    by a name that resolves into the block, an allow block's exemption from privateNetworks, a
+    name still needing a pattern, and a rule written wrong refused (engine, start, policy.update);
   - the request API's loopback by the address a name resolves to (127.0.0.1.nip.io);
   - redirects the request API follows, each one checked like the first (allow/deny), the app's
     secrets only for their own host, the guest's own keys only within their origin, the methods
@@ -231,6 +235,57 @@ check("hfetch=2" in out and "allowHostLoopback is off" in err, "deny without --a
 code, out, err = guest("true", "--private-networks", "block")
 check(code != 0 and "--private-networks block: allow, deny or only" in err, "--private-networks block: refused, the engine does not start", net(err))
 
+# --- address rules in the lists: an IP or a CIDR block, by address -------------------------------
+BLOCK = str(ipaddress.ip_network(f"{LAN}/24", strict=False))  # the LAN's /24, e.g. 192.168.0.0/24
+code, out, err = guest(BOTH, "--deny", BLOCK)
+check("lan-ok" not in out and "wget=0" not in out and "hfetch=2" in out, f"--deny {BLOCK}: the LAN address is refused to both", out + net(err))
+check(f'reason: Some("{LAN} matches the deny rule \\"{BLOCK}\\"")' in err
+      and f'blocked GET {URL}: blocked by the network policy: "{LAN}" matches the deny rule "{BLOCK}"' in err,
+      "--deny CIDR: both refusals name the rule", net(err))
+if by_name:
+    script = f"nslookup {NAME} 192.0.2.1; echo nslookup=$?; wget -q -T 5 -O - http://{NAME}:{PORT}/; echo wget=$?; hfetch http://{NAME}:{PORT}/; echo hfetch=$?"
+    code, out, err = guest(script, "--deny", BLOCK)
+    check(f"Address: {LAN}" not in out.split("nslookup=")[0] and "lan-ok" not in out and "hfetch=2" in out,
+          "--deny CIDR: a name that resolves into the block gets no address, and the request API refuses it", out + net(err))
+    check(f'"{NAME.lower()}\\" is {LAN}, which matches the deny rule \\"{BLOCK}\\"' in err
+          and f'"{NAME}" is {LAN}, which matches the deny rule "{BLOCK}"' in err,
+          "--deny CIDR: the DNS answer and the request API say which name, address and rule", net(err))
+    # A bare IP in the deny list is an address too: its names do not get around it.
+    code, out, err = guest(f"wget -q -T 5 -O - http://{NAME}:{PORT}/; echo wget=$?; hfetch http://{NAME}:{PORT}/; echo hfetch=$?", "--deny", LAN)
+    check("lan-ok" not in out and "hfetch=2" in out and f'which matches the deny rule "{LAN}"' in err, "--deny IP: refused by a name that resolves to it", out + net(err))
+    # The exemption from privateNetworks: the addresses an allow CIDR block holds, by any name.
+    code, out, err = guest(f"{BOTH}; wget -q -T 5 -O - http://{NAME}:{PORT}/; echo name=$?",
+                           "--private-networks", "deny", "--allow", "*", "--allow", BLOCK)
+    check(out.count("lan-ok") == 3 and "wget=0" in out and "hfetch=0" in out and "name=0" in out,
+          f"--private-networks deny + --allow {BLOCK}: that subnet is reached, by address and by name", out + net(err))
+else:
+    skip("--deny CIDR by name, the allow block's exemption by name", f"{NAME} does not resolve here")
+code, out, err = guest(f"hfetch http://169.254.169.254/; echo metadata=$?", "--private-networks", "deny", "--allow", "*", "--allow", BLOCK)
+check("metadata=2" in out and "169.254.169.254 is in a private network" in err, "--private-networks deny + --allow CIDR: the other private ones stay refused", out + net(err))
+# In the allow list alone: those addresses and no other, and no name.
+code, out, err = guest(f"{BOTH}; nc -w 3 1.1.1.1 80 </dev/null; echo nc=$?; hfetch http://1.1.1.1/; echo public=$?", "--allow", BLOCK)
+check("lan-ok\nwget=0" in out and "lan-ok\nhfetch=0" in out and "nc=0" not in out and "public=2" in out
+      and '"1.1.1.1" is not in the allow list' in err, f"--allow {BLOCK} alone: the LAN address is reached, a public one is not", out + net(err))
+if public:
+    code, out, err = guest("hfetch https://example.com/; echo hfetch=$?", "--allow", BLOCK)
+    check("hfetch=2" in out and '"example.com" is not in the allow list' in err, "--allow CIDR alone: a name still needs a pattern", out + net(err))
+# An IPv4 address with * for its last octets is that CIDR block.
+WILD = ".".join(LAN.split(".")[:3]) + ".*"  # e.g. 192.168.0.*
+code, out, err = guest(BOTH, "--deny", WILD)
+check("lan-ok" not in out and "hfetch=2" in out and f'reason: Some("{LAN} matches the deny rule \\"{WILD}\\"")' in err
+      and f'"{LAN}" matches the deny rule "{WILD}"' in err, f"--deny {WILD}: the LAN address is refused to both, naming the rule", out + net(err))
+if by_name:
+    code, out, err = guest(f"wget -q -T 5 -O - http://{NAME}:{PORT}/; echo wget=$?; hfetch http://{NAME}:{PORT}/; echo hfetch=$?", "--deny", WILD)
+    check("lan-ok" not in out and "hfetch=2" in out and f'"{NAME}" is {LAN}, which matches the deny rule "{WILD}"' in err,
+          "--deny IPv4 wildcard: refused by a name that resolves into it too", out + net(err))
+code, out, err = guest(f"{BOTH}; hfetch http://169.254.169.254/; echo metadata=$?", "--private-networks", "deny", "--allow", "*", "--allow", WILD)
+check(out.count("lan-ok") == 2 and "metadata=2" in out, f"--private-networks deny + --allow {WILD}: that subnet is exempt, the others not", out + net(err))
+# Written wrong: the engine does not start, rather than leave a rule that matches nothing.
+for wrong, says in ((f"{LAN}/16", "has bits set past its /16"), ("10.0.0.0/33", "the prefix length is 0 to 32"),
+                    ("10.*.0.1", "* stands for whole octets at the end"), ("fd00::*", "IPv6 takes no *"), ("api*.example.com", "a host is")):
+    code, out, err = guest("true", "--deny", wrong)
+    check(code != 0 and f"--deny \"{wrong}\"" in err and says in err, f"--deny {wrong}: refused, the engine does not start", err[-300:])
+
 # --- the app's network.privateNetworks (the --stdio protocol the Dart package speaks) -------------
 class App:
     """The engine under --stdio: requests by id, events kept."""
@@ -277,6 +332,22 @@ app = App()
 wrong = app.call("start", {"config": {"python": False, "tools": False, "network": {"privateNetworks": "lan"}}})
 check(wrong.get("error", {}).get("kind") == "bad-request" and "privateNetworks" in wrong["error"].get("message", ""),
       "app: start with a wrong value is refused", wrong)
+app.close()
+
+# --- the app's CIDR rules (network.allow / network.deny) ---------------------------------------
+app = App()
+started = app.call("start", {"config": {"python": False, "tools": False, "network": {"deny": [BLOCK]}}})
+out = app.run(f"hfetch {URL}; echo hfetch=$?") if "result" in started else ""
+blocked = [e for e in app.events if e.get("event") == "network" and e.get("blocked")]
+check("hfetch=2" in out and any(f'matches the deny rule \\"{BLOCK}\\"' in json.dumps(e) for e in blocked),
+      "app: start with network.deny [CIDR] refuses the LAN, with a blocked network event", (started, out, blocked[-1:]))
+wrong = app.call("policy.update", {"network": {"deny": [], "allow": [f"{LAN}/8"]}})
+out = app.run(f"hfetch {URL}; echo hfetch=$?")
+check(wrong.get("error", {}).get("kind") == "bad-request" and "network.allow" in wrong["error"].get("message", "") and "hfetch=2" in out,
+      "app: policy.update with a CIDR block written wrong: bad-request, and the deny stays", (wrong, out))
+updated = app.call("policy.update", {"network": {"deny": [], "allow": [BLOCK]}})
+out = app.run(f"hfetch {URL}; echo hfetch=$?; hfetch http://1.1.1.1/; echo public=$?")
+check("result" in updated and "lan-ok\nhfetch=0" in out and "public=2" in out, "app: policy.update to allow [CIDR]: the LAN answers, a public address does not", (updated, out))
 app.close()
 
 # --- the request API's loopback, by the address a name resolves to ------------------------------
