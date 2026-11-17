@@ -241,7 +241,8 @@ class Mount {
 }
 
 /// The sandbox's network rules. Patterns: `example.com` (exactly), `*.example.com`
-/// (subdomains), `*` (anything). [deny] wins over [allow].
+/// (subdomains), `*` (anything). [deny] wins over [allow]. [privateNetworks] acts on the
+/// addresses hosts have, beside the names.
 class NetworkPolicy {
   const NetworkPolicy({
     this.allow = const ['*'],
@@ -251,16 +252,20 @@ class NetworkPolicy {
     this.extraAllowedHeaders = const [],
     this.ask = false,
     this.skipTlsVerify = false,
+    this.privateNetworks = PrivateNetworks.allow,
   });
 
   final List<String> allow;
   final List<String> deny;
 
-  /// May the sandbox reach services on this computer (localhost)? Off by default.
+  /// May the sandbox reach services on this computer (localhost, 127.0.0.0/8, ::1, and any name
+  /// that resolves to one of those)? Off by default.
   final bool allowHostLoopback;
 
   /// Headers the host adds to HTTPS requests from the sandbox (API keys). The sandbox never
-  /// sees the values; they are not logged or echoed in events.
+  /// sees the values; they are not logged or echoed in events. A redirect to another host does
+  /// not take them along: each request (and each redirect, checked like the first) gets the
+  /// secrets of its own host.
   final List<Secret> secrets;
 
   /// Request headers the sandbox may set itself, beyond accept, content-type, authorization
@@ -279,6 +284,17 @@ class NetworkPolicy {
   /// [secrets] still go. Programs that do their own TLS in the sandbox (curl, git) still check.
   final bool skipTlsVerify;
 
+  /// The private networks' addresses — 10/8, 172.16/12, 192.168/16, 100.64/10 (carrier-grade
+  /// NAT, Tailscale), 169.254/16 (link-local, a cloud's metadata service), fc00::/7, fe80::/10 —
+  /// whatever name reaches them: [PrivateNetworks.allow] (the default), [PrivateNetworks.deny]
+  /// (the internet only) or [PrivateNetworks.only] (the local networks only). Checked on the
+  /// address: an IP in a URL, the addresses a name resolves to (the sandbox's DNS answers keep
+  /// only the ones allowed), each redirect. A host [allow] names exactly (no `*`) is exempt,
+  /// e.g. `allow: ['*', 'api.anthropic.com'], privateNetworks: PrivateNetworks.only` for the
+  /// LAN and one API; a wildcard is not, since whoever runs a domain's DNS picks its addresses.
+  /// Loopback stays [allowHostLoopback]'s. Not asked about with [ask]: a refusal.
+  final PrivateNetworks privateNetworks;
+
   Map<String, Object?> toJson() => {
         'allow': allow,
         'deny': deny,
@@ -287,7 +303,21 @@ class NetworkPolicy {
         'extraAllowedHeaders': extraAllowedHeaders,
         'ask': ask,
         'skipTlsVerify': skipTlsVerify,
+        'privateNetworks': privateNetworks.name,
       };
+}
+
+/// The private networks' addresses in [NetworkPolicy.privateNetworks].
+enum PrivateNetworks {
+  /// Reached like any other address (the default).
+  allow,
+
+  /// Never reached: the sandbox reaches the internet only (and this computer, with
+  /// [NetworkPolicy.allowHostLoopback]).
+  deny,
+
+  /// The only ones reached: the sandbox reaches the local networks only.
+  only,
 }
 
 class Secret {

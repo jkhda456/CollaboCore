@@ -66,6 +66,11 @@ Network (the guest's sockets and its request API go through the same policy):
   --deny HOST               a host it may not (repeatable, checked first)
   --no-network              no outbound connections at all
   --allow-loopback          let the guest reach this computer's own services
+  --private-networks allow|deny|only
+                            the private networks' addresses (10/8, 172.16/12, 192.168/16,
+                            100.64/10, 169.254/16, fc00::/7, fe80::/10), whatever name reaches
+                            them: allow (default), deny (the internet only) or only (the local
+                            networks only); a host --allow names exactly (no *) is exempt
   --secret HOST:HEADER=VALUE
                             a header the host adds to https requests to HOST (repeatable);
                             the guest never sees it, and it is never logged
@@ -131,7 +136,7 @@ Examples (in a runtime folder):
 /// The options that take a value, so `--help` can be told from an option's value.
 const TAKES_VALUE: &[&str] = &[
     "--python-image", "--tools-image", "--addon-dir", "--addon", "--addon-config", "--gui-config", "--kernel",
-    "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--secret", "--allow-header", "--cwd", "--arg",
+    "--initramfs", "--cpus", "--mount", "--allow", "--deny", "--private-networks", "--secret", "--allow-header", "--cwd", "--arg",
     "--log-network", "--log-exec", "--log-file", "--log-exec-kinds", "--log-max-size", "--log-rotate", "--serial",
 ];
 
@@ -548,6 +553,11 @@ fn main() -> Result<()> {
             "--deny" => policy.deny.extend(argv.next()),
             "--no-network" => network = false,
             "--allow-loopback" => policy.allow_loopback = true,
+            "--private-networks" => {
+                let mode = argv.next().context("--private-networks needs allow, deny or only")?;
+                policy.private_networks = http::PrivateNetworks::parse(&mode)
+                    .with_context(|| format!("--private-networks {mode}: allow, deny or only"))?;
+            }
             "--skip-tls-verify" => policy.skip_tls_verify = true,
             "--secret" => {
                 let spec = argv.next().context("--secret needs HOST:HEADER=VALUE")?;

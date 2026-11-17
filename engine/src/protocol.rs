@@ -14,7 +14,8 @@
 //! start.config: cpus, preempt (false: no tick interrupting programs, machine.rs), python, tools,
 //! gui {settings of the display in tools.cpio}, addons {name:
 //! settings} (addons.rs), mounts, network {allow,
-//! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
+//! deny, allowHostLoopback, secrets, extraAllowedHeaders, ask, skipTlsVerify, privateNetworks
+//! ("allow"/"deny"/"only")}, hostExec, hostFunctions, permissionTimeoutMs, sshAgent ("off",
 //! "ask", "allow"), sshAgentSocket, serial {mode: "off"/"ask"/"allow", devices: [path globs or
 //! usb:VID:PID[:SERIAL]]} (serial.rs), quiet, consoleSize. policy.update takes network, hostExec,
 //! hostFunctions, sshAgent, sshAgentSocket and serial.
@@ -298,7 +299,10 @@ impl Server {
             Ok(addons) => addons,
             Err(message) => return failed("bad-request", message),
         };
-        let network = Arc::new(RwLock::new(network_policy(config.get("network"))));
+        let network = match network_policy(config.get("network")) {
+            Ok(policy) => Arc::new(RwLock::new(policy)),
+            Err(message) => return failed("bad-request", message),
+        };
         {
             let mut policy = network.write().unwrap();
             policy.addon_headers = addons.headers.clone();
@@ -846,7 +850,9 @@ impl Server {
     fn update_policy(&self, params: &Value) -> Answer {
         let running = self.running()?;
         if let Some(network) = params.get("network") {
-            apply_network_policy(&mut running.network.write().unwrap(), Some(network));
+            if let Err(message) = apply_network_policy(&mut running.network.write().unwrap(), Some(network)) {
+                return failed("bad-request", message);
+            }
             running.network_answers.lock().unwrap().clear();
         }
         if params.get("sshAgent").is_some() || params.get("sshAgentSocket").is_some() {
@@ -1016,25 +1022,38 @@ fn serial_policy(fields: &Value, mut policy: serial::Policy) -> std::result::Res
 }
 
 /// The app's `network` field: `false`, or the policy object.
-fn network_policy(value: Option<&Value>) -> http::Policy {
+fn network_policy(value: Option<&Value>) -> std::result::Result<http::Policy, String> {
     let mut policy = http::Policy::default();
-    apply_network_policy(&mut policy, value);
-    policy
+    apply_network_policy(&mut policy, value)?;
+    Ok(policy)
 }
 
 /// Applies what the app sent onto a policy, leaving out what it did not mention. `policy.update`
-/// is a change to the policy the sandbox started with, not a replacement for it.
-fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) {
+/// is a change to the policy the sandbox started with, not a replacement for it. A value that
+/// would loosen it by mistake (an unknown `privateNetworks`) is refused, and nothing changes.
+fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) -> std::result::Result<(), String> {
     let fields = match value {
         Some(Value::Bool(false)) => {
             // No network at all: nothing is allowed, and the keys go with it.
             policy.allow.clear();
             policy.secrets.clear();
-            return;
+            return Ok(());
         }
         Some(Value::Object(fields)) => fields,
-        _ => return,
+        _ => return Ok(()),
     };
+    let private_networks = match fields.get("privateNetworks") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(http::PrivateNetworks::parse)
+                .ok_or_else(|| format!("network.privateNetworks must be \"allow\", \"deny\" or \"only\", not {value}"))?,
+        ),
+    };
+    if let Some(private_networks) = private_networks {
+        policy.private_networks = private_networks;
+    }
     let list = |name: &str| -> Option<Vec<String>> {
         fields
             .get(name)
@@ -1071,6 +1090,7 @@ fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) {
             })
             .collect();
     }
+    Ok(())
 }
 
 /// The policy echoed back to the app, without the secret values.
@@ -1099,14 +1119,31 @@ mod tests {
 
     #[test]
     fn the_app_turns_certificate_checks_off_and_on() {
-        let mut policy = network_policy(Some(&json!({"allow": ["*"]})));
+        let mut policy = network_policy(Some(&json!({"allow": ["*"]}))).unwrap();
         assert!(!policy.skip_tls_verify);
-        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": true})));
+        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": true}))).unwrap();
         assert!(policy.skip_tls_verify);
         // A policy.update that does not mention it leaves it as it was.
-        apply_network_policy(&mut policy, Some(&json!({"deny": ["example.com"]})));
+        apply_network_policy(&mut policy, Some(&json!({"deny": ["example.com"]}))).unwrap();
         assert!(policy.skip_tls_verify);
-        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": false})));
+        apply_network_policy(&mut policy, Some(&json!({"skipTlsVerify": false}))).unwrap();
         assert!(!policy.skip_tls_verify);
+    }
+
+    #[test]
+    fn the_app_sets_the_private_networks_rule() {
+        use http::PrivateNetworks;
+        let mut policy = network_policy(Some(&json!({"allow": ["*"]}))).unwrap();
+        assert_eq!(policy.private_networks, PrivateNetworks::Allow);
+        assert_eq!(network_policy(Some(&json!({"privateNetworks": "deny"}))).unwrap().private_networks, PrivateNetworks::Deny);
+        apply_network_policy(&mut policy, Some(&json!({"privateNetworks": "Only"}))).unwrap();
+        assert_eq!(policy.private_networks, PrivateNetworks::Only);
+        // An update that does not mention it leaves it; one that gets it wrong changes nothing.
+        apply_network_policy(&mut policy, Some(&json!({"deny": ["example.com"]}))).unwrap();
+        assert_eq!(policy.private_networks, PrivateNetworks::Only);
+        let wrong = apply_network_policy(&mut policy, Some(&json!({"privateNetworks": "block", "allow": []})));
+        assert!(wrong.unwrap_err().contains("\"allow\", \"deny\" or \"only\""));
+        assert_eq!((policy.private_networks, policy.allow.as_slice()), (PrivateNetworks::Only, &["*".to_string()][..]));
+        assert!(network_policy(Some(&json!({"privateNetworks": true}))).is_err());
     }
 }

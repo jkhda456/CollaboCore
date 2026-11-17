@@ -96,6 +96,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   python3 "$T/test_logs.py" >"$progs/logs.txt" 2>&1 || { grep -A2 "^FAIL" "$progs/logs.txt"; echo "FAIL: engine logs"; exit 1; }
   tail -1 "$progs/logs.txt"
 
+  echo "== network policy: privateNetworks by address, name and redirect; loopback by address; redirects checked hop by hop, secrets per host"
+  python3 "$T/test_network_policy.py" >"$progs/network-policy.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/network-policy.txt" | head -40; echo "FAIL: network policy (engine/src/http.rs, net.rs)"; exit 1; }
+  tail -1 "$progs/network-policy.txt"
+
   echo "== guest boot: /work (virtiofs) exported as a zip, checked with Python's zipfile"
   zip="$(mktemp -d)/work.zip"
   WORK=1 WORK_OUT="$zip" bash "$ROOT/userspace/test-boot.sh" "$ROOT/userspace/out/initramfs.cpio" \

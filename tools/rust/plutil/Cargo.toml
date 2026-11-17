@@ -1,0 +1,15 @@
+[package]
+name = "collabo-plutil"
+version = "6.4.2"
+description = "plutil, written again in Rust for the guest: Apple's plutil and CoreFoundation's property lists as swift-corelibs-foundation 6.4.2 has them"
+edition.workspace = true
+# Follows Apple's code (Apache-2.0, LICENSE-swift-corelibs-foundation).
+license = "Apache-2.0"
+publish.workspace = true
+
+# A library: the `plutil` applet of collabo-data (../data).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+indexmap = "2"

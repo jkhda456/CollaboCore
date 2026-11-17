@@ -3,7 +3,7 @@
 # (tools/build.sh runs this as its `rust` step; it also runs alone). Into tools/stage:
 #
 #   usr/bin/collabo-archive   xz, zstd, lz4, 7z and zip in one binary; the image links their names to it
-#   usr/bin/jq                the JSON processor
+#   usr/bin/collabo-data      jq, plutil and yq in one binary, the same way
 #   usr/bin/git-lfs           Git Large File Storage
 #
 # and build/rust/licenses/ (the crates linked in). Cargo is incremental, so a run with nothing
@@ -15,7 +15,8 @@
 # zlib from python/deps (git-lfs/build.rs reads COLLABO_CURL_LIBDIRS).
 #   TEST=1 tools/rust/build.sh    also run the unit tests natively first
 #   HOST=1 tools/rust/build.sh    build for this machine instead, into build/rust/host (for the
-#                                 differential tests in tests/, against the original tools)
+#                                 differential tests in tests/, against the original tools), with
+#                                 the applets' names linked to the multi-call binaries
 set -euo pipefail
 
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +28,10 @@ TARGET=wasm32-unknown-linux-musl
 NIGHTLY=nightly-2026-07-22   # as python/build-rust-toolchain.sh
 B="$N/build/rust"
 STAGE="${STAGE:-$N/stage}"
-BINS=(collabo-archive jq git-lfs)
+BINS=(collabo-archive collabo-data git-lfs)
+# The names the multi-call binaries answer to (the image links them; HOST=1 links them too).
+APPLETS_ARCHIVE="xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt lz4 unlz4 lz4cat 7z 7za 7zr zip"
+APPLETS_DATA="jq plutil yq"
 
 [[ -f "$U/sysroot/lib/crt1.o" ]] || { echo "missing userspace/sysroot; run: ./build.sh userspace" >&2; exit 1; }
 bash "$ROOT/python/build-rust-toolchain.sh" >/dev/null
@@ -55,6 +59,8 @@ fi
 if [[ -n "${HOST:-}" ]]; then
   echo "== rust tools ($HOST_TRIPLE, into build/rust/host/release)"
   cargo +"$NIGHTLY" build --release --manifest-path "$B/src/Cargo.toml" --target-dir "$B/host" "${PATCHED[@]}"
+  for n in $APPLETS_ARCHIVE; do ln -sf collabo-archive "$B/host/release/$n"; done
+  for n in $APPLETS_DATA; do ln -sf collabo-data "$B/host/release/$n"; done
   exit 0
 fi
 
@@ -107,6 +113,10 @@ for p in sorted(meta["packages"], key=lambda p: p["name"]):
 # (archive/src/lz4/{block,hc,frame}.rs) of the library, BSD-2-Clause, its command line
 # (archive/src/lz4/mod.rs) of programs/, GPL-2.0-or-later.
 cp "$W/jq/COPYING-jq" "$B/licenses/jq.MIT.txt"
+# yq follows mikefarah/yq 4.54.1 and carries its help texts (MIT); plutil follows Apple's plutil
+# and CoreFoundation property list code in swift-corelibs-foundation 6.4.2 (Apache-2.0).
+cp "$W/yq/LICENSE-yq" "$B/licenses/yq.MIT.txt"
+cp "$W/plutil/LICENSE-swift-corelibs-foundation" "$B/licenses/plutil-swift-corelibs-foundation.Apache-2.0.txt"
 cp "$W/git-lfs/LICENSE-git-lfs.md" "$B/licenses/git-lfs.MIT.txt"
 # archive's zip follows Info-ZIP's Zip 3.0 and carries its help and license texts: Info-ZIP's
 # license, which also asks that it not be passed off as an Info-ZIP release (it says it is not).

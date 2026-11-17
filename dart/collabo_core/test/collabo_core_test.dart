@@ -125,6 +125,17 @@ void main() {
       expect(r.stderrText, contains('matches the deny rule'));
       await sandbox.updatePolicy(network: const NetworkPolicy(allow: ['example.com'], deny: ['evil.example.com']));
     });
+
+    test('privateNetworks refuses the private networks, or everything else', () async {
+      await sandbox.updatePolicy(network: const NetworkPolicy(privateNetworks: PrivateNetworks.deny));
+      var r = await sandbox.run('hfetch http://10.0.0.1/');
+      expect(r.exitCode, 2);
+      expect(r.stderrText, contains('10.0.0.1 is in a private network (privateNetworks is deny)'));
+      await sandbox.updatePolicy(network: const NetworkPolicy(privateNetworks: PrivateNetworks.only));
+      r = await sandbox.run('hfetch http://1.1.1.1/');
+      expect(r.stderrText, contains('1.1.1.1 is not in a private network (privateNetworks is only)'));
+      await sandbox.updatePolicy(network: const NetworkPolicy(allow: ['example.com'], deny: ['evil.example.com']));
+    });
   });
 
   group('host access', () {

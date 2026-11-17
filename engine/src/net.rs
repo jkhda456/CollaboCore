@@ -10,6 +10,10 @@
 //! host, filtered by the same policy), and TCP, where every connection is terminated here and
 //! proxied to a real socket. UDP other than DNS is not carried.
 //!
+//! The policy's `private_networks` acts on addresses: a DNS answer keeps only the addresses it
+//! lets the name reach, and a connection or ping to one it refuses is refused, whatever name
+//! it came from (a hard rule: `ask` does not ask about it).
+//!
 //! Nothing is ever dropped on the way to the guest: frames wait in a queue until the guest
 //! offers a buffer, so the stack needs no retransmission of its own.
 use std::collections::{HashMap, VecDeque};
@@ -263,10 +267,15 @@ impl Stack {
             };
         }
         let names = self.resolved.lock().unwrap().get(&address).cloned().unwrap_or_default();
+        let ip = address.to_string();
+        // The private networks' rule, on the address: by any name it came from, or as itself.
+        let by_address = policy.refuses_address(&ip, IpAddr::V4(address));
+        if let Some(reason) = by_address.filter(|_| names.iter().all(|name| policy.refuses_address(name, IpAddr::V4(address)).is_some())) {
+            return Decision::Refuse(reason);
+        }
         if names.iter().any(|name| policy.refuses_host(name).is_none()) {
             return Decision::Allow;
         }
-        let ip = address.to_string();
         let Some(reason) = policy.refuses_host(&ip) else { return Decision::Allow };
         // A name (or, without one, the address) that no list mentions: the app decides.
         if policy.ask && self.asker.is_some() {
@@ -456,22 +465,40 @@ impl Stack {
                                 })
                                 .collect();
                             addresses.dedup();
-                            if !addresses.is_empty() {
-                                code = 0;
-                                let mut resolved = self.resolved.lock().unwrap();
-                                for address in &addresses {
-                                    let names = resolved.entry(*address).or_default();
-                                    if !names.contains(&name) {
-                                        names.push(name.clone());
+                            // Only what private_networks lets this name reach: the guest then
+                            // connects to one of those (none left: no such name, and why).
+                            let before = addresses.len();
+                            let mut refused = None;
+                            {
+                                let policy = self.policy.read().unwrap();
+                                addresses.retain(|address| match policy.refuses_address(&name, IpAddr::V4(*address)) {
+                                    None => true,
+                                    Some(reason) => {
+                                        refused.get_or_insert(reason);
+                                        false
+                                    }
+                                });
+                            }
+                            if before > 0 && addresses.is_empty() {
+                                self.report(Event::Dns { host: name.clone(), addresses: Vec::new(), blocked: true, reason: refused });
+                            } else {
+                                if !addresses.is_empty() {
+                                    code = 0;
+                                    let mut resolved = self.resolved.lock().unwrap();
+                                    for address in &addresses {
+                                        let names = resolved.entry(*address).or_default();
+                                        if !names.contains(&name) {
+                                            names.push(name.clone());
+                                        }
                                     }
                                 }
+                                self.report(Event::Dns {
+                                    host: name.clone(),
+                                    addresses: addresses.iter().map(|a| a.to_string()).collect(),
+                                    blocked: false,
+                                    reason: None,
+                                });
                             }
-                            self.report(Event::Dns {
-                                host: name.clone(),
-                                addresses: addresses.iter().map(|a| a.to_string()).collect(),
-                                blocked: false,
-                                reason: None,
-                            });
                         }
                         Err(error) => self.report(Event::Dns {
                             host: name.clone(),

@@ -1,0 +1,17 @@
+[package]
+name = "collabo-data"
+version = "0.1.0"
+description = "The guest's data format tools in one binary, as busybox: jq, plutil and yq, picked by the name it runs as"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "collabo-data"
+path = "src/main.rs"
+
+[dependencies]
+collabo-jq = { path = "../jq" }
+collabo-plutil = { path = "../plutil" }
+collabo-yq = { path = "../yq" }
+libc = "0.2"

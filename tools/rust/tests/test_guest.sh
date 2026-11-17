@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The tools of tools.cpio written in Rust (and openssl), run in the guest: xz, zstd, lz4 and 7z
-# round trips, jq, and git-lfs (clean/smudge filters, a push to a file:// remote and a clone
-# from it, ls-files, fsck, prune). Needs a built runtime (dist/runtime).
+# round trips, collabo-data's jq, plutil and yq, and git-lfs (clean/smudge filters, a push to a
+# file:// remote and a clone from it, ls-files, fsck, prune). Needs a built runtime (dist/runtime).
 #
 #   tools/rust/tests/test_guest.sh [RUNTIME_DIR]   TOOLS_IMAGE=...  another tools.cpio
 #   NET=1 tools/rust/tests/test_guest.sh           also download LFS objects over HTTPS
@@ -49,6 +49,30 @@ printf "%s\n" "[.[] | . * 2]" "[1,2]" "[2,4]" "" "def f: reduce .[] as \$x (0; .
 jq --run-tests /tmp/t.test | tail -1')"
 check "jq filter" "$out" '^\[3,"x",2,true\]'
 check "jq --run-tests" "$out" "2 of 2 tests passed"
+
+out="$(guest 120 '
+cd /tmp && echo "{\"name\":\"Demo\",\"n\":3,\"tags\":[\"x\"],\"on\":true}" > a.json
+plutil -convert binary1 -o a.plist a.json && file a.plist && plutil -lint a.plist
+plutil -insert tags.1 -string y a.plist && plutil -replace n -integer 4 a.plist
+plutil -extract tags.1 raw a.plist && plutil -type on a.plist && plutil -p a.plist | grep -c "=>"
+plutil -convert xml1 -o - a.plist | grep -c "<key>"
+plutil -convert json -r -o - a.plist; echo
+plutil -extract n raw -expect string a.plist; echo "expect=$?"
+collabo-data plutil -convert swift -o - a.plist | head -2
+printf "a: 1\nb: [x, y]\n" | yq -o json -I0 .
+collabo-data --list | tr "\n" " "; echo')"
+check "plutil json to binary1" "$out" "a.plist: Apple binary property list"
+check "plutil -lint" "$out" "^a.plist: OK"
+check "plutil -insert, -replace, -extract raw" "$out" "^y$"
+check "plutil -type" "$out" "^bool$"
+check "plutil -p" "$out" "^6$"
+check "plutil -convert xml1 to stdout" "$out" "^4$"
+check "plutil -convert json -r" "$out" '"n" : 4,'
+check "plutil -expect: the message, exit 1" "$out" "a.plist: Value at \[n\] expected to be string but is integer"
+check "plutil -expect exit status" "$out" "^expect=1$"
+check "collabo-data plutil -convert swift" "$out" "^let a : \[String : Any\] = \[$"
+check "yq" "$out" '^\{"a":1,"b":\["x","y"\]\}$'
+check "collabo-data --list" "$out" "^jq plutil yq $"
 
 out="$(guest 60 'printf abc | openssl dgst -sha256')"
 check "openssl dgst" "$out" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

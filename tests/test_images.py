@@ -108,7 +108,7 @@ pip install --no-index --force-reinstall --no-deps /usr/lib/python3.13/ensurepip
 rm -rf $SP/idna && mkdir $SP/idna && echo "MARK = 7" > $SP/idna/__init__.py && python3 -c "import idna; print('C idna', idna.MARK)"
 [ "$(ls $SP/idna)" = "__init__.py" ] && echo "C opaque"
 mv $SP/h11 /tmp/h11 && [ -f /tmp/h11/__init__.py ] && [ ! -e $SP/h11 ] && echo "C moved-out"
-mv /usr/bin/jq /usr/bin/jq2 && jq2 --version >/dev/null && [ ! -e /usr/bin/jq ] && echo "C renamed"
+mv /usr/bin/rg /usr/bin/rg2 && rg2 --version >/dev/null && [ ! -e /usr/bin/rg ] && echo "C renamed"
 echo "# appended" >> /etc/profile && [ "$(tail -1 /etc/profile)" = "# appended" ] && echo "C appended"
 rm /usr/bin/python3 && [ ! -e /usr/bin/python3 ] && python3.13 -c "pass" && echo "C deleted"
 python3.13 -c "import os; open('/tmp/x', 'w').close(); os.setxattr('/tmp/x', 'user.k', b'v'); print('C xattr', os.getxattr('/tmp/x', 'user.k').decode())"

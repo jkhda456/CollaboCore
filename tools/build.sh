@@ -18,7 +18,8 @@
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
 #   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, lz4, 7z and
-#                   zip (one binary, collabo-archive, under each name), jq, git-lfs
+#                   zip (one binary, collabo-archive, under each name), jq, plutil and yq (one
+#                   binary, collabo-data, the same way), git-lfs
 #
 # telnet, wget, nc, ftpget and ssl_client come with busybox in the base image; so do xz, unxz,
 # xzcat, lzma, unlzma and lzcat (decompression only), which this image's links replace.
@@ -452,7 +453,8 @@ echo "== cpio"   # always: packing takes a second
     --file usr/lib/libcollabo-gui.a="$STAGE/usr/lib/libcollabo-gui.a" \
     --file usr/bin/collabo-archive="$STAGE/usr/bin/collabo-archive" \
     $(for n in xz unxz xzcat lzma unlzma lzcat zstd unzstd zstdcat zstdmt lz4 unlz4 lz4cat 7z 7za 7zr zip; do echo "--link usr/bin/$n=collabo-archive"; done) \
-    --file usr/bin/jq="$STAGE/usr/bin/jq" \
+    --file usr/bin/collabo-data="$STAGE/usr/bin/collabo-data" \
+    $(for n in jq plutil yq; do echo "--link usr/bin/$n=collabo-data"; done) \
     --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
     --file usr/bin/svn="$STAGE/usr/bin/svn" \
     $(for p in $SVN_PROGRAMS; do [[ $p == svn ]] || echo "--link usr/bin/$p=svn"; done) \

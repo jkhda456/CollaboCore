@@ -13,7 +13,19 @@
 //! https certificate is not checked (a local server's self-signed one), as `curl -k` does. The
 //! app's secrets are never sent on such a request. The policy's `skip_tls_verify` (the app's
 //! choice, for development) checks no certificate at all, and then the secrets do go.
+//!
+//! The policy's `private_networks` (the app's `privateNetworks`) refuses the private networks'
+//! addresses, or everything but them, by the address a host has: here an IP in the URL, and
+//! the addresses a name resolves to (`PolicyResolver`, each redirect too); in net.rs the
+//! guest's DNS answers and connections. This computer is judged by address here too: a name
+//! that resolves to 127.0.0.1 needs `allow_loopback` as `localhost` does.
+//!
+//! Redirects are followed here, not by ureq: each hop is checked as the guest's own request is
+//! (the lists, `ask`, the addresses), gets the app's secrets for its own host only, and takes
+//! the guest's headers along within the origin (to another origin only `accept` and
+//! `content-type`). Methods change as ureq changed them; at most 10.
 use std::io::Read;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -31,6 +43,8 @@ const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OP
 /// fetch() has already decoded the body, so its framing headers would only mislead the guest.
 const DROPPED_RESPONSE_HEADERS: [&str; 4] = ["content-encoding", "content-length", "transfer-encoding", "connection"];
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// Redirects followed for one request, as many as ureq followed when it did.
+const MAX_REDIRECTS: u32 = 10;
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 /// A key the host adds to requests for one host, which the guest never sees.
@@ -39,6 +53,53 @@ pub struct Secret {
     pub host: String,
     pub header: String,
     pub value: String,
+}
+
+/// The private networks' addresses (`is_private`): reachable as any other (the default), never
+/// (only the internet), or alone (only the local networks).
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum PrivateNetworks {
+    #[default]
+    Allow,
+    Deny,
+    Only,
+}
+
+impl PrivateNetworks {
+    pub fn parse(text: &str) -> Option<PrivateNetworks> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(PrivateNetworks::Allow),
+            "deny" => Some(PrivateNetworks::Deny),
+            "only" => Some(PrivateNetworks::Only),
+            _ => None,
+        }
+    }
+}
+
+/// An address only a local network reaches: 10/8, 172.16/12, 192.168/16 (RFC 1918), 100.64/10
+/// (carrier-grade NAT, RFC 6598: Tailscale and the like), 169.254/16 (link-local: a cloud's
+/// metadata service), fc00::/7 (unique local), fe80::/10 (link-local), and those IPv4 ones
+/// written as IPv6 (::ffff:a.b.c.d). Loopback is not one: `allow_loopback` is its own rule.
+pub fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168) || (a == 100 && (64..=127).contains(&b)) || (a == 169 && b == 254)
+        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => is_private(IpAddr::V4(ip)),
+            None => ip.segments()[0] & 0xfe00 == 0xfc00 || ip.segments()[0] & 0xffc0 == 0xfe80,
+        },
+    }
+}
+
+/// This computer by address: 127/8 and ::1, 0.0.0.0 and :: (which reach it too), and those
+/// IPv4 ones written as IPv6 (::ffff:127.0.0.1).
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_unspecified(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback() || ip.is_unspecified()),
+    }
 }
 
 /// Which hosts the guest may reach, and what the host adds to those requests.
@@ -64,6 +125,8 @@ pub struct Policy {
     /// No https certificate is checked, on any request (and on intercept.rs's connections):
     /// for development against local servers. The app's choice, so its secrets still go.
     pub skip_tls_verify: bool,
+    /// The private networks' addresses: allowed, refused, or the only ones (`refuses_address`).
+    pub private_networks: PrivateNetworks,
 }
 
 /// Asks the app whether the guest may reach a host the lists do not name: (via "api" or "net",
@@ -82,6 +145,7 @@ impl Default for Policy {
             addon_secrets: Vec::new(),
             ask: false,
             skip_tls_verify: false,
+            private_networks: PrivateNetworks::Allow,
         }
     }
 }
@@ -123,6 +187,44 @@ impl Policy {
         }
     }
 
+    /// Why `private_networks` refuses `ip`, the address `host` (a name, or the address itself)
+    /// has, if it does. A host the allow list names exactly (no `*`) is exempt: it was named on
+    /// purpose, while `*` and `*.example.com` also let through names whose addresses whoever runs
+    /// their DNS picks. Loopback is `allow_loopback`'s, not this rule's.
+    pub fn refuses_address(&self, host: &str, ip: IpAddr) -> Option<String> {
+        if self.private_networks == PrivateNetworks::Allow || is_loopback_ip(ip) {
+            return None;
+        }
+        let host = host.trim_matches(['[', ']']);
+        if self.allow.iter().any(|rule| !rule.contains('*') && host_matches(rule, host)) {
+            return None;
+        }
+        let shown = match host.parse::<IpAddr>() {
+            Ok(_) => format!("{ip}"),
+            Err(_) => format!("\"{host}\" is {ip}, which"),
+        };
+        match (self.private_networks, is_private(ip)) {
+            (PrivateNetworks::Deny, true) => Some(format!("{shown} is in a private network (privateNetworks is deny)")),
+            (PrivateNetworks::Only, false) => Some(format!("{shown} is not in a private network (privateNetworks is only)")),
+            _ => None,
+        }
+    }
+
+    /// Why the request API may not connect to `ip`, an address `host` resolved to
+    /// (PolicyResolver): this computer without `allow_loopback` — a name says nothing about
+    /// where it points, so `is_loopback`'s look at the name is not enough — or the private
+    /// networks' rule.
+    fn refuses_resolved(&self, host: &str, ip: IpAddr) -> Option<String> {
+        if !is_loopback_ip(ip) {
+            return self.refuses_address(host, ip);
+        }
+        let host = host.trim_matches(['[', ']']);
+        (!self.allow_loopback).then(|| match host.parse::<IpAddr>() {
+            Ok(_) => format!("{ip} is this computer (allowHostLoopback is off)"),
+            Err(_) => format!("\"{host}\" is {ip}, this computer (allowHostLoopback is off)"),
+        })
+    }
+
     /// Neither list names this host (and it is not this computer): what `ask` asks about.
     pub fn unlisted(&self, host: &str) -> bool {
         !is_loopback(host)
@@ -139,6 +241,9 @@ impl Policy {
             format!("\"{host}\" matches the deny rule \"{rule}\"")
         } else if !self.allow.iter().any(|rule| host_matches(rule, host)) {
             format!("\"{host}\" is not in the allow list")
+        } else if let Some(reason) = host.trim_matches(['[', ']']).parse::<IpAddr>().ok().and_then(|ip| self.refuses_address(host, ip)) {
+            // An address in the URL; a name's addresses are PolicyResolver's.
+            reason
         } else {
             return None;
         };
@@ -409,6 +514,65 @@ fn root_certificates() -> Result<ureq::tls::RootCerts> {
     Ok(ureq::tls::RootCerts::from(certificates))
 }
 
+/// The policy refused the addresses a name resolved to (PolicyResolver): the request is denied.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Resolves as ureq does, then keeps the addresses the URL's host may be reached at
+/// (`Policy::refuses_resolved`): this computer only with `allow_loopback`, and what
+/// `private_networks` lets through. A name that resolves to 127.0.0.1, or into a private network
+/// or out of one, is only told apart here; every redirect handle() follows comes here too. The
+/// live policy, so a `policy.update` applies at once. A proxy the host is configured with
+/// (`HTTPS_PROXY`) is the host's own: its address is not checked, and the names it resolves
+/// are its business.
+struct PolicyResolver {
+    policy: Arc<RwLock<Policy>>,
+    inner: ureq::unversioned::resolver::DefaultResolver,
+}
+
+/// ureq wants one; the policy (with the secrets) stays out of it.
+impl std::fmt::Debug for PolicyResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PolicyResolver")
+    }
+}
+
+impl ureq::unversioned::resolver::Resolver for PolicyResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let found = self.inner.resolve(uri, config, timeout)?;
+        if config.proxy().is_some_and(|proxy| proxy.uri().host() == uri.host()) {
+            return Ok(found);
+        }
+        let host = uri.host().unwrap_or("");
+        let policy = self.policy.read().unwrap();
+        let mut kept = self.empty();
+        let mut refused = None;
+        for address in found.iter() {
+            match policy.refuses_resolved(host, address.ip()) {
+                None => kept.push(*address),
+                Some(reason) => refused = refused.or(Some(reason)),
+            }
+        }
+        match (kept.is_empty(), refused) {
+            (true, Some(reason)) => Err(ureq::Error::Other(Box::new(Refused(format!("blocked by the network policy: {reason}"))))),
+            _ => Ok(kept),
+        }
+    }
+}
+
 /// The two agents requests go through: one that checks certificates, one that does not.
 #[derive(Clone)]
 struct Agents {
@@ -416,8 +580,9 @@ struct Agents {
     unverified: ureq::Agent,
 }
 
-fn agent(roots: ureq::tls::RootCerts, verify: bool) -> ureq::Agent {
-    ureq::Agent::new_with_config(
+fn agent(roots: ureq::tls::RootCerts, verify: bool, policy: Arc<RwLock<Policy>>) -> ureq::Agent {
+    let resolver = PolicyResolver { policy, inner: Default::default() };
+    ureq::Agent::with_parts(
         ureq::Agent::config_builder()
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).disable_verification(!verify).build())
             // Per phase rather than one deadline for the whole exchange: a model's answer streams
@@ -428,17 +593,20 @@ fn agent(roots: ureq::tls::RootCerts, verify: bool) -> ureq::Agent {
             .timeout_send_body(Some(Duration::from_secs(120)))
             .timeout_recv_response(Some(Duration::from_secs(600)))
             .timeout_recv_body(Some(Duration::from_secs(1800)))
-            .max_redirects(10)
+            // handle() follows redirects itself, checking each one.
+            .max_redirects(0)
             // 404 is an answer, not a failure: the guest gets the status like a browser does.
             .http_status_as_error(false)
             .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        resolver,
     )
 }
 
 /// Serves the guest's HTTP API on `port`, one thread per request.
 pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Option<Observer>, asker: Option<Asker>) -> Result<()> {
     let roots = root_certificates()?;
-    let agents = Agents { verified: agent(roots.clone(), true), unverified: agent(roots, false) };
+    let agents = Agents { verified: agent(roots.clone(), true, policy.clone()), unverified: agent(roots, false, policy.clone()) };
     vsock.listen(port, move |stream| {
         let (policy, agents, observer, asker) = (policy.clone(), agents.clone(), observer.clone(), asker.clone());
         std::thread::spawn(move || {
@@ -450,6 +618,106 @@ pub fn serve(vsock: &Vsock, port: u32, policy: Arc<RwLock<Policy>>, observer: Op
             }
         });
     })
+}
+
+/// One request on its way: the guest's, or a redirect handle() follows.
+struct Hop {
+    method: String,
+    url: String,
+    host: String,
+    https: bool,
+    /// The guest's headers that go with it.
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// One event for the app (and the network log) about a hop.
+fn notify(observer: Option<&Observer>, hop: &Hop, status: Option<u16>, error: Option<&str>, blocked: bool, unverified: bool) {
+    if let Some(observer) = observer {
+        observer(Event { method: hop.method.clone(), url: hop.url.clone(), status, error: error.map(str::to_string), blocked, unverified });
+    }
+}
+
+/// The method a redirect goes on with, as ureq (and curl) do: 307 and 308 keep it, but are not
+/// followed for a method with a body or DELETE (None: the 3xx goes back to the guest); the
+/// others turn what is not GET or HEAD into GET.
+fn redirect_method(method: &str, status: u16) -> Option<String> {
+    match status {
+        307 | 308 if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") => None,
+        307 | 308 => Some(method.to_string()),
+        _ if method == "GET" || method == "HEAD" => Some(method.to_string()),
+        _ => Some("GET".to_string()),
+    }
+}
+
+/// A Location against the URL it came from (RFC 3986 5.2): absolute, `//authority…`,
+/// `/path`, `?query` or a relative path, without its fragment. None when it is not one.
+fn join_location(base: &str, location: &str) -> Option<String> {
+    let location = location.trim().split('#').next().unwrap_or("");
+    if location.is_empty() {
+        return None;
+    }
+    let scheme_end = location.find(':').filter(|&end| {
+        location[..end].chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && location[..end].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    if scheme_end.is_some() {
+        return Some(location.to_string());
+    }
+    let (scheme, rest) = base.split_once("://")?;
+    if let Some(network_path) = location.strip_prefix("//") {
+        return Some(format!("{scheme}://{network_path}"));
+    }
+    let (authority, path_and_query) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let base_path = match path_and_query.split(['?', '#']).next().unwrap_or("") {
+        "" => "/",
+        path => path,
+    };
+    let (path, query) = location.split_at(location.find('?').unwrap_or(location.len()));
+    let path = match path {
+        "" => base_path.to_string(),
+        absolute if absolute.starts_with('/') => absolute.to_string(),
+        relative => format!("{}{relative}", &base_path[..=base_path.rfind('/').unwrap_or(0)]),
+    };
+    Some(format!("{scheme}://{authority}{}{query}", remove_dot_segments(&path)))
+}
+
+/// `.` and `..` out of a path (RFC 3986 5.2.4).
+fn remove_dot_segments(path: &str) -> String {
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut out: Vec<&str> = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let last = index == segments.len() - 1;
+        match *segment {
+            "." | ".." => {
+                if *segment == ".." && out.len() > 1 {
+                    out.pop();
+                }
+                if last {
+                    out.push("");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let joined = out.join("/");
+    match joined.starts_with('/') {
+        true => joined,
+        false => format!("/{joined}"),
+    }
+}
+
+/// scheme://host:port of an http(s) URL, the port always written: what a redirect leaves or
+/// stays in.
+fn origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let has_port = authority.rsplit_once(':').is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) && !port.contains(']'));
+    match has_port {
+        true => format!("{scheme}://{authority}"),
+        false => format!("{scheme}://{authority}:{}", if scheme == "https" { 443 } else { 80 }),
+    }
 }
 
 /// Serves one connection. Every failure is reported to the guest in the protocol's own words.
@@ -465,82 +733,134 @@ fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Opti
         unverified = request.https && (policy.skip_tls_verify || !request.verify_tls);
         let body = read_body(stream, rest, request.content_length)?;
 
-        let refused = match (policy.refuses(&request.host), asker) {
-            (Some(_), Some(ask)) if policy.ask && policy.unlisted(&request.host) => {
-                let target = format!("{}:{}", request.host, if request.https { 443 } else { 80 });
-                match ask("api", &target) {
-                    true => None,
-                    false => Some(format!("blocked by the network policy: the app did not allow \"{target}\"")),
+        // A hop the lists refuse, or the app (`ask`) does not allow.
+        let refusal = |host: &str, https: bool| -> Option<String> {
+            match (policy.refuses(host), asker) {
+                (Some(_), Some(ask)) if policy.ask && policy.unlisted(host) => {
+                    let target = format!("{host}:{}", if https { 443 } else { 80 });
+                    match ask("api", &target) {
+                        true => None,
+                        false => Some(format!("blocked by the network policy: the app did not allow \"{target}\"")),
+                    }
                 }
+                (reason, _) => reason,
             }
-            (reason, _) => reason,
-        };
-        if let Some(reason) = refused {
-            if let Some(observer) = observer {
-                observer(Event {
-                    method: request.method.clone(),
-                    url: request.url.clone(),
-                    status: None,
-                    error: Some(reason.clone()),
-                    blocked: true,
-                    unverified,
-                });
-            }
-            blocked = true;
-            return fail("denied", reason);
-        }
-
-        // The host's secrets replace a header of the same name the guest set: a key the app
-        // configured always wins over anything from inside the sandbox.
-        let secrets = policy.secrets_for(request.https, &request.host);
-        // Only the guest asked: the app did not agree to send its keys unchecked.
-        if request.https && !request.verify_tls && !policy.skip_tls_verify && !secrets.is_empty() {
-            return fail(
-                "denied",
-                format!(
-                    "the app's key for \"{}\" is only sent to a server whose certificate is checked; \
-                     for a private CA give the engine COLLABO_CORE_CA_FILE instead of {TLS_VERIFY_HEADER}: false",
-                    request.host
-                ),
-            );
-        }
-        let mut builder = ureq::http::Request::builder().method(request.method.as_str()).uri(&request.url);
-        for (name, value) in &request.headers {
-            if secrets.iter().any(|secret| secret.header == *name) {
-                continue;
-            }
-            builder = builder.header(name, value);
-        }
-        // The guest never sees these, and they are never logged.
-        for secret in secrets {
-            builder = builder.header(secret.header.as_str(), secret.value.as_str());
-        }
-        let built = match builder.body(body.as_slice()) {
-            Ok(built) => built,
-            Err(error) => return fail("bad-request", policy.redact(&error.to_string())),
         };
 
-        let agent = match unverified {
-            true => &agents.unverified,
-            false => &agents.verified,
-        };
-        let mut response = match agent.run(built) {
-            Ok(response) => response,
-            Err(ureq::Error::Timeout(phase)) => return fail("timeout", format!("timed out ({phase})")),
-            Err(error) => return fail("network", policy.redact(&error.to_string())),
-        };
+        // The guest's request, then each redirect: followed here rather than by ureq
+        // (`max_redirects(0)`), so every hop is checked as the first is and carries only its
+        // own host's secrets.
+        let mut hop = Hop { method: request.method.clone(), url: request.url.clone(), host: request.host.clone(), https: request.https, headers: request.headers.clone(), body };
+        let mut from: Option<String> = None;
+        let mut redirects = 0;
+        let (mut response, status) = loop {
+            seen = Some((hop.method.clone(), hop.url.clone()));
+            unverified = hop.https && (policy.skip_tls_verify || !request.verify_tls);
+            let after = |reason: String| match &from {
+                Some(from) => format!("{reason} (a redirect from {from})"),
+                None => reason,
+            };
+            if let Some(reason) = refusal(&hop.host, hop.https).map(after) {
+                notify(observer, &hop, None, Some(&reason), true, unverified);
+                blocked = true;
+                return fail("denied", reason);
+            }
 
-        let status = response.status();
-        if let Some(observer) = observer {
-            observer(Event {
-                method: request.method.clone(),
-                url: request.url.clone(),
-                status: Some(status.as_u16()),
-                error: None,
-                blocked: false,
-                unverified,
-            });
-        }
+            // The host's secrets replace a header of the same name the guest set: a key the
+            // app configured always wins over anything from inside the sandbox.
+            let secrets = policy.secrets_for(hop.https, &hop.host);
+            // Only the guest asked: the app did not agree to send its keys unchecked.
+            if hop.https && !request.verify_tls && !policy.skip_tls_verify && !secrets.is_empty() {
+                return fail(
+                    "denied",
+                    after(format!(
+                        "the app's key for \"{}\" is only sent to a server whose certificate is checked; \
+                         for a private CA give the engine COLLABO_CORE_CA_FILE instead of {TLS_VERIFY_HEADER}: false",
+                        hop.host
+                    )),
+                );
+            }
+            let build = || {
+                let mut builder = ureq::http::Request::builder().method(hop.method.as_str()).uri(&hop.url);
+                for (name, value) in &hop.headers {
+                    if secrets.iter().any(|secret| secret.header == *name) {
+                        continue;
+                    }
+                    builder = builder.header(name, value);
+                }
+                // The guest never sees these, and they are never logged.
+                for secret in &secrets {
+                    builder = builder.header(secret.header.as_str(), secret.value.as_str());
+                }
+                builder.body(hop.body.as_slice()).map_err(|error| BridgeError { kind: "bad-request", message: policy.redact(&error.to_string()) })
+            };
+
+            let agent = match unverified {
+                true => &agents.unverified,
+                false => &agents.verified,
+            };
+            let mut repeated = false;
+            let response = loop {
+                match agent.run(build()?) {
+                    Ok(response) => break response,
+                    // A connection the pool kept that the server had just closed: an HTTP/1.0
+                    // server closes after every response, and ureq keeps one unless it says
+                    // `connection: close`, so the next request can find it gone. A request that
+                    // may be repeated goes once more, on a new connection.
+                    Err(ureq::Error::Io(error))
+                        if !repeated
+                            && matches!(hop.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe
+                            ) =>
+                    {
+                        repeated = true;
+                    }
+                    Err(ureq::Error::Timeout(phase)) => return fail("timeout", format!("timed out ({phase})")),
+                    Err(ureq::Error::Other(error)) if error.is::<Refused>() => {
+                        let reason = after(error.to_string());
+                        notify(observer, &hop, None, Some(&reason), true, unverified);
+                        blocked = true;
+                        return fail("denied", reason);
+                    }
+                    Err(error) => return fail("network", policy.redact(&error.to_string())),
+                }
+            };
+            let status = response.status();
+            notify(observer, &hop, Some(status.as_u16()), None, false, unverified);
+
+            // A redirect ureq would have followed: any 3xx but 304 with a Location.
+            let location = response.headers().get("location").and_then(|value| value.to_str().ok()).map(str::to_string);
+            let (Some(location), true) = (location, status.is_redirection() && status.as_u16() != 304) else { break (response, status) };
+            let Some(method) = redirect_method(&hop.method, status.as_u16()) else { break (response, status) };
+            // Read to its end (a redirect's body is short), so ureq knows whether the connection
+            // can carry the next request: one dropped unread could go back to the pool after the
+            // server closed it (an HTTP/1.0 server), and the next hop would find it gone.
+            let mut response = response;
+            let _ = std::io::copy(&mut response.body_mut().as_reader().take(64 * 1024), &mut std::io::sink());
+            drop(response);
+            if redirects == MAX_REDIRECTS {
+                return fail("network", format!("too many redirects (more than {MAX_REDIRECTS})"));
+            }
+            redirects += 1;
+            let Some(url) = join_location(&hop.url, &location) else {
+                return fail("network", format!("invalid redirect location {} (from {})", one_line(&location), hop.url));
+            };
+            let (host, https) = split_url(&url).map_err(|error| BridgeError { kind: error.kind, message: format!("{} (a redirect from {})", error.message, hop.url) })?;
+            let mut headers = std::mem::take(&mut hop.headers);
+            let mut body = std::mem::take(&mut hop.body);
+            if method != hop.method {
+                body.clear();
+                headers.retain(|(name, _)| name != "content-type");
+            }
+            // The guest's own keys stay with the origin it gave them for.
+            if origin(&url) != origin(&hop.url) {
+                headers.retain(|(name, _)| name == "accept" || name == "content-type");
+            }
+            from = Some(std::mem::take(&mut hop.url));
+            hop = Hop { method, url, host, https, headers, body };
+        };
 
         let mut head = format!("{} {}\n", status.as_u16(), status.canonical_reason().unwrap_or(""));
         for (name, value) in response.headers() {
@@ -554,7 +874,7 @@ fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Opti
         write(stream, head.as_bytes())?;
         head_sent = true;
 
-        if request.method != "HEAD" {
+        if hop.method != "HEAD" {
             let mut reader = response.body_mut().as_reader();
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
@@ -667,6 +987,134 @@ mod tests {
         assert!(is_loopback("::1"));
         assert!(!is_loopback("example.com"));
         assert!(!is_loopback("128.0.0.1"));
+    }
+
+    #[test]
+    fn the_private_networks_are_the_local_ones() {
+        let private = |text: &str| is_private(text.parse().unwrap());
+        for ip in ["10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.254", "192.168.0.22", "100.64.0.1", "100.127.255.1",
+                   "169.254.169.254", "fd7d:a3ce:f5bb:53b5::1", "fc00::1", "fe80::1", "::ffff:192.168.1.1"] {
+            assert!(private(ip), "{ip}");
+        }
+        for ip in ["8.8.8.8", "172.15.0.1", "172.32.0.1", "192.169.0.1", "100.63.0.1", "100.128.0.1", "11.0.0.1",
+                   "127.0.0.1", "192.0.2.1", "2606:4700::6810:84e5", "::1", "::ffff:1.1.1.1"] {
+            assert!(!private(ip), "{ip}");
+        }
+    }
+
+    #[test]
+    fn private_networks_denied_or_alone_by_address() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let deny = Policy { private_networks: PrivateNetworks::Deny, ..Policy::default() };
+        let only = Policy { private_networks: PrivateNetworks::Only, ..Policy::default() };
+        assert_eq!(Policy::default().refuses_address("nas.lan", ip("192.168.0.22")), None);
+        assert_eq!(deny.refuses_address("192.168.0.22", ip("192.168.0.22")).unwrap(), "192.168.0.22 is in a private network (privateNetworks is deny)");
+        assert_eq!(
+            deny.refuses_address("nas.example.com", ip("10.0.0.5")).unwrap(),
+            "\"nas.example.com\" is 10.0.0.5, which is in a private network (privateNetworks is deny)"
+        );
+        assert_eq!(deny.refuses_address("example.com", ip("93.184.215.14")), None);
+        assert!(only.refuses_address("example.com", ip("93.184.215.14")).unwrap().contains("is not in a private network (privateNetworks is only)"));
+        assert_eq!(only.refuses_address("nas.lan", ip("192.168.0.22")), None);
+        // Loopback is allow_loopback's question in either mode.
+        assert_eq!(deny.refuses_address("localhost", ip("127.0.0.1")), None);
+        assert_eq!(only.refuses_address("localhost", ip("::1")), None);
+        // A host the allow list names exactly is exempt; one a wildcard lets through is not.
+        let named = |mode| Policy { allow: vec!["*".into(), "*.corp.test".into(), "nas.corp.test".into(), "api.example.com".into(), "10.0.0.7".into()], private_networks: mode, ..Policy::default() };
+        assert_eq!(named(PrivateNetworks::Deny).refuses_address("nas.corp.test", ip("10.0.0.5")), None);
+        assert_eq!(named(PrivateNetworks::Deny).refuses_address("10.0.0.7", ip("10.0.0.7")), None);
+        assert!(named(PrivateNetworks::Deny).refuses_address("git.corp.test", ip("10.0.0.6")).is_some());
+        assert_eq!(named(PrivateNetworks::Only).refuses_address("API.example.com.", ip("93.184.215.14")), None);
+        assert!(named(PrivateNetworks::Only).refuses_address("other.example.com", ip("93.184.215.14")).is_some());
+    }
+
+    #[test]
+    fn an_address_in_the_url_is_checked_with_the_lists() {
+        let deny = Policy { private_networks: PrivateNetworks::Deny, ..Policy::default() };
+        assert!(deny.refuses("192.168.0.22").unwrap().starts_with("blocked by the network policy: 192.168.0.22 is in a private network"));
+        assert!(deny.refuses("[fd00::1]").unwrap().contains("private network"));
+        assert_eq!(deny.refuses("example.com"), None);
+        let only = Policy { private_networks: PrivateNetworks::Only, ..Policy::default() };
+        assert!(only.refuses("1.1.1.1").unwrap().contains("not in a private network"));
+        // The lists come first: a deny rule says so itself.
+        let both = Policy { deny: vec!["10.0.0.1".into()], ..only.clone() };
+        assert!(both.refuses("10.0.0.1").unwrap().contains("deny rule"));
+        assert!(PrivateNetworks::parse(" DENY ") == Some(PrivateNetworks::Deny) && PrivateNetworks::parse("block").is_none());
+    }
+
+    #[test]
+    fn the_resolver_keeps_the_addresses_the_rule_lets_through() {
+        use ureq::unversioned::resolver::Resolver;
+        let resolver = |mode| PolicyResolver { policy: Arc::new(RwLock::new(Policy { private_networks: mode, ..Policy::default() })), inner: Default::default() };
+        let config = ureq::config::Config::builder().proxy(None).build();
+        let resolve = |resolver: &PolicyResolver, url: &str| resolver.resolve(&url.parse().unwrap(), &config, ureq::unversioned::transport::NextTimeout { after: ureq::unversioned::transport::time::Duration::NotHappening, reason: ureq::Timeout::Resolve });
+        let found = resolve(&resolver(PrivateNetworks::Allow), "http://192.168.0.22:8080/").unwrap();
+        assert_eq!(found.iter().map(|a| a.to_string()).collect::<Vec<_>>(), ["192.168.0.22:8080"]);
+        // What handle() tells the guest: the refusal itself (ureq's own text adds "other: ").
+        let reason = |error: ureq::Error| match error {
+            ureq::Error::Other(error) if error.is::<Refused>() => error.to_string(),
+            other => panic!("not a refusal: {other}"),
+        };
+        let refused = reason(resolve(&resolver(PrivateNetworks::Deny), "http://192.168.0.22:8080/").unwrap_err());
+        assert_eq!(refused, "blocked by the network policy: 192.168.0.22 is in a private network (privateNetworks is deny)");
+        assert!(reason(resolve(&resolver(PrivateNetworks::Only), "https://8.8.8.8/").unwrap_err()).contains("not in a private network"));
+        assert_eq!(resolve(&resolver(PrivateNetworks::Only), "http://10.1.2.3/").unwrap().len(), 1);
+        // A live policy: an update applies to the next resolve.
+        let live = resolver(PrivateNetworks::Deny);
+        live.policy.write().unwrap().private_networks = PrivateNetworks::Allow;
+        assert_eq!(resolve(&live, "http://10.1.2.3/").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn this_computer_by_the_address_a_name_resolves_to() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let policy = Policy::default();
+        assert_eq!(policy.refuses_resolved("127.0.0.1.nip.io", ip("127.0.0.1")).unwrap(), "\"127.0.0.1.nip.io\" is 127.0.0.1, this computer (allowHostLoopback is off)");
+        assert_eq!(policy.refuses_resolved("::ffff:127.0.0.1", ip("::ffff:127.0.0.1")).unwrap(), "::ffff:127.0.0.1 is this computer (allowHostLoopback is off)");
+        for address in ["127.1.2.3", "::1", "0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            assert!(policy.refuses_resolved("x.test", ip(address)).is_some(), "{address}");
+        }
+        assert_eq!(policy.refuses_resolved("example.com", ip("93.184.215.14")), None);
+        assert_eq!(Policy { allow_loopback: true, ..Policy::default() }.refuses_resolved("x.test", ip("127.0.0.1")), None);
+        // Loopback is not a private network: only allow_loopback decides it.
+        let only = Policy { allow_loopback: true, private_networks: PrivateNetworks::Only, ..Policy::default() };
+        assert_eq!(only.refuses_resolved("x.test", ip("::ffff:127.0.0.1")), None);
+        assert!(only.refuses_resolved("x.test", ip("8.8.8.8")).is_some());
+    }
+
+    #[test]
+    fn a_location_is_joined_to_the_url_it_came_from() {
+        let join = |base: &str, location: &str| join_location(base, location);
+        let base = "https://a.test:8443/v1/models/list?page=2";
+        assert_eq!(join(base, "https://b.test/x").as_deref(), Some("https://b.test/x"));
+        assert_eq!(join(base, "//b.test/x?y").as_deref(), Some("https://b.test/x?y"));
+        assert_eq!(join(base, "/root?q=1#frag").as_deref(), Some("https://a.test:8443/root?q=1"));
+        assert_eq!(join(base, "other").as_deref(), Some("https://a.test:8443/v1/models/other"));
+        assert_eq!(join(base, "../up/./here").as_deref(), Some("https://a.test:8443/v1/up/here"));
+        assert_eq!(join(base, "../../../../top").as_deref(), Some("https://a.test:8443/top"));
+        assert_eq!(join(base, "?page=3").as_deref(), Some("https://a.test:8443/v1/models/list?page=3"));
+        assert_eq!(join("http://a.test", "x").as_deref(), Some("http://a.test/x"));
+        assert_eq!(join("http://a.test/dir/", "..").as_deref(), Some("http://a.test/"));
+        assert_eq!(join(base, "ftp://b.test/").as_deref(), Some("ftp://b.test/")); // split_url refuses it
+        assert_eq!(join(base, "  "), None);
+    }
+
+    #[test]
+    fn origins_and_the_methods_redirects_go_on_with() {
+        assert_eq!(origin("https://A.test/x"), "https://a.test:443");
+        assert_eq!(origin("https://a.test:443/y?z"), "https://a.test:443");
+        assert_eq!(origin("http://[::1]/"), "http://[::1]:80");
+        assert_eq!(origin("http://[::1]:8080/"), "http://[::1]:8080");
+        assert_ne!(origin("http://a.test/"), origin("https://a.test/"));
+        assert_ne!(origin("http://a.test:1/"), origin("http://a.test:2/"));
+        assert_eq!(redirect_method("GET", 301).as_deref(), Some("GET"));
+        assert_eq!(redirect_method("HEAD", 303).as_deref(), Some("HEAD"));
+        assert_eq!(redirect_method("POST", 302).as_deref(), Some("GET"));
+        assert_eq!(redirect_method("DELETE", 303).as_deref(), Some("GET"));
+        assert_eq!(redirect_method("GET", 307).as_deref(), Some("GET"));
+        assert_eq!(redirect_method("POST", 307), None);
+        assert_eq!(redirect_method("PUT", 308), None);
+        assert_eq!(redirect_method("DELETE", 307), None);
     }
 
     #[test]

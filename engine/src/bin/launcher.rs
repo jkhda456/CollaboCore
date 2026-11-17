@@ -34,7 +34,7 @@ use std::process::Command;
 /// Engine options that take a value, by the name launcher.conf uses.
 const VALUE_KEYS: &[&str] = &[
     "kernel", "initramfs", "python-image", "tools-image", "addon-dir", "cpus", "mount", "cwd",
-    "arg", "allow", "deny", "secret", "allow-header", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
+    "arg", "allow", "deny", "private-networks", "secret", "allow-header", "addon", "addon-config", "gui-config", "log-network", "log-exec", "log-file",
     "log-exec-kinds", "log-max-size", "log-rotate", "serial",
 ];
 /// Engine options that are flags.
@@ -480,6 +480,7 @@ mod tests {
              mount = ~/proj:/proj:ro   # read-only\n\
              cpus = 4\n\
              no-network = yes\n\
+             private-networks = deny\n\
              skip-tls-verify = yes\n\
              log-requests = no\n\
              log-network = logs/network.log\n\
@@ -498,7 +499,7 @@ mod tests {
             conf.args,
             [
                 "--mount", "/rt/work:/work", "--mount", "/home/me/proj:/proj:ro", "--cpus", "4",
-                "--no-network", "--skip-tls-verify", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
+                "--no-network", "--private-networks", "deny", "--skip-tls-verify", "--log-network", "/rt/logs/network.log", "--log-exec", "-",
                 "--log-file", "/rt/logs/all.log", "--log-max-size", "10M", "--allow-header", "x-auth-token", "--addon-config",
                 "agent:apiKey=sk-1",
             ]

@@ -146,6 +146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "collabo-data"
+version = "0.1.0"
+dependencies = [
+ "collabo-jq",
+ "collabo-plutil",
+ "collabo-yq",
+ "libc",
+]
+
+[[package]]
 name = "collabo-git-lfs"
 version = "3.8.0"
 dependencies = [
@@ -166,6 +176,13 @@ dependencies = [
  "fancy-regex",
  "indexmap",
  "libc",
+]
+
+[[package]]
+name = "collabo-plutil"
+version = "6.4.2"
+dependencies = [
+ "indexmap",
 ]
 
 [[package]]

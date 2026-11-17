@@ -2,7 +2,10 @@
 #
 #   archive   xz, zstd, lz4, 7z and zip (with their unxz/xzcat/lzma/..., unzstd/zstdcat and
 #             unlz4/lz4cat names), one binary
+#   data      collabo-data: jq, plutil and yq (the crates below, libraries), one binary
 #   jq        the JSON processor
+#   plutil    property lists (XML, binary, JSON, OpenStep), as Apple's plutil
+#   yq        YAML, JSON, XML, ... as mikefarah/yq
 #   git-lfs   Git Large File Storage
 #
 # The codecs are pure Rust crates (lz4's, a port of its library, is in archive itself); nothing
@@ -10,7 +13,7 @@
 # makes.
 [workspace]
 resolver = "2"
-members = ["archive", "jq", "git-lfs", "yq"]
+members = ["archive", "data", "jq", "plutil", "yq", "git-lfs"]
 
 [workspace.package]
 edition = "2021"
