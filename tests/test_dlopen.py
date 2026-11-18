@@ -9,7 +9,9 @@ it through a mutex, or is handed a pointer from dlsym through one; a library tha
 load a library each at once, one waiting for the other's; the floating-point flags; weak definitions (its own — which wasm-ld imports
 too —, and one the program has, which wins) and a weak symbol nothing defines; dlerror. Then
 tests/dlopen/threads.c: threads started four at once with large libraries loaded, which hung the
-machine while a tick could preempt a dylink call (each new thread instantiates them). Only the
+machine while a tick could preempt a dylink call (each new thread instantiates them); and
+tests/dlopen/fault.c: a program with a library loaded that writes past its memory, in its code and
+in the library's, ends with SIGSEGV while the machine goes on (wasmtime 37 aborted the engine). Only the
 native engine loads libraries: on the JavaScript host (userspace/test-boot.sh, under Node) the same
 program runs, and its dlopen fails with an error.
 
@@ -113,6 +115,28 @@ print(("ok   " if ok else "FAIL ") + want)
 if not ok:
     failures += 1
     print("     output:\n     " + "\n     ".join(got[-10:]) + "\n     " + detail.replace("\n", "\n     "))
+
+# A program with a library loaded writes past its memory, in its own code and then in the
+# library's: SIGSEGV each time, and the machine goes on. wasmtime 37 aborted the engine there
+# (`assertion failed: fault.is_none()`: the shared memory is defined by an instance per import;
+# engine/patches/wasmtime-37.0.3-shared-memory-fault.patch).
+subprocess.run([cc, "-O2", "-fPIC", "-shared", str(ROOT / "tests/dlopen/poke.c"), "-o", str(work / "poke.so")], check=True, env=env)
+subprocess.run([cc, "-O2", "-fvisibility=default", "-rdynamic", str(ROOT / "tests/dlopen/fault.c"), "-o", str(work / "fault"), *link],
+               check=True, env=env)
+os.chmod(work / "fault", 0o755)
+f = subprocess.run([*ENGINE[:1], "exec", *ENGINE[1:], "--no-network", "--mount", f"{work}:/t", "--", "/bin/sh", "-c",
+                    'for where in program library; do /t/fault /t/poke.so $where; echo "fault-rc=$?"; done; echo machine-goes-on'],
+                   capture_output=True, text=True, timeout=120)
+got = f.stdout.replace("\r", "").splitlines()
+for want in ("fault: in the program", "fault: in the library"):
+    ok = want in got and got[got.index(want) + 1:got.index(want) + 3].count("fault-rc=139") >= 1 and "not reached" not in got
+    print(("ok   " if ok else "FAIL ") + want + ": SIGSEGV")
+    failures += not ok
+ok = f.returncode == 0 and "machine-goes-on" in got and "fault.is_none()" not in f.stderr
+print(("ok   " if ok else "FAIL ") + "the machine goes on after a fault with a library loaded")
+if not ok:
+    failures += 1
+    print("     output:\n     " + "\n     ".join(got[-10:]) + f"\n     engine exit {f.returncode}\n     " + f.stderr[-800:].replace("\n", "\n     "))
 
 # The JavaScript host has no dynamic loading: the program (which has dlopen) runs all the same, its
 # dlopen fails with an error (the dylink calls are syscalls its kernel answers with ENOSYS).

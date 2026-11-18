@@ -13,6 +13,8 @@ if [[ -x "$ROOT/.tools/cargo/bin/cargo" ]]; then
 fi
 
 command -v cargo >/dev/null || { echo "no cargo; run: python3 build.py tools" >&2; exit 1; }
+# the crates.io packages built with patches of ours (Cargo.toml's [patch.crates-io])
+bash "$E/patch-crates.sh"
 cd "$E"
 if [[ "${1:-}" == "--tests" ]]; then
   exec cargo test --release

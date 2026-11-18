@@ -59,6 +59,8 @@ PLATFORMS="${PLATFORMS:-$HERE}"
 [[ -n "$PLATFORMS" ]] || { echo "unknown platform $(uname -sm); set PLATFORMS" >&2; exit 2; }
 [[ -f "$ENGINE/kernel/vmlinux.wasm" ]] || { echo "missing dist/engine; run: python3 build.py engine" >&2; exit 1; }
 command -v cargo >/dev/null || { echo "no cargo; run: python3 build.py tools" >&2; exit 1; }
+# the crates.io packages the engine builds with patches of ours (engine/Cargo.toml's [patch.crates-io])
+bash "$ROOT/engine/patch-crates.sh"
 mkdir -p "$OUT"
 
 triple() {

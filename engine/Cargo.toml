@@ -36,6 +36,12 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_Console", "Win32_Devices_Communication", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_IO"] }
 
+# wasmtime with engine/patches/wasmtime-37.0.3-*.patch applied (a trap in a program that has
+# loaded libraries aborted the engine): engine/crates, made by engine/patch-crates.sh, which
+# engine/build.sh and scripts/package-runtime.sh run before cargo.
+[patch.crates-io]
+wasmtime = { path = "crates/wasmtime-37.0.3" }
+
 [profile.release]
 opt-level = 3
 lto = true

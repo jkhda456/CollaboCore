@@ -1,0 +1,45 @@
+wasmtime 37.0.3: a trap in a program that has loaded libraries no longer aborts the engine.
+
+StoreOpaque::wasm_fault, which the signal handler calls to tell whether a fault is a wasm
+out-of-bounds access, asked every instance of the store whether the address is in its memory and
+asserted that no two say so. But a shared memory imported into a module is defined by an instance
+of its own for each import (SharedMemory::vmimport → generate_memory_export, every time): the
+guest program's memory is imported by the program and by each library dylink.rs instantiates, so
+with one library loaded two instances claim every address of it. The first wasm trap of such a
+program (a write past its memory) panicked in the handler — `assertion failed: fault.is_none()`,
+store.rs:2187 — and the engine aborted (panic = "abort"), the whole machine with it, where the
+program alone should have got SIGSEGV (addons/mod/0009).
+
+The same change as upstream wasmtime 51.0.0 (51.0.0-rc.1; 50.0.2 still has the assert): the
+instances that claim a fault must agree on its wasm address. Checked against the package's
+sources of 37, 38, 40, 42, 45, 48, 50.0.2 (old) and 51.0.0-rc.1 (this).
+
+Applied by engine/patch-crates.sh to the published package, in engine/crates (Cargo.toml's
+[patch.crates-io]). Drop it with a wasmtime of 51 or later.
+
+--- a/src/runtime/store.rs
++++ b/src/runtime/store.rs
+@@ -2181,11 +2181,20 @@
+         // If this loop becomes hot in the future, however, it should be
+         // possible to precompute maps about linear memories in a store and have
+         // a quicker lookup.
+-        let mut fault = None;
++        //
++        // A shared memory can be defined by more than one instance in a store,
++        // for example when it's imported through the single-memory instance
++        // that `SharedMemory::vmimport` creates. Each of those instances
++        // reports the same fault, so only assert that the faulting address
++        // doesn't belong to two different memories. The memory size isn't
++        // compared because a shared memory can grow concurrently.
++        let mut fault: Option<vm::WasmFault> = None;
+         for (_, instance) in self.instances.iter() {
+             if let Some(f) = instance.handle.get().wasm_fault(addr) {
+-                assert!(fault.is_none());
+-                fault = Some(f);
++                match &fault {
++                    Some(prev) => assert_eq!(prev.wasm_address, f.wasm_address),
++                    None => fault = Some(f),
++                }
+             }
+         }
+         if fault.is_some() {
