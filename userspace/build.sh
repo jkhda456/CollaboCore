@@ -135,10 +135,12 @@ fi
 validate() {
   "$ROOT/.tools/node/bin/node" -e '
     const fs=require("fs");
+    const ok = [];
     for (const f of process.argv.slice(1)) {
-      try { new WebAssembly.Module(fs.readFileSync(f)); console.log("valid wasm:", f); }
+      try { new WebAssembly.Module(fs.readFileSync(f)); ok.push(require("path").basename(f)); }
       catch (e) { console.error("INVALID wasm:", f, "-", e.message); process.exit(1); }
-    }' "$@"
+    }
+    console.log("valid wasm:", ok.join(" "));' "$@"
 }
 
 if stage init "$U/out/init.wasm" "$U/rootfs/init.c" "$U/bin/wasm-cc"; then

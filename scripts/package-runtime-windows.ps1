@@ -102,6 +102,51 @@ function Install-Toolchain([string] $HostTriple) {
     return $Toolchain
 }
 
+# The crates.io packages the engine builds with patches of ours (engine\patches\crates.txt), made
+# as engine/patch-crates.sh makes them: engine\crates\<name>-<version>, the published package
+# (cargo's download cache, else crates.io; its SHA-256 checked) with
+# engine\patches\<name>-<version>-*.patch applied in name order, where engine\Cargo.toml's
+# [patch.crates-io] finds it. Redone when a patch changes; the same stamp as the bash script's.
+function Use-PatchedCrates {
+    $Patches = Join-Path $Root "engine\patches"
+    $Crates = Join-Path $Root "engine\crates"
+    New-Item -ItemType Directory -Force $Crates | Out-Null
+    # Windows' own tar (bsdtar): a Git Bash on PATH would offer GNU tar, which reads C:\ as a host
+    $Tar = Join-Path $env:SystemRoot "System32\tar.exe"
+    foreach ($Line in Get-Content (Join-Path $Patches "crates.txt")) {
+        if ($Line -match '^\s*(#|$)') { continue }
+        $Name, $Version, $Sum = -split $Line
+        $Dir = Join-Path $Crates "$Name-$Version"
+        $Files = @(Get-ChildItem $Patches -Filter "$Name-$Version-*.patch" | Sort-Object Name)
+        if (-not $Files) { throw "no engine\patches\$Name-$Version-*.patch" }
+        $Stamp = ($Files | ForEach-Object { (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() }) -join " "
+        $Done = Join-Path $Dir ".patched"
+        if ((Test-Path $Done) -and ((Get-Content -Raw $Done).Trim() -eq $Stamp)) { continue }
+        $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+        $Crate = Get-ChildItem (Join-Path $CargoHome "registry\cache") -Recurse -Filter "$Name-$Version.crate" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+        if (-not $Crate) {
+            $Crate = Join-Path $Crates "$Name-$Version.crate"
+            Invoke-WebRequest -UseBasicParsing -Uri "https://static.crates.io/crates/$Name/$Name-$Version.crate" -OutFile $Crate
+        }
+        if ((Get-FileHash -Algorithm SHA256 $Crate).Hash.ToLower() -ne $Sum) { throw "${Crate}: not the published $Name $Version (SHA-256)" }
+        if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
+        & $Tar -xzf $Crate -C $Crates
+        if ($LASTEXITCODE) { throw "tar could not unpack $Crate ($LASTEXITCODE)" }
+        # the ceiling keeps git from taking a checkout around engine\ for the patch's repository
+        $Ceiling = $env:GIT_CEILING_DIRECTORIES
+        $env:GIT_CEILING_DIRECTORIES = $Crates
+        try {
+            foreach ($F in $Files) {
+                & git -C $Dir apply --whitespace=nowarn $F.FullName
+                if ($LASTEXITCODE) { throw "git apply $($F.Name) in $Dir failed ($LASTEXITCODE)" }
+            }
+        } finally { $env:GIT_CEILING_DIRECTORIES = $Ceiling }
+        [System.IO.File]::WriteAllText($Done, "$Stamp`n")
+        Write-Host "== $Name $Version patched: $(($Files | ForEach-Object Name) -join ' ')"
+    }
+}
+
 function Build-Platform([string] $P) {
     $Target = $Triples[$P]
     # The toolchain whose host builds this platform (the table above): the target's own on a
@@ -116,7 +161,7 @@ function Build-Platform([string] $P) {
     Write-Host "== build $P ($Target with $Toolchain, on $Machine)"
     Push-Location (Join-Path $Root "engine")
     try {
-        & cargo "+$Toolchain" build --release --target $Target
+        & cargo "+$Toolchain" build --release --quiet --target $Target
         if ($LASTEXITCODE) {
             $Component = @{ "win-x64" = "x64/x86 build tools (Microsoft.VisualStudio.Component.VC.Tools.x86.x64)";
                             "win-arm64" = "ARM64/ARM64EC build tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64)" }[$P]
@@ -183,4 +228,5 @@ function Build-Platform([string] $P) {
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 Write-Host "== machine $Machine (rustup host $RustupHost), platforms: $($Platforms -join ', ')"
+Use-PatchedCrates
 foreach ($P in $Platforms) { Build-Platform $P }

@@ -29,22 +29,24 @@ command -v pnpm >/dev/null || { echo "pnpm not found (expected in $ROOT/.tools/n
 
 # Local patches to the distro clone (kept in ./patches, never edited silently in place).
 # Idempotent: a patch that is already applied is skipped.
+applied=()
 for patch in "$ROOT"/patches/*.patch; do
   if git -C "$DISTRO" apply --reverse --check "$patch" 2>/dev/null; then
-    echo "== patch already applied: $(basename "$patch")"
+    applied+=("$(basename "$patch" .patch)")
   else
     echo "== apply patch: $(basename "$patch")"
     git -C "$DISTRO" apply "$patch"
   fi
 done
+[[ ${#applied[@]} -eq 0 ]] || echo "== patches already applied: ${applied[*]}"
 
 echo "== build host JS (distro packages)"
 (
   cd "$DISTRO"
   pnpm install --filter "@lowland/kernel..." --filter "@lowland/guest..." --frozen-lockfile >/dev/null
-  pnpm --filter @lowland/bytes build >/dev/null
-  pnpm --filter @lowland/kernel build >/dev/null
-  pnpm --filter @lowland/guest build >/dev/null
+  pnpm --silent --filter @lowland/bytes build >/dev/null
+  pnpm --silent --filter @lowland/kernel build >/dev/null
+  pnpm --silent --filter @lowland/guest build >/dev/null
 )
 
 echo "== assemble $OUT"
@@ -91,13 +93,15 @@ for name in $bundled; do
   cp "$cpio" "$OUT/images/addons/"
   [[ -f "$ROOT/addons/$name/addon.json" ]] && cp "$ROOT/addons/$name/addon.json" "$OUT/images/addons/$name.json"
   shipped+="$name "
-  echo "== addon $name"
 done
+[[ "$shipped" == " " ]] || echo "== bundled add-ons:${shipped% }"
+others=()
 for cpio in "$ROOT"/addons/*/out/*.cpio; do
   [[ -f "$cpio" ]] || continue
   name="$(basename "$cpio" .cpio)"
-  [[ "$shipped" == *" $name "* ]] || echo "== addon $name: not bundled, stays in addons/$name/out"
+  [[ "$shipped" == *" $name "* ]] || others+=("$name")
 done
+[[ ${#others[@]} -eq 0 ]] || echo "== not bundled (they stay in addons/<name>/out): ${others[*]}"
 
 # License texts travel with the redistributed binaries.
 mkdir -p "$OUT/licenses"

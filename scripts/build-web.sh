@@ -23,6 +23,8 @@ cp -r "$ENGINE/kernel" "$ENGINE/guest" "$ENGINE/licenses" "$OUT/static/"
 cp "$ENGINE"/images/*.cpio "$OUT/static/"
 cp -r "$ROOT/third_party/distro/apps/site/vendor/xterm" "$OUT/vendor/xterm"
 
-echo "== web ready: $OUT"
-(cd "$OUT" && find . -type f -not -path './vendor/*' -printf '%9s  %p\n' | sort -k2 | grep -v "static/guest/\|static/kernel/dist/")
-du -sh "$OUT"
+# (each file and its size: VERBOSE=1)
+if [[ -n "${VERBOSE:-}" ]]; then
+  (cd "$OUT" && find . -type f -not -path './vendor/*' -printf '%9s  %p\n' | sort -k2 | grep -v "static/guest/\|static/kernel/dist/")
+fi
+echo "== web ready: $OUT ($(du -sh "$OUT" | cut -f1), $(find "$OUT" -type f | wc -l) files)"

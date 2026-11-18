@@ -1,0 +1,19 @@
+wasmtime 37.0.3: its own warnings stay quiet, as they were from the registry.
+
+Cargo caps a registry package's lints (--cap-lints allow): nothing of wasmtime's showed. Built from
+a path (engine/crates, for wasmtime-37.0.3-shared-memory-fault.patch) it is a local package, and
+its warnings showed in every build that compiles it — 23 in 37.0.3, unused variables in
+runtime/vm/libcalls.rs (the features the engine leaves out) and function-to-integer casts in
+runtime/vm/sys/unix/signals.rs, each with its source: hundreds of lines in the runtime step.
+`warnings` allowed in the package's own [lints.rust], above its other levels, is what the cap did.
+
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -541,6 +541,7 @@
+ priority = -1
+ 
+ [lints.rust]
++warnings = { level = "allow", priority = 10 }
+ trivial_numeric_casts = "warn"
+ unstable_features = "warn"
+ unused-lifetimes = "warn"

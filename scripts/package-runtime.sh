@@ -79,11 +79,11 @@ for platform in $PLATFORMS; do
   target="$(triple "$platform")"
   echo "== build $platform ($target)"
   if [[ "$platform" == "$HERE" ]]; then
-    (cd "$ROOT/engine" && cargo build --release >/dev/null)
+    (cd "$ROOT/engine" && cargo build --release --quiet)
     built="$ROOT/engine/target/release/collabo-core-engine"
     launcher="$ROOT/engine/target/release/launcher"
   else
-    (cd "$ROOT/engine" && cargo build --release --target "$target" >/dev/null)
+    (cd "$ROOT/engine" && cargo build --release --quiet --target "$target")
     built="$ROOT/engine/target/$target/release/collabo-core-engine"
     launcher="$ROOT/engine/target/$target/release/launcher"
   fi

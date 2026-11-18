@@ -1,0 +1,7 @@
+# The crates.io packages the engine builds with patches of ours: name, version, and the published
+# package's SHA-256 (its checksum in Cargo.lock before [patch.crates-io] took it over). Each one's
+# patches are engine/patches/<name>-<version>-*.patch, applied in name order to the package in
+# engine/crates/<name>-<version>, which engine/Cargo.toml's [patch.crates-io] names. Made by
+# engine/patch-crates.sh (engine/build.sh, scripts/package-runtime.sh) and by its PowerShell twin in
+# scripts/package-runtime-windows.ps1.
+wasmtime 37.0.3 efcab4481a639a8f3413aa011f733db105ecccc1326a51a6f5c7d09c99314f85

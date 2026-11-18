@@ -60,10 +60,12 @@ sdist() {
 }
 
 # build NAME MANIFEST LIBNAME OUT: `cargo rustc` turns the crate's cdylib into a staticlib.
+BUILT=""   # one was built: their sizes at the end
 build() {
   local name=$1 manifest=$2 lib=$3 out=$4
   if [[ "$FORCE" != *",$name,"* && -f "$out" ]]; then echo "== $name: up to date"; return; fi
   echo "== $name (Rust -> $TARGET)"
+  BUILT=1
   (
     cd "$(dirname "$manifest")"
     # The libc crate as this platform's ABI has it (ILP32 musl), not upstream's WALI one.
@@ -85,4 +87,4 @@ S="$(sdist pydantic-core)"
 build pydantic-core "$S/Cargo.toml" _pydantic_core "$D/lib/libpydantic_core.a"
 S="$(sdist jiter)"
 build jiter "$S/crates/jiter-python/Cargo.toml" jiter_python "$D/lib/libjiter.a"
-ls -l "$D/lib/libpydantic_core.a" "$D/lib/libjiter.a" | awk '{printf "  %-24s %s\n", $NF, $5}' | sed "s#$D/lib/##"
+[[ -z "$BUILT" ]] || ls -l "$D/lib/libpydantic_core.a" "$D/lib/libjiter.a" | awk '{printf "  %-24s %s\n", $NF, $5}' | sed "s#$D/lib/##"

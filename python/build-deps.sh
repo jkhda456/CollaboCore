@@ -25,9 +25,10 @@ JOBS="$(nproc)"
 HOST=(--host=wasm32-unknown-linux-musl --build=x86_64-pc-linux-gnu)
 chmod +x "$CC"
 
+BUILT=""   # a stage ran: the libraries' sizes at the end
 stage() { # name output: true when the stage must run
   if [[ "$FORCE" != *",$1,"* && -e "$2" ]]; then echo "== $1: up to date"; return 1; fi
-  echo "== $1"; return 0
+  echo "== $1"; BUILT=1; return 0
 }
 
 # fetch NAME: download (once) and check the source that sources.lock names; prints its path.
@@ -163,4 +164,4 @@ if stage openssl "$D/lib/libssl.a"; then
 fi
 
 fetch cacert > /dev/null
-ls -l "$D"/lib/*.a | awk '{printf "  %-16s %s\n", $NF, $5}' | sed "s#$D/lib/##"
+[[ -z "$BUILT" ]] || find "$D/lib" -maxdepth 1 -type f -name '*.a' -printf '  %-16f %s\n' | sort

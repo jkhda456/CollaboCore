@@ -72,14 +72,16 @@ case "$cmd" in
     for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
       (cd "$probe" && git apply --reverse "${patches[i]}" 2>/dev/null) && applied[i]=1
     done
+    already=()
     for i in "${!patches[@]}"; do
       if [[ -n "${applied[i]:-}" ]]; then
-        echo "== patch already applied: $(basename "${patches[i]}")"
+        already+=("$(basename "${patches[i]}" .patch)")
       else
         echo "== apply patch: $(basename "${patches[i]}")"
         git apply "${patches[i]}"
       fi
     done
+    [[ ${#already[@]} -eq 0 ]] || echo "== patches already applied: ${already[*]}"
     [[ -f .config ]] || "${MAKE[@]}" defconfig
     "${MAKE[@]}" vmlinux.wasm
     ls -lh vmlinux.wasm
