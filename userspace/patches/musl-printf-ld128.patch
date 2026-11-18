@@ -1,0 +1,49 @@
+printf: double formatting on ld128 (WebAssembly's 128-bit long double): upstream musl's two fixes
+since tombl/musl's base (637b0d2), backported as they are.
+
+musl 572a2e2e ("printf: drastically reduce stack usage without [long] double args", 2024-08, in
+the fork) made fmt_fp's base-1e9 buffer a VLA, sized for a double unless the argument is a long
+double, but kept the start offset of the mantissa at `LDBL_MANT_DIG + 1` slots from the end. With
+wasm32's LDBL_MANT_DIG of 113 that is past the start of a double's buffer: a double with a large
+positive exponent wrote below the array (the stack) and printed garbage — in the guest
+printf '%g' 1e200 gave 1e+198, 1e256 gave 2.0000e+256, 0x1p+700 gave 0.14e+207 (busybox printf
+and awk, wabt's wasm2wat comments: any C program's %e/%f/%g of a double past ~1e150).
+
+  f96e47a2 printf: fix regression in large double formatting on ld128 archs (2025-07-01)
+  0ccaf057 printf: fix buffer overflow in floating point decimal formatting (2025-09-19)
+
+Upstream: https://git.musl-libc.org/cgit/musl/commit/?id=f96e47a26102d537c29435f0abf9ec94676a030e
+and ?id=0ccaf0572e9cccda2cced0f7ee659af4c1c6679a (Rich Felker).
+
+diff --git a/src/stdio/vfprintf.c b/src/stdio/vfprintf.c
+index 7673399..514a44d 100644
+--- a/src/stdio/vfprintf.c
++++ b/src/stdio/vfprintf.c
+@@ -180,11 +180,13 @@ typedef char compiler_defines_long_double_incorrectly[9-(int)sizeof(long double)
+ 
+ static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t, int ps)
+ {
+-	int bufsize = (ps==BIGLPRE)
+-		? (LDBL_MANT_DIG+28)/29 + 1 +          // mantissa expansion
+-		  (LDBL_MAX_EXP+LDBL_MANT_DIG+28+8)/9  // exponent expansion
+-		: (DBL_MANT_DIG+28)/29 + 1 +
+-		  (DBL_MAX_EXP+DBL_MANT_DIG+28+8)/9;
++	int max_mant_dig = (ps==BIGLPRE) ? LDBL_MANT_DIG : DBL_MANT_DIG;
++	int max_exp = (ps==BIGLPRE) ? LDBL_MAX_EXP : DBL_MAX_EXP;
++	/* One slot for 29 bits left of radix point, a slot for every 29-21=8
++	 * bits right of the radix point, and one final zero slot. */
++	int max_mant_slots = 1 + (max_mant_dig-29+7)/8 + 1;
++	int max_exp_slots = (max_exp+max_mant_dig+28+8)/9;
++	int bufsize = max_mant_slots + max_exp_slots;
+ 	uint32_t big[bufsize];
+ 	uint32_t *a, *d, *r, *z;
+ 	int e2=0, e, i, j, l;
+@@ -266,7 +268,7 @@ static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t, int ps)
+ 	if (y) y *= 0x1p28, e2-=28;
+ 
+ 	if (e2<0) a=r=z=big;
+-	else a=r=z=big+sizeof(big)/sizeof(*big) - LDBL_MANT_DIG - 1;
++	else a=r=z=big+sizeof(big)/sizeof(*big) - max_mant_slots - 1;
+ 
+ 	do {
+ 		*z = y;

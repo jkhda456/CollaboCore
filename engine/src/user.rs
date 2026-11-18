@@ -348,8 +348,14 @@ pub fn instantiate(mut store: impl AsContextMut<Data = HostState>, kernel: &Inst
         "linux",
         "syscall",
         move |mut caller: Caller<'_, HostState>, nr: i32, a0: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32| -> Result<i32> {
-            // dlopen's calls, which the engine answers itself (dylink.rs)
-            if let Some(result) = crate::dylink::syscall(&mut caller, nr, [a0, a1, a2, a3, a4]) {
+            // dlopen's calls, which the engine answers itself (dylink.rs). Like a syscall, not
+            // preempted: they hold the process's library log (a host lock) while they instantiate
+            // libraries, which runs their code; a tick there would hand the CPU to another thread
+            // that then waits for the lock in the host, where the kernel cannot run the holder.
+            let was = std::mem::replace(&mut caller.data_mut().user.in_user, false);
+            let dylink = crate::dylink::syscall(&mut caller, nr, [a0, a1, a2, a3, a4]);
+            caller.data_mut().user.in_user = was;
+            if let Some(result) = dylink {
                 return result;
             }
             let before = caller.data().user.generation;
