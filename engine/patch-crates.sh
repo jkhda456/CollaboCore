@@ -7,7 +7,8 @@
 # patch changes; quiet otherwise.
 #
 #   wasmtime 37.0.3   a fault in a program with libraries loaded aborted the engine (upstream in
-#                     51); its own warnings kept quiet, as from the registry
+#                     51); the warnings it gave with our features and toolchain, fixed (a path
+#                     package's warnings show: kept on, they show for what we patch too)
 set -euo pipefail
 E="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

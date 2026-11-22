@@ -730,6 +730,56 @@ impl ureq::unversioned::resolver::Resolver for PolicyResolver {
     }
 }
 
+/// The longest a read waits for the server (a streamed body may go on for any time while it
+/// keeps arriving).
+const IDLE_READ: Duration = Duration::from_secs(1800);
+
+/// The last of the connector chain: each wait for input lasts this long at most (or the phase's
+/// own deadline, when nearer). A read that waits that long fails as a timeout.
+#[derive(Debug)]
+struct Idle(Duration);
+
+impl ureq::unversioned::transport::Connector<Box<dyn ureq::unversioned::transport::Transport>> for Idle {
+    type Out = IdleTransport;
+
+    fn connect(
+        &self,
+        _: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<Box<dyn ureq::unversioned::transport::Transport>>,
+    ) -> std::result::Result<Option<IdleTransport>, ureq::Error> {
+        Ok(chained.map(|inner| IdleTransport(inner, self.0)))
+    }
+}
+
+#[derive(Debug)]
+struct IdleTransport(Box<dyn ureq::unversioned::transport::Transport>, Duration);
+
+impl ureq::unversioned::transport::Transport for IdleTransport {
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: ureq::unversioned::transport::NextTimeout) -> std::result::Result<(), ureq::Error> {
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: ureq::unversioned::transport::NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        self.0.await_input(idle_capped(timeout, self.1))
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+}
+
+fn idle_capped(timeout: ureq::unversioned::transport::NextTimeout, idle: Duration) -> ureq::unversioned::transport::NextTimeout {
+    use ureq::unversioned::transport::time;
+    match timeout.after {
+        time::Duration::Exact(after) if after <= idle => timeout,
+        _ => ureq::unversioned::transport::NextTimeout { after: time::Duration::Exact(idle), ..timeout },
+    }
+}
+
 /// The two agents requests go through: one that checks certificates, one that does not.
 #[derive(Clone)]
 struct Agents {
@@ -743,19 +793,19 @@ fn agent(roots: ureq::tls::RootCerts, verify: bool, policy: Arc<RwLock<Policy>>)
         ureq::Agent::config_builder()
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).disable_verification(!verify).build())
             // Per phase rather than one deadline for the whole exchange: a model's answer streams
-            // for minutes, and a local model can take minutes to start. A body that stops
-            // arriving still ends, at 30 minutes.
+            // for minutes, and a local model can take minutes to start. The body has no deadline
+            // of its own (ureq's would end an answer still streaming at 30 minutes): it ends when
+            // nothing arrives for IDLE_READ (Idle).
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_send_request(Some(Duration::from_secs(60)))
             .timeout_send_body(Some(Duration::from_secs(120)))
             .timeout_recv_response(Some(Duration::from_secs(600)))
-            .timeout_recv_body(Some(Duration::from_secs(1800)))
             // handle() follows redirects itself, checking each one.
             .max_redirects(0)
             // 404 is an answer, not a failure: the guest gets the status like a browser does.
             .http_status_as_error(false)
             .build(),
-        ureq::unversioned::transport::DefaultConnector::default(),
+        ureq::unversioned::transport::Connector::chain(ureq::unversioned::transport::DefaultConnector::default(), Idle(IDLE_READ)),
         resolver,
     )
 }
@@ -1038,6 +1088,9 @@ fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Opti
                 let read = match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(read) => read,
+                    Err(error) if matches!(error.get_ref().and_then(|inner| inner.downcast_ref::<ureq::Error>()), Some(ureq::Error::Timeout(_))) => {
+                        return fail("timeout", format!("the server sent nothing for {} minutes", IDLE_READ.as_secs() / 60))
+                    }
                     Err(error) => return fail("network", format!("response body interrupted: {error}")),
                 };
                 write(stream, format!("{read:x}\n").as_bytes())?;
@@ -1110,6 +1163,56 @@ mod tests {
             deny: vec!["blocked.allowed.test".into()],
             ..Policy::default()
         }
+    }
+
+    /// A local server that sends its head, then `pieces` of the body `gap` apart (then closes).
+    fn slow_server(pieces: usize, gap: Duration, stall: Duration) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n");
+            std::thread::sleep(stall);
+            for _ in 0..pieces {
+                let _ = stream.write_all(b"piece\n");
+                std::thread::sleep(gap);
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    fn idle_agent(idle: Duration) -> ureq::Agent {
+        ureq::Agent::with_parts(
+            ureq::Agent::config_builder().http_status_as_error(false).build(),
+            ureq::unversioned::transport::Connector::chain(ureq::unversioned::transport::DefaultConnector::default(), Idle(idle)),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        )
+    }
+
+    #[test]
+    fn a_body_goes_on_while_it_arrives_and_ends_when_it_stops() {
+        // 12 pieces 100 ms apart: 1.2 s in all, four times the 300 ms a read may wait
+        let mut response = idle_agent(Duration::from_millis(300)).get(&slow_server(12, Duration::from_millis(100), Duration::ZERO)).call().unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        assert_eq!(text.matches("piece").count(), 12);
+        // nothing for 1 s after the head
+        let mut response = idle_agent(Duration::from_millis(300)).get(&slow_server(1, Duration::ZERO, Duration::from_secs(1))).call().unwrap();
+        let mut body = Vec::new();
+        let error = response.body_mut().as_reader().read_to_end(&mut body).unwrap_err();
+        assert!(matches!(error.get_ref().and_then(|inner| inner.downcast_ref::<ureq::Error>()), Some(ureq::Error::Timeout(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_read_waits_for_the_nearer_of_its_phase_and_the_idle_limit() {
+        use ureq::unversioned::transport::{time, NextTimeout};
+        let next = |after| NextTimeout { after, reason: ureq::Timeout::RecvBody };
+        let idle = Duration::from_secs(1800);
+        assert_eq!(idle_capped(next(time::Duration::NotHappening), idle), next(time::Duration::Exact(idle)));
+        assert_eq!(idle_capped(next(time::Duration::from_secs(600)), idle), next(time::Duration::from_secs(600)));
+        assert_eq!(idle_capped(next(time::Duration::from_secs(7200)), idle), next(time::Duration::Exact(idle)));
     }
 
     #[test]

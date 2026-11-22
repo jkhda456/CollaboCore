@@ -1,6 +1,6 @@
 [package]
 name = "collabo-core-engine"
-version = "0.2.14"
+version = "0.2.15"
 edition = "2021"
 description = "collaboCore sandbox engine: runs the WebAssembly Linux kernel with wasmtime"
 license = "MIT"
@@ -37,7 +37,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_System_Console", "Win32_Devices_Communication", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_IO"] }
 
 # wasmtime with engine/patches/wasmtime-37.0.3-*.patch applied (a trap in a program that has
-# loaded libraries aborted the engine; its own warnings kept quiet): engine/crates, made by
+# loaded libraries aborted the engine; the warnings it gave here, fixed): engine/crates, made by
 # engine/patch-crates.sh, which engine/build.sh and scripts/package-runtime.sh run before cargo
 # (scripts/package-runtime-windows.ps1 its twin), from the list in engine/patches/crates.txt.
 [patch.crates-io]

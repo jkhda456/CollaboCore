@@ -1,0 +1,57 @@
+wasmtime 37.0.3: the warnings it gives with the engine's features and toolchain, fixed.
+
+Built from a path (engine/crates, for wasmtime-37.0.3-shared-memory-fault.patch) wasmtime is a
+local package, whose lints cargo does not cap as it does a registry package's: its warnings show,
+and they are kept on, so that a warning in what we patch shows too. There were 23, none a fault:
+
+  runtime/vm/libcalls.rs:119, 20 of them (unused variable: `value_contref`, `delta`, `addr`, …):
+    the libcall macro's stand-in for a libcall of a feature that is compiled out (#[cfg(not(…))],
+    unreachable!()) uses vmctx only (`let _ = vmctx;`); the engine leaves features out
+    (stack switching, the component model, …), so their parameters were unused. Those stand-ins
+    alone allow unused_variables (#[cfg_attr(not(…), allow(…))]: the macro cannot repeat the
+    parameters inside the feature's optional group, so `let _ = (vmctx, …)` does not expand).
+  runtime/vm/sys/unix/signals.rs:52, 114, 218 (direct cast of function item into an integer):
+    `trap_handler as usize` and alike, which a lint newer than wasmtime 37's MSRV (1.87) flags with
+    the pinned 1.98.1; cast through `*const ()` as it suggests. The value is the same.
+
+--- a/src/runtime/vm/libcalls.rs
++++ b/src/runtime/vm/libcalls.rs
+@@ -114,6 +114,9 @@
+                 // implementation and automatically perform `catch_unwind` along
+                 // with conversion of the return value in the face of traps.
+                 #[allow(improper_ctypes_definitions, reason = "__m128i known not FFI-safe")]
++                // A libcall of a feature compiled out stands in with unreachable!(): its
++                // parameters go unused there, and only there.
++                $(#[cfg_attr(not($attr), allow(unused_variables))])?
+                 pub unsafe extern "C" fn $name(
+                     vmctx: NonNull<VMContext>,
+                     $( $pname : libcall!(@ty $param), )*
+--- a/src/runtime/vm/sys/unix/signals.rs
++++ b/src/runtime/vm/sys/unix/signals.rs
+@@ -49,7 +49,7 @@
+             // crash while handling the signal, and fall through to the
+             // Breakpad handler by testing handlingSegFault.
+             handler.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER | libc::SA_ONSTACK;
+-            handler.sa_sigaction = trap_handler as usize;
++            handler.sa_sigaction = trap_handler as *const () as usize;
+             unsafe {
+                 libc::sigemptyset(&mut handler.sa_mask);
+                 if libc::sigaction(signal, &handler, slot) != 0 {
+@@ -111,7 +111,7 @@
+                 // signal handler state and don't know how to remove ourselves
+                 // from the signal handling state. Inform the user of this and
+                 // abort the process.
+-                if prev.sa_sigaction != trap_handler as usize {
++                if prev.sa_sigaction != trap_handler as *const () as usize {
+                     eprintln!(
+                         "
+ Wasmtime's signal handler was not the last signal handler to be installed
+@@ -215,7 +215,7 @@
+                 unsafe { wasmtime_longjmp(jmp_buf) }
+             }
+             unsafe {
+-                set_pc(context, wasmtime_longjmp_shim as usize, jmp_buf as usize);
++                set_pc(context, wasmtime_longjmp_shim as *const () as usize, jmp_buf as usize);
+             }
+             return true;
+         }
