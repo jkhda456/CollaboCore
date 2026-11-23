@@ -111,6 +111,9 @@ class AgentSettings {
     this.maxTurns,
     this.apiSkipTlsVerify,
     this.mcpSkipTlsVerify,
+    this.telegramBotToken,
+    this.telegramAllowedUsers,
+    this.telegramApiUrl,
   });
 
   /// Anthropic's API (or a gateway that speaks it).
@@ -161,6 +164,17 @@ class AgentSettings {
   /// `agent --mcp-skip-tls-verify` does the same for one run.
   final bool? mcpSkipTlsVerify;
 
+  /// Remote control of the interactive session from a Telegram chat: the bot's token (from
+  /// @BotFather). Like [apiKey], kept by this computer: the sandbox's settings get a placeholder,
+  /// which this computer replaces in the URLs of the requests to Telegram.
+  final String? telegramBotToken;
+
+  /// Who may control it: Telegram user ids (numbers) or @usernames. No one when null.
+  final List<Object>? telegramAllowedUsers;
+
+  /// Another Bot API server; `https://api.telegram.org` when null.
+  final String? telegramApiUrl;
+
   Map<String, Object?> toJson() => {
         'provider': provider,
         if (baseUrl != null) 'baseUrl': baseUrl,
@@ -173,6 +187,9 @@ class AgentSettings {
         if (maxTurns != null) 'maxTurns': maxTurns,
         if (apiSkipTlsVerify != null) 'apiSkipTlsVerify': apiSkipTlsVerify,
         if (mcpSkipTlsVerify != null) 'mcpSkipTlsVerify': mcpSkipTlsVerify,
+        if (telegramBotToken != null) 'telegramBotToken': telegramBotToken,
+        if (telegramAllowedUsers != null) 'telegramAllowedUsers': telegramAllowedUsers,
+        if (telegramApiUrl != null) 'telegramApiUrl': telegramApiUrl,
       };
 
   @override

@@ -1095,6 +1095,7 @@ fn apply_network_policy(policy: &mut http::Policy, value: Option<&Value>) -> std
                     host: secret.get("host")?.as_str()?.to_lowercase(),
                     header: secret.get("header")?.as_str()?.to_lowercase(),
                     value: secret.get("value")?.as_str()?.to_string(),
+                    placeholder: None,
                 })
             })
             .collect();

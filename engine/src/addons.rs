@@ -10,12 +10,16 @@
 //!   * writes the add-on's settings to /etc/collabo/addons/<name>.json in the guest, less its
 //!     `apiKey`, which becomes a network secret for the host of its `baseUrl` instead (https
 //!     only: the host adds it to requests and the guest never sees it)
+//!   * likewise for each setting its description names in `urlSecrets` (a key that goes in the
+//!     URL, as a Telegram bot's token does): the guest's settings get a placeholder instead, and
+//!     the host puts the key in its place in the URLs of https requests to that service's host
 //!   * lets the guest set the request headers the description names (`extraAllowedHeaders`)
 //!
 //! `<name>.json`:
 //!   {"name", "description", "extraAllowedHeaders": [...],
 //!    "apiKey": {"selector": "provider", "default": "anthropic",
-//!               "variants": {"anthropic": {"baseUrl", "header", "value": "... {key} ..."}, ...}}}
+//!               "variants": {"anthropic": {"baseUrl", "header", "value": "... {key} ..."}, ...}},
+//!    "urlSecrets": {"telegramBotToken": {"urlSetting": "telegramApiUrl", "default": "https://api.telegram.org"}}}
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -96,6 +100,7 @@ pub fn resolve(dir: Option<&Path>, requested: Option<&Value>) -> Result<Resolved
                 }
             }
         }
+        resolved.secrets.extend(url_secrets(&name, &meta, &mut settings)?);
         resolved.layers.push(crate::image_fs::Layer::File(image));
         let text = serde_json::to_vec_pretty(&Value::Object(settings)).expect("settings serialize");
         settings_files.push((format!("etc/collabo/addons/{name}.json"), text));
@@ -141,7 +146,16 @@ fn api_key_secret(name: &str, meta: &Map<String, Value>, settings: &Map<String, 
         .and_then(Value::as_str)
         .or_else(|| variant_spec.get("baseUrl").and_then(Value::as_str))
         .ok_or_else(|| format!("addons.{name}: apiKey needs a baseUrl"))?;
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| format!("addons.{name}.baseUrl: not a URL: {url}"))?;
+    let Some(host) = https_host(url).map_err(|e| format!("addons.{name}.baseUrl: {e}"))? else { return Ok(None) };
+    let header = variant_spec.get("header").and_then(Value::as_str).unwrap_or("authorization");
+    let value = variant_spec.get("value").and_then(Value::as_str).unwrap_or("Bearer {key}").replace("{key}", key);
+    Ok(Some(http::Secret { host, header: header.to_lowercase(), value, placeholder: None }))
+}
+
+/// The host of an https URL, lowercased; None for plain http (the host adds secrets to https
+/// requests only).
+fn https_host(url: &str) -> Result<Option<String>, String> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| format!("not a URL: {url}"))?;
     if scheme.eq_ignore_ascii_case("http") {
         return Ok(None);
     }
@@ -152,11 +166,39 @@ fn api_key_secret(name: &str, meta: &Map<String, Value>, settings: &Map<String, 
         None => authority.split(':').next().unwrap_or_default().to_string(),
     };
     if host.is_empty() {
-        return Err(format!("addons.{name}.baseUrl: no host in {url}"));
+        return Err(format!("no host in {url}"));
     }
-    let header = variant_spec.get("header").and_then(Value::as_str).unwrap_or("authorization");
-    let value = variant_spec.get("value").and_then(Value::as_str).unwrap_or("Bearer {key}").replace("{key}", key);
-    Ok(Some(http::Secret { host: host.to_lowercase(), header: header.to_lowercase(), value }))
+    Ok(Some(host.to_lowercase()))
+}
+
+/// What stands for a URL secret in the guest's settings and URLs: letters, digits, `_` and `-`,
+/// so it fits in a URL's path as it is.
+fn placeholder(name: &str, key: &str) -> String {
+    format!("COLLABO_SECRET_{name}_{key}")
+}
+
+/// The settings the description's `urlSecrets` names, taken out of `settings` and made URL
+/// secrets for the host of the service's URL (the setting `urlSetting` names, else `default`); the
+/// settings keep the placeholder. A plain-http URL keeps the value in the settings, as apiKey does.
+fn url_secrets(name: &str, meta: &Map<String, Value>, settings: &mut Map<String, Value>) -> Result<Vec<http::Secret>, String> {
+    let Some(specs) = meta.get("urlSecrets").and_then(Value::as_object) else { return Ok(Vec::new()) };
+    let mut secrets = Vec::new();
+    for (key, spec) in specs {
+        let Some(value) = settings.get(key) else { continue };
+        let value = value.as_str().ok_or_else(|| format!("addons.{name}.{key}: a string"))?.to_string();
+        let url_setting = spec.get("urlSetting").and_then(Value::as_str);
+        let url = url_setting
+            .and_then(|setting| settings.get(setting))
+            .and_then(Value::as_str)
+            .or_else(|| spec.get("default").and_then(Value::as_str))
+            .ok_or_else(|| format!("addons.{name}.{key}: the add-on names no URL for it"))?;
+        let at = url_setting.unwrap_or(key);
+        let Some(host) = https_host(url).map_err(|e| format!("addons.{name}.{at}: {e}"))? else { continue };
+        let placeholder = placeholder(name, key);
+        settings.insert(key.clone(), json!(placeholder));
+        secrets.push(http::Secret { host, header: String::new(), value, placeholder: Some(placeholder) });
+    }
+    Ok(secrets)
 }
 
 /// Command-line settings: `NAME:KEY=VALUE` → addons.NAME.KEY. Numbers and true/false keep
@@ -200,6 +242,31 @@ mod tests {
             serde_json::from_value(json!({"provider": "openai", "baseUrl": "https://llm.example.com:8443/v1"})).unwrap();
         let secret = api_key_secret("x", &meta(), &settings, "k2").unwrap().unwrap();
         assert_eq!((secret.host.as_str(), secret.header.as_str(), secret.value.as_str()), ("llm.example.com", "authorization", "Bearer k2"));
+    }
+
+    #[test]
+    fn a_url_secret_leaves_a_placeholder_in_the_settings() {
+        let meta = json!({"urlSecrets": {"telegramBotToken": {"urlSetting": "telegramApiUrl", "default": "https://api.telegram.org"}}});
+        let meta = meta.as_object().unwrap();
+        let mut settings = json!({"telegramBotToken": "123:abc", "model": "m"}).as_object().unwrap().clone();
+        let secrets = url_secrets("agent", meta, &mut settings).unwrap();
+        assert_eq!(secrets.len(), 1);
+        let secret = &secrets[0];
+        assert_eq!((secret.host.as_str(), secret.header.as_str(), secret.value.as_str()), ("api.telegram.org", "", "123:abc"));
+        assert_eq!(secret.placeholder.as_deref(), Some("COLLABO_SECRET_agent_telegramBotToken"));
+        assert_eq!(settings["telegramBotToken"], "COLLABO_SECRET_agent_telegramBotToken");
+        assert_eq!(settings["model"], "m");
+        // Another server named by the setting; plain http keeps the token in the guest.
+        let mut own = json!({"telegramBotToken": "t", "telegramApiUrl": "https://Bot.Example:8081/x"}).as_object().unwrap().clone();
+        assert_eq!(url_secrets("agent", meta, &mut own).unwrap()[0].host, "bot.example");
+        let mut plain = json!({"telegramBotToken": "t", "telegramApiUrl": "http://localhost:8081"}).as_object().unwrap().clone();
+        assert!(url_secrets("agent", meta, &mut plain).unwrap().is_empty());
+        assert_eq!(plain["telegramBotToken"], "t");
+        // Not given: nothing; not a string: an error.
+        let mut none = Map::new();
+        assert!(url_secrets("agent", meta, &mut none).unwrap().is_empty());
+        let mut number = json!({"telegramBotToken": 5}).as_object().unwrap().clone();
+        assert!(url_secrets("agent", meta, &mut number).is_err_and(|e| e.contains("a string")));
     }
 
     #[test]

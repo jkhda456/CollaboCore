@@ -55,6 +55,11 @@ pub struct Secret {
     pub host: String,
     pub header: String,
     pub value: String,
+    /// A URL secret instead of a header (an add-on's `urlSecrets`, addons.rs): this text in the
+    /// URL of an https request to `host` becomes `value` on the way out, and `header` is empty.
+    /// The guest knows only the placeholder; the request API alone does this (intercept.rs adds
+    /// header secrets only).
+    pub placeholder: Option<String>,
 }
 
 /// The private networks' addresses (`is_private`): reachable as any other (the default), never
@@ -415,7 +420,7 @@ impl Policy {
                 let mut matching: Vec<&Secret> = self.secrets.iter().filter(|secret| host_matches(&secret.host, host)).collect();
                 let app = matching.len();
                 for secret in self.addon_secrets.iter().filter(|secret| host_matches(&secret.host, host)) {
-                    if !matching[..app].iter().any(|own| own.header == secret.header) {
+                    if !matching[..app].iter().any(|own| own.header == secret.header && own.placeholder == secret.placeholder) {
                         matching.push(secret);
                     }
                 }
@@ -424,14 +429,14 @@ impl Policy {
         }
     }
 
-    /// The secrets for a host the guest reaches over its own TLS (intercept.rs).
+    /// The header secrets for a host the guest reaches over its own TLS (intercept.rs).
     pub fn secrets_for_host(&self, host: &str) -> Vec<Secret> {
-        self.secrets_for(true, host).into_iter().cloned().collect()
+        self.secrets_for(true, host).into_iter().filter(|secret| secret.placeholder.is_none()).cloned().collect()
     }
 
-    /// Is there a secret for this host? Its TLS connections are then taken over (intercept.rs).
+    /// Is there a header secret for this host? Its TLS connections are then taken over (intercept.rs).
     pub fn has_secret_for(&self, host: &str) -> bool {
-        self.secrets.iter().chain(&self.addon_secrets).any(|secret| host_matches(&secret.host, host))
+        self.secrets.iter().chain(&self.addon_secrets).any(|secret| secret.placeholder.is_none() && host_matches(&secret.host, host))
     }
 
     /// `redact`, for other modules.
@@ -770,6 +775,12 @@ impl ureq::unversioned::transport::Transport for IdleTransport {
     fn is_open(&mut self) -> bool {
         self.0.is_open()
     }
+
+    // ureq asks the outermost transport; the default (false) refuses every https request with
+    // "TLS required, but transport is unsecured".
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
 }
 
 fn idle_capped(timeout: ureq::unversioned::transport::NextTimeout, idle: Duration) -> ureq::unversioned::transport::NextTimeout {
@@ -855,6 +866,23 @@ fn redirect_method(method: &str, status: u16) -> Option<String> {
         _ if method == "GET" || method == "HEAD" => Some(method.to_string()),
         _ => Some("GET".to_string()),
     }
+}
+
+/// The URL with each URL secret's placeholder replaced by its value.
+fn with_url_secrets(url: &str, secrets: &[&Secret]) -> String {
+    secrets.iter().fold(url.to_string(), |url, secret| match &secret.placeholder {
+        Some(placeholder) => url.replace(placeholder.as_str(), &secret.value),
+        None => url,
+    })
+}
+
+/// A URL from the server (a redirect's Location) with the URL secrets' values back to their
+/// placeholders.
+fn without_url_secrets(url: &str, secrets: &[&Secret]) -> String {
+    secrets.iter().fold(url.to_string(), |url, secret| match &secret.placeholder {
+        Some(placeholder) if !secret.value.is_empty() => url.replace(secret.value.as_str(), placeholder),
+        _ => url,
+    })
 }
 
 /// A Location against the URL it came from (RFC 3986 5.2): absolute, `//authority…`,
@@ -987,16 +1015,19 @@ fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Opti
                     )),
                 );
             }
+            // A URL secret goes in where its placeholder is; hop.url (what is logged and what a
+            // redirect is joined to) keeps the placeholder.
+            let url = with_url_secrets(&hop.url, &secrets);
             let build = || {
-                let mut builder = ureq::http::Request::builder().method(hop.method.as_str()).uri(&hop.url);
+                let mut builder = ureq::http::Request::builder().method(hop.method.as_str()).uri(&url);
                 for (name, value) in &hop.headers {
-                    if secrets.iter().any(|secret| secret.header == *name) {
+                    if secrets.iter().any(|secret| secret.placeholder.is_none() && secret.header == *name) {
                         continue;
                     }
                     builder = builder.header(name, value);
                 }
                 // The guest never sees these, and they are never logged.
-                for secret in &secrets {
+                for secret in secrets.iter().filter(|secret| secret.placeholder.is_none()) {
                     builder = builder.header(secret.header.as_str(), secret.value.as_str());
                 }
                 builder.body(hop.body.as_slice()).map_err(|error| BridgeError { kind: "bad-request", message: policy.redact(&error.to_string()) })
@@ -1040,6 +1071,8 @@ fn handle(stream: &VsockStream, policy: &Policy, agents: &Agents, observer: Opti
             // A redirect ureq would have followed: any 3xx but 304 with a Location.
             let location = response.headers().get("location").and_then(|value| value.to_str().ok()).map(str::to_string);
             let (Some(location), true) = (location, status.is_redirection() && status.as_u16() != 304) else { break (response, status) };
+            // A URL secret the server wrote back goes back to its placeholder.
+            let location = without_url_secrets(&location, &secrets);
             let Some(method) = redirect_method(&hop.method, status.as_u16()) else { break (response, status) };
             // Read to its end (a redirect's body is short), so ureq knows whether the connection
             // can carry the next request: one dropped unread could go back to the pool after the
@@ -1138,7 +1171,7 @@ pub fn parse_secret(spec: &str) -> Result<Secret> {
     if !is_token(&header) || value.contains(['\r', '\n']) {
         bail!("{header} is not a valid header name for a secret");
     }
-    Ok(Secret { host: host.to_lowercase(), header, value: value.to_string() })
+    Ok(Secret { host: host.to_lowercase(), header, value: value.to_string(), placeholder: None })
 }
 
 /// Parses `NAME[,NAME...]`, the command line spelling of extra allowed headers.
@@ -1203,6 +1236,57 @@ mod tests {
         let mut body = Vec::new();
         let error = response.body_mut().as_reader().read_to_end(&mut body).unwrap_err();
         assert!(matches!(error.get_ref().and_then(|inner| inner.downcast_ref::<ureq::Error>()), Some(ureq::Error::Timeout(_))), "{error:?}");
+    }
+
+    /// A local https server on 127.0.0.1, its certificate from a CA of its own (returned with the
+    /// URL): answers one request with "secure".
+    fn tls_server() -> (String, ureq::tls::Certificate<'static>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        use std::io::Write;
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap().signed_by(&key, &issuer).unwrap();
+        let private = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()));
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf.der().clone()], private)
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut stream = rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), tcp);
+            let (mut head, mut buffer) = (Vec::new(), [0u8; 4096]);
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => head.extend_from_slice(&buffer[..count]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecure");
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        });
+        (format!("https://{address}/"), ureq::tls::Certificate::from_der(ca.der()).to_owned())
+    }
+
+    #[test]
+    fn https_goes_through_the_idle_transport() {
+        // The agent serve() uses: Idle wraps the TLS transport, and ureq refuses https unless
+        // the outermost transport says it is TLS.
+        let (url, ca) = tls_server();
+        let policy = Arc::new(RwLock::new(Policy { allow_loopback: true, ..Policy::default() }));
+        let mut response = agent(ureq::tls::RootCerts::new_with_certs(&[ca]), true, policy).get(&url).call().unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body_mut().read_to_string().unwrap(), "secure");
     }
 
     #[test]
@@ -1533,9 +1617,29 @@ mod tests {
     }
 
     #[test]
+    fn a_url_secret_goes_in_for_its_placeholder() {
+        let token = Secret { host: "api.telegram.org".into(), header: String::new(), value: "123:abc".into(), placeholder: Some("COLLABO_SECRET_agent_t".into()) };
+        let key = Secret { host: "api.telegram.org".into(), header: "x-api-key".into(), value: "sk-1".into(), placeholder: None };
+        let policy = Policy { addon_secrets: vec![token, key], ..Policy::default() };
+        let secrets = policy.secrets_for(true, "api.telegram.org");
+        assert_eq!(secrets.len(), 2);
+        let url = "https://api.telegram.org/botCOLLABO_SECRET_agent_t/getUpdates?offset=1";
+        assert_eq!(with_url_secrets(url, &secrets), "https://api.telegram.org/bot123:abc/getUpdates?offset=1");
+        assert_eq!(without_url_secrets("https://api.telegram.org/bot123:abc/x", &secrets), "https://api.telegram.org/botCOLLABO_SECRET_agent_t/x");
+        // Not over http, not for another host; intercept.rs (the guest's own TLS) gets the header one only.
+        assert!(policy.secrets_for(false, "api.telegram.org").is_empty());
+        assert!(policy.secrets_for(true, "example.com").is_empty());
+        assert_eq!(policy.secrets_for_host("api.telegram.org").iter().map(|s| s.header.as_str()).collect::<Vec<_>>(), ["x-api-key"]);
+        let only_url = Policy { addon_secrets: vec![policy.addon_secrets[0].clone()], ..Policy::default() };
+        assert!(!only_url.has_secret_for("api.telegram.org"));
+        // Its value is hidden in what the guest is told, as a header secret's is.
+        assert_eq!(policy.redact("no bot123:abc here"), "no bot[secret] here");
+    }
+
+    #[test]
     fn secrets_only_travel_over_https() {
         let policy = Policy {
-            secrets: vec![Secret { host: "example.com".into(), header: "x-api-key".into(), value: "sk-1".into() }],
+            secrets: vec![Secret { host: "example.com".into(), header: "x-api-key".into(), value: "sk-1".into(), placeholder: None }],
             ..Policy::default()
         };
         assert_eq!(policy.secrets_for(true, "example.com").len(), 1);

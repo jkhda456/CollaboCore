@@ -6,9 +6,10 @@
 //! puts `<name>.*` in the add-on folder and each `licenses/FILE` in app/licenses as
 //! `addon-<name>-FILE`, replacing what was there; there are no versions to choose from.
 use std::fs::File;
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
+use crate::archive::{central_directory, extract};
+use crate::fetch::megabytes;
 
 /// The release `addons-repo` replaces.
 pub const DEFAULT_REPO: &str = "https://api.github.com/repos/jkhda456/CollaboAddons/releases/latest";
@@ -21,24 +22,19 @@ pub struct Place {
     pub dir: PathBuf,
     /// The runtime's licenses folder.
     pub licenses: PathBuf,
+    /// The conf the launcher reads (launcher.conf or --config's), which enable and disable edit.
+    pub conf: PathBuf,
 }
 
-/// `addons-repo = VALUE`: an API URL as it is, `OWNER/REPO` the latest release there.
-pub fn repo_url(value: &str) -> String {
-    if value.contains("://") {
-        value.to_string()
-    } else {
-        format!("https://api.github.com/repos/{}/releases/latest", value.trim_matches('/'))
-    }
-}
-
-/// `launcher --addons [list | get NAME...]`.
+/// `launcher --addons [list | get NAME... | enable NAME... | disable NAME...]`.
 pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
     match args.first().map(String::as_str) {
         None | Some("list") if args.len() <= 1 => list(place),
         Some("get") if args.len() > 1 => get(&args[1..], place),
-        Some("get") => Err("--addons get needs the name of an add-on (launcher --addons list)".into()),
-        _ => Err(format!("--addons takes list or get NAME..., not {}", args.join(" "))),
+        Some("enable") if args.len() > 1 => crate::switch::switch(&args[1..], true, place),
+        Some("disable") if args.len() > 1 => crate::switch::switch(&args[1..], false, place),
+        Some(sub @ ("get" | "enable" | "disable")) => Err(format!("--addons {sub} needs the name of an add-on (launcher --addons list)")),
+        _ => Err(format!("--addons takes list, get NAME..., enable NAME... or disable NAME..., not {}", args.join(" "))),
     }
 }
 
@@ -73,30 +69,8 @@ fn assets(release: &serde_json::Value) -> Result<Vec<Asset>, String> {
     Ok(assets)
 }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .user_agent(concat!("collabo-core-launcher/", env!("CARGO_PKG_VERSION")))
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_response(Some(Duration::from_secs(120)))
-            .build(),
-    )
-}
-
-fn http_error(url: &str, error: ureq::Error) -> String {
-    match error {
-        ureq::Error::StatusCode(403 | 429) => format!("{url}: refused (GitHub allows 60 requests an hour without a login; try again later)"),
-        ureq::Error::StatusCode(404) => format!("{url}: not found (addons-repo in launcher.conf)"),
-        error => format!("{url}: {error}"),
-    }
-}
-
 fn release(repo: &str) -> Result<Vec<Asset>, String> {
-    let mut response =
-        agent().get(repo).header("accept", "application/vnd.github+json").call().map_err(|e| http_error(repo, e))?;
-    let text = response.body_mut().read_to_string().map_err(|e| format!("{repo}: {e}"))?;
-    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{repo}: {e}"))?;
-    assets(&json).map_err(|e| format!("{repo}: {e}"))
+    assets(&crate::fetch::release(repo, "addons-repo")?).map_err(|e| format!("{repo}: {e}"))
 }
 
 /// The add-ons in the folder: its `<name>.cpio` files.
@@ -109,10 +83,6 @@ fn installed(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-fn megabytes(bytes: u64) -> String {
-    format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
 /// The release's add-ons, those in the folder marked, then those only in the folder.
@@ -166,29 +136,7 @@ fn get(names: &[String], place: &Place) -> Result<i32, String> {
 }
 
 fn download(asset: &Asset, to: &Path) -> Result<(), String> {
-    let mut response = agent().get(&asset.url).call().map_err(|e| http_error(&asset.url, e))?;
-    let total = response.body().content_length().unwrap_or(asset.size);
-    let mut body = response.body_mut().as_reader();
-    let mut file = File::create(to).map_err(|e| format!("{}: {e}", to.display()))?;
-    let progress = std::io::stderr().is_terminal();
-    let (mut buffer, mut done, mut shown) = (vec![0u8; 256 * 1024], 0u64, 0u64);
-    loop {
-        let n = body.read(&mut buffer).map_err(|e| format!("{}: {e}", asset.url))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buffer[..n]).map_err(|e| format!("{}: {e}", to.display()))?;
-        done += n as u64;
-        if progress && (done - shown >= 1 << 20 || done == total) {
-            shown = done;
-            eprint!("\r{}: {} / {}  ", asset.name, megabytes(done), megabytes(total));
-        }
-    }
-    if progress {
-        eprint!("\r\x1b[K");
-    }
-    eprintln!("{}: downloaded {}", asset.name, megabytes(done));
-    Ok(())
+    crate::fetch::download(&asset.url, &asset.name, asset.size, to)
 }
 
 /// Where a file of `<name>`'s zip goes.
@@ -267,105 +215,6 @@ fn install(zip: &Path, name: &str, place: &Place) -> Result<(), String> {
     Ok(())
 }
 
-/// A file in a zip, as its central directory describes it.
-#[derive(Debug)]
-struct Entry {
-    name: String,
-    method: u16,
-    crc: u32,
-    compressed: u64,
-    size: u64,
-    offset: u64,
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-
-fn central_directory(file: &mut (impl Read + Seek)) -> Result<Vec<Entry>, String> {
-    let io = |e: std::io::Error| e.to_string();
-    let len = file.seek(SeekFrom::End(0)).map_err(io)?;
-    // The end record is 22 bytes and a comment of at most 65535.
-    let tail_len = len.min(22 + 65535);
-    let mut tail = vec![0u8; tail_len as usize];
-    file.seek(SeekFrom::Start(len - tail_len)).map_err(io)?;
-    file.read_exact(&mut tail).map_err(io)?;
-    let end = (0..tail.len().saturating_sub(21))
-        .rev()
-        .find(|&i| u32_at(&tail, i) == 0x0605_4b50)
-        .ok_or("not a zip archive")?;
-    let (count, size, start) = (u16_at(&tail, end + 10), u32_at(&tail, end + 12), u32_at(&tail, end + 16));
-    if count == 0xffff || size == u32::MAX || start == u32::MAX {
-        return Err("a zip64 archive (not supported)".into());
-    }
-    let mut directory = vec![0u8; size as usize];
-    file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
-    file.read_exact(&mut directory).map_err(io)?;
-
-    let mut entries = Vec::new();
-    let mut at = 0;
-    for _ in 0..count {
-        if at + 46 > directory.len() || u32_at(&directory, at) != 0x0201_4b50 {
-            return Err("a broken central directory".into());
-        }
-        let (name_len, extra_len, comment_len) =
-            (u16_at(&directory, at + 28) as usize, u16_at(&directory, at + 30) as usize, u16_at(&directory, at + 32) as usize);
-        let name = directory.get(at + 46..at + 46 + name_len).ok_or("a broken central directory")?;
-        if u16_at(&directory, at + 8) & 1 != 0 {
-            return Err(format!("{} is encrypted", String::from_utf8_lossy(name)));
-        }
-        entries.push(Entry {
-            name: String::from_utf8_lossy(name).into_owned(),
-            method: u16_at(&directory, at + 10),
-            crc: u32_at(&directory, at + 16),
-            compressed: u32_at(&directory, at + 20) as u64,
-            size: u32_at(&directory, at + 24) as u64,
-            offset: u32_at(&directory, at + 42) as u64,
-        });
-        at += 46 + name_len + extra_len + comment_len;
-    }
-    Ok(entries)
-}
-
-/// Writes one entry's bytes to `to`, checking their size and CRC.
-fn extract(file: &mut File, entry: &Entry, to: &Path) -> Result<(), String> {
-    let io = |e: std::io::Error| e.to_string();
-    let mut local = [0u8; 30];
-    file.seek(SeekFrom::Start(entry.offset)).map_err(io)?;
-    file.read_exact(&mut local).map_err(io)?;
-    if u32_at(&local, 0) != 0x0403_4b50 {
-        return Err("a broken local header".into());
-    }
-    let skip = u16_at(&local, 26) as i64 + u16_at(&local, 28) as i64;
-    file.seek(SeekFrom::Current(skip)).map_err(io)?;
-    let data = (&mut *file).take(entry.compressed);
-    let mut reader: Box<dyn Read + '_> = match entry.method {
-        0 => Box::new(data),
-        8 => Box::new(flate2::read::DeflateDecoder::new(data)),
-        method => return Err(format!("compression method {method} (not supported)")),
-    };
-    let mut out = std::io::BufWriter::new(File::create(to).map_err(|e| format!("{}: {e}", to.display()))?);
-    let (mut buffer, mut crc, mut size) = (vec![0u8; 256 * 1024], crc32fast::Hasher::new(), 0u64);
-    loop {
-        let n = reader.read(&mut buffer).map_err(io)?;
-        if n == 0 {
-            break;
-        }
-        crc.update(&buffer[..n]);
-        size += n as u64;
-        out.write_all(&buffer[..n]).map_err(|e| format!("{}: {e}", to.display()))?;
-    }
-    out.flush().map_err(|e| format!("{}: {e}", to.display()))?;
-    if size != entry.size || crc.finalize() != entry.crc {
-        return Err("its size or CRC does not match (a broken download?)".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +245,7 @@ mod tests {
 
     #[test]
     fn repo_takes_a_url_or_owner_and_repo() {
+        use crate::fetch::repo_url;
         assert_eq!(repo_url("me/addons"), "https://api.github.com/repos/me/addons/releases/latest");
         assert_eq!(repo_url("https://h/api/releases/tags/v1"), "https://h/api/releases/tags/v1");
     }
@@ -426,7 +276,7 @@ mod tests {
             eprintln!("no zip command; skipped");
             return;
         }
-        let place = Place { repo: String::new(), dir: dir.join("addons"), licenses: dir.join("licenses") };
+        let place = Place { repo: String::new(), dir: dir.join("addons"), licenses: dir.join("licenses"), conf: dir.join("launcher.conf") };
         std::fs::create_dir_all(&place.dir).unwrap();
         std::fs::create_dir_all(&place.licenses).unwrap();
         std::fs::write(place.licenses.join("addon-demo-stale.txt"), b"old").unwrap();

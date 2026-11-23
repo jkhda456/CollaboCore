@@ -19,6 +19,7 @@ mod serial;
 mod sshagent;
 mod module_info;
 mod net;
+mod platform;
 mod program_cache;
 mod user;
 mod virtio;
@@ -43,6 +44,7 @@ Usage:
   collabo-core-engine --stdio [IMAGES]           the control protocol on stdin/stdout, for an app
                                                  (the app describes the sandbox in `start`)
   collabo-core-engine --help                     this text
+  collabo-core-engine --version                  the version and platform (launcher --version too)
 
 Images:
   --kernel FILE             the kernel image, vmlinux.wasm (required)
@@ -121,7 +123,8 @@ Add-ons (optional overlays; addons/README.md):
   --addon NAME              boot with that add-on (repeatable)
   --addon-config NAME:KEY=VALUE
                             one of its settings (repeatable; implies --addon NAME), e.g.
-                            agent:provider=openai; an apiKey becomes a --secret
+                            agent:provider=openai; an apiKey becomes a --secret, and
+                            so does a key the add-on puts in URLs (agent:telegramBotToken)
 
 Terminal:
   --no-raw                  leave this terminal line-buffered (Ctrl-C then ends the engine)
@@ -517,6 +520,10 @@ fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if wants_help(&argv) {
         print!("{USAGE}");
+        return Ok(());
+    }
+    if argv.len() == 1 && argv[0] == "--version" {
+        println!("{}", platform::version_line());
         return Ok(());
     }
     if argv.is_empty() {
