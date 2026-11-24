@@ -15,6 +15,9 @@
 #   svn       1.15  Subversion: svn, svnadmin, svnlook, svnserve, svnsync, svnrdump, svnmucc,
 #                   svndumpfilter, svnfsfs, svnversion (one program, the others links to it),
 #                   over APR 1.7, APR-util 1.6, expat and serf 1.3 (http and https)
+#   smbclient 4.25  Samba's SMB/CIFS client: SMB1, SMB2 and SMB3 (signing, encryption; QUIC is in
+#                   it too), NTLMSSP logins (Heimdal's Kerberos is in it), DCE/RPC (share lists),
+#                   tar (libarchive), over GnuTLS 3.8 (Samba's crypto); build-samba.sh says how
 #   gui             the display for GUI programs: `gui` (server and command line, Rust),
 #                   libcollabo-gui and gui-demo (C); our own, in gui/ (gui/README.md)
 #   rust            our Rust reimplementations, in rust/ (rust/README.md): xz, zstd, lz4, 7z and
@@ -28,7 +31,7 @@
 # patches; distro has no screen or Subversion, so their patches are ours (patches/screen-nofork.patch,
 # patches/apr-wasm.patch), and file's fork is ours to replace (patches/file-nofork.patch). OpenSSL, zlib, ncurses and SQLite are the static libraries
 # python/build-deps.sh builds (python/deps), so the python step comes first. Stages skip when their output exists; FORCE=stage[,stage] redoes
-# them.   stages: curl dropbear git screen openssl sqlite file column perl svn gui rust ripgrep cpio (gui and rust always run: cargo
+# them.   stages: curl dropbear git screen openssl sqlite file column perl svn smbclient gui rust ripgrep cpio (gui and rust always run: cargo
 # and the compiles are incremental)
 set -euo pipefail
 
@@ -406,6 +409,13 @@ if stage svn "$STAGE/usr/bin/svn"; then
   install -D "$MC/svn" "$STAGE/usr/bin/svn"
 fi
 
+STEP=smbclient  # Samba's own client, everything it needs in build/samba-deps; build-samba.sh has the
+                # steps and their reasons (configure's answers from the guest, no fork, no mmap)
+if stage smbclient "$STAGE/usr/bin/smbclient"; then
+  STAGE="$STAGE" FORCE="$([[ "$FORCE" == *",smbclient,"* ]] && echo gmp,nettle,tasn1,gnutls,libarchive,samba-src,samba-configure || true)" \
+    bash "$N/build-samba.sh"
+fi
+
 STEP=gui
 echo "== gui"
 STAGE="$STAGE" bash "$N/gui/build.sh"
@@ -458,6 +468,8 @@ echo "== cpio"   # always: packing takes a second
     --file usr/bin/git-lfs="$STAGE/usr/bin/git-lfs" \
     --file usr/bin/svn="$STAGE/usr/bin/svn" \
     $(for p in $SVN_PROGRAMS; do [[ $p == svn ]] || echo "--link usr/bin/$p=svn"; done) \
+    --file usr/bin/smbclient="$STAGE/usr/bin/smbclient" \
+    --dir var/lock/samba --dir var/cache/samba --dir var/lib/samba \
     --tree usr/share/terminfo="$DEPS/share/terminfo" \
     --file etc/ssl/cert.pem="$CACERT" \
     --etc "$N/etc"

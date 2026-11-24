@@ -114,6 +114,7 @@ class AgentSettings {
     this.telegramBotToken,
     this.telegramAllowedUsers,
     this.telegramApiUrl,
+    this.telegramMaxFileMB,
   });
 
   /// Anthropic's API (or a gateway that speaks it).
@@ -175,6 +176,10 @@ class AgentSettings {
   /// Another Bot API server; `https://api.telegram.org` when null.
   final String? telegramApiUrl;
 
+  /// The largest photo or file taken from a chat, in MB; 20 when null (what Telegram's own server
+  /// lets a bot download; more needs a local Bot API server as [telegramApiUrl]).
+  final num? telegramMaxFileMB;
+
   Map<String, Object?> toJson() => {
         'provider': provider,
         if (baseUrl != null) 'baseUrl': baseUrl,
@@ -190,6 +195,7 @@ class AgentSettings {
         if (telegramBotToken != null) 'telegramBotToken': telegramBotToken,
         if (telegramAllowedUsers != null) 'telegramAllowedUsers': telegramAllowedUsers,
         if (telegramApiUrl != null) 'telegramApiUrl': telegramApiUrl,
+        if (telegramMaxFileMB != null) 'telegramMaxFileMB': telegramMaxFileMB,
       };
 
   @override

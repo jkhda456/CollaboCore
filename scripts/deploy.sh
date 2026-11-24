@@ -10,6 +10,8 @@
 #
 # DIR: the argument, else $COLLABO_DEPLOY_DIR, else the first line of .deploy-target (a local file,
 # not committed: each machine has its own target, e.g. a VirtualBox shared folder).
+# DIR must already hold CollaboCore32.bmp (as a copy of this tree does): deploy does not start
+# otherwise, because rsync --delete would empty a wrong folder. A new target: `build.py export DIR`.
 #
 # The source copy deletes what no longer exists in the tree (dist/ at the target excepted).
 # dist/ is mirrored, except that runtimes and release archives of platforms this machine does not
@@ -39,6 +41,15 @@ DEST="${DEST/#\~/$HOME}"
 [[ -d "$DEST" ]] || { echo "the target $DEST does not exist (is the shared folder mounted?)" >&2; exit 1; }
 DEST="$(cd "$DEST" && pwd)"
 [[ "$DEST" != "$ROOT" ]] || { echo "the target is this tree" >&2; exit 2; }
+# rsync --delete removes whatever DIR holds that this tree does not, so a mistyped or unmounted
+# target would be emptied. Only a folder that already holds a copy of collaboCore (its logo,
+# CollaboCore32.bmp, at the top) is deployed to; a new one is filled first with `build.py export DIR`.
+MARK=CollaboCore32.bmp
+[[ -f "$DEST/$MARK" ]] || {
+  echo "the target $DEST has no $MARK, so it does not look like a collaboCore copy; nothing done" >&2
+  echo "(a new target: python3 build.py export $DEST first)" >&2
+  exit 1
+}
 command -v rsync >/dev/null || { echo "rsync is needed" >&2; exit 1; }
 
 if [[ -n "$RELEASE" && -z "$CHECK" && -z "${DRY:-}" ]]; then

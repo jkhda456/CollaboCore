@@ -1,0 +1,359 @@
+Samba 4.25 (smbclient) for Linux compiled to WebAssembly, the collaboCore guest.
+
+The build (tools/build-samba.sh) cross-compiles with --cross-compile --hostcc=clang-19:
+- buildtools/wafsamba/wafsamba.py: --hostcc is stored but nothing used it, so the build's own
+  tools (Heimdal's asn1_compile and compile_et, which the build runs) came out as WebAssembly.
+  The use_hostcc targets are now compiled and linked with that compiler, without the target's
+  CPPFLAGS and LDFLAGS.
+
+No fork(): there is no MMU, so fork() and vfork() do not exist (unistd.h does not declare them).
+- lib/replace (and Heimdal's roken.h, which does not include replace.h): rep_fork() fails with
+  ENOSYS, so the code that has a fork still compiles and links. None of it is live in smbclient
+  (the linker drops rep_fork: background jobs, daemons, smbrun, popen, Heimdal's simple_exec,
+  the dns_ex resolver's child), and shell escapes go through system(), musl's posix_spawn.
+- tests/fcntl_lock.c, the configure check for fcntl locks, runs its child as the same program
+  started again with posix_spawn instead of forking.
+
+No mmap() in the C library:
+- lib/util/util.c: anonymous_shared_allocate() is plain zeroed memory. An anonymous shared
+  mapping is shared only with children made by fork, which do not exist here.
+- tdb is built without robust-mutex locking (it needs the file mapped), so a request for it is
+  no longer an error message every time a client opens gencache.tdb (tdb_wrap, dbwrap_open).
+
+Calls through a pointer of another type (WebAssembly checks the type and traps):
+- lib/util/stable_sort.c: the two-argument compare function was called as a three-argument
+  one; a trampoline takes it as the context.
+- libcli/smbreadline/smbreadline.c: the void callback was called as readline's int-returning
+  rl_event_hook; a wrapper of the right type. And it is installed for GNU readline only: libedit's
+  readline (python/deps', here) calls the hook in a busy loop while it waits for a key and then
+  reads the input a byte at a time, which breaks multibyte (UTF-8) input.
+
+diff --git a/buildtools/wafsamba/wafsamba.py b/buildtools/wafsamba/wafsamba.py
+index 20e223f..72ea513 100644
+--- a/buildtools/wafsamba/wafsamba.py
++++ b/buildtools/wafsamba/wafsamba.py
+@@ -544,7 +544,8 @@ def SAMBA_BINARY(bld, binname, source,
+         install_path   = None,
+         samba_inst_path= install_path,
+         samba_install  = install,
+-        samba_ldflags  = pie_ldflags
++        samba_ldflags  = pie_ldflags,
++        samba_use_hostcc = use_hostcc
+         )
+ 
+     if manpages is not None and 'XSLTPROC_MANPAGES' in bld.env and bld.env['XSLTPROC_MANPAGES']:
+@@ -553,6 +554,23 @@ def SAMBA_BINARY(bld, binname, source,
+ Build.BuildContext.SAMBA_BINARY = SAMBA_BINARY
+ 
+ 
++@TaskGen.feature('c')
++@TaskGen.before_method('process_source', 'apply_link')
++def samba_hostcc_env(self):
++    '''when cross-compiling with --hostcc, compile and link the use_hostcc targets
++    (the build's own tools, such as Heimdal's asn1_compile and compile_et, which the
++    build runs) with that compiler, without the target's CPPFLAGS and LDFLAGS'''
++    if not getattr(self, 'samba_use_hostcc', False):
++        return
++    if not self.env.CROSS_COMPILE or not self.env.HOSTCC:
++        return
++    self.env = self.env.derive()
++    self.env.CC = Utils.to_list(self.env.HOSTCC)
++    self.env.LINK_CC = Utils.to_list(self.env.HOSTCC)
++    self.env.CPPFLAGS = []
++    self.env.LDFLAGS = []
++
++
+ #################################################################
+ def SAMBA_MODULE(bld, modname, source,
+                  deps='',
+diff --git a/lib/replace/replace.c b/lib/replace/replace.c
+index dd07e6c..fb4b6c9 100644
+--- a/lib/replace/replace.c
++++ b/lib/replace/replace.c
+@@ -71,6 +71,14 @@ int rep_ftruncate(int f, off_t l)
+ #endif /* HAVE_FTRUNCATE */
+ 
+ 
++#if defined(__wasm__) && !defined(_SAMBA_HOSTCC_)
++pid_t rep_fork(void)
++{
++	errno = ENOSYS;
++	return -1;
++}
++#endif
++
+ #ifndef HAVE_STRLCPY
+ /*
+  * Like strncpy but does not 0 fill the buffer and always null
+diff --git a/lib/replace/replace.h b/lib/replace/replace.h
+index 538d1f4..e084ff0 100644
+--- a/lib/replace/replace.h
++++ b/lib/replace/replace.h
+@@ -172,6 +172,15 @@
+ #include <unistd.h>
+ #endif
+ 
++#if defined(__wasm__) && !defined(_SAMBA_HOSTCC_)
++/* WebAssembly (the collaboCore guest) has no fork() or vfork(): a process
++ * cannot copy itself, others are started with posix_spawn(). What still
++ * calls them gets -1 and ENOSYS. */
++#define fork rep_fork
++#define vfork rep_fork
++pid_t rep_fork(void);
++#endif
++
+ #ifdef HAVE_STRING_H
+ #include <string.h>
+ #endif
+diff --git a/lib/tdb_wrap/tdb_wrap.c b/lib/tdb_wrap/tdb_wrap.c
+index 6e47760..cd1e010 100644
+--- a/lib/tdb_wrap/tdb_wrap.c
++++ b/lib/tdb_wrap/tdb_wrap.c
+@@ -151,8 +151,14 @@ struct tdb_wrap *tdb_wrap_open(TALLOC_CTX *mem_ctx,
+ 
+ 		if (tdb_flags & TDB_MUTEX_LOCKING) {
+ 			if (!tdb_runtime_check_for_robust_mutexes()) {
++#ifdef USE_TDB_MUTEX_LOCKING
+ 				DBG_ERR("mutexes requested but not "
+ 					"available\n");
++#else
++				/* tdb built without them (no mmap): not news */
++				DBG_INFO("mutexes requested but not "
++					 "available\n");
++#endif
+ 				tdb_flags &= ~TDB_MUTEX_LOCKING;
+ 			}
+ 		}
+diff --git a/lib/util/stable_sort.c b/lib/util/stable_sort.c
+index 47667c4..8856913 100644
+--- a/lib/util/stable_sort.c
++++ b/lib/util/stable_sort.c
+@@ -219,22 +219,30 @@ bool stable_sort_talloc_r(TALLOC_CTX *mem_ctx,
+ }
+ 
+ 
++/*
++ * The two-argument cmpfn is called by a three-argument one that has it as
++ * its context: calling it through the three-argument type (one argument
++ * the callee does not take) works on most ABIs, but WebAssembly checks the
++ * type of each indirect call and traps.
++ */
++struct stable_sort_cmp {
++	samba_compare_fn_t fn;
++};
++
++static int stable_sort_call_cmp(const void *a, const void *b, void *opaque)
++{
++	const struct stable_sort_cmp *cmp = opaque;
++	return cmp->fn(a, b);
++}
++
+ bool stable_sort(void *array, void *aux,
+ 		 size_t n,
+ 		 size_t s,
+ 		 samba_compare_fn_t cmpfn)
+ {
+-	/*
+-	 * What is this magic, casting cmpfn into a different type that takes
+-	 * an extra parameter? Is that allowed?
+-	 *
+-	 * A: Yes. It's fine. The extra argument will be passed on the stack
+-	 * or (more likely) a register, and the cmpfn will remain blissfully
+-	 * unaware.
+-	 */
+-	return stable_sort_r(array, aux, n, s,
+-			     (samba_compare_with_context_fn_t)cmpfn,
+-			     NULL);
++	struct stable_sort_cmp cmp = { .fn = cmpfn };
++
++	return stable_sort_r(array, aux, n, s, stable_sort_call_cmp, &cmp);
+ }
+ 
+ 
+@@ -244,7 +252,8 @@ bool stable_sort_talloc(TALLOC_CTX *mem_ctx,
+ 			size_t s,
+ 			samba_compare_fn_t cmpfn)
+ {
++	struct stable_sort_cmp cmp = { .fn = cmpfn };
++
+ 	return stable_sort_talloc_r(mem_ctx, array, n, s,
+-				    (samba_compare_with_context_fn_t)cmpfn,
+-				    NULL);
++				    stable_sort_call_cmp, &cmp);
+ }
+diff --git a/lib/util/util.c b/lib/util/util.c
+index bd610fa..ec18ecc 100644
+--- a/lib/util/util.c
++++ b/lib/util/util.c
+@@ -1166,7 +1166,17 @@ void *anonymous_shared_allocate(size_t orig_bufsz)
+ 		return NULL;
+ 	}
+ 
+-#ifdef MAP_ANON
++#ifndef HAVE_MMAP
++	/*
++	 * No mmap() (the collaboCore guest): nor is there fork(), the only
++	 * way another process would share an anonymous mapping, so plain
++	 * zeroed memory is the same thing here.
++	 */
++	buf = calloc(1, bufsz);
++	if (buf == NULL) {
++		return NULL;
++	}
++#elif defined(MAP_ANON)
+ 	/* BSD */
+ 	buf = mmap(NULL, bufsz, PROT_READ|PROT_WRITE, MAP_ANON|MAP_SHARED,
+ 			-1 /* fd */, 0 /* offset */);
+@@ -1188,9 +1198,11 @@ void *anonymous_shared_allocate(size_t orig_bufsz)
+ }
+ #endif
+ 
++#ifdef HAVE_MMAP
+ 	if (buf == MAP_FAILED) {
+ 		return NULL;
+ 	}
++#endif
+ 
+ 	hdr = (struct anonymous_shared_header *)buf;
+ 	hdr->u.length = bufsz;
+@@ -1276,7 +1288,11 @@ void anonymous_shared_free(void *ptr)
+ 
+ 	hdr--;
+ 
++#ifdef HAVE_MMAP
+ 	munmap(hdr, hdr->u.length);
++#else
++	free(hdr);
++#endif
+ }
+ 
+ #ifdef DEVELOPER
+diff --git a/libcli/smbreadline/smbreadline.c b/libcli/smbreadline/smbreadline.c
+index 0a95c63..f99526a 100644
+--- a/libcli/smbreadline/smbreadline.c
++++ b/libcli/smbreadline/smbreadline.c
+@@ -107,6 +107,20 @@ static char *smb_readline_replacement(const char *prompt, void (*callback)(void)
+ 	return NULL;
+ }
+ 
++#if defined(HAVE_LIBREADLINE) && defined(HAVE_DECL_RL_EVENT_HOOK)
++/*
++ * rl_event_hook returns an int: calling the void callback through it
++ * is a call of another type, which WebAssembly checks (and traps on).
++ */
++static void (*smb_readline_event_callback)(void);
++
++static int smb_readline_event_hook(void)
++{
++	smb_readline_event_callback();
++	return 0;
++}
++#endif
++
+ /****************************************************************************
+  Display the prompt and wait for input. Call callback() regularly.
+ ****************************************************************************/
+@@ -145,9 +159,16 @@ char *smb_readline(const char *prompt, void (*callback)(void),
+ 		rl_basic_word_break_characters = " \t\n";
+ 	}
+ 
+-#ifdef HAVE_DECL_RL_EVENT_HOOK
+-	if (callback)
+-		rl_event_hook = (rl_hook_func_t *)callback;
++#if defined(HAVE_DECL_RL_EVENT_HOOK) && defined(RL_VERSION_MAJOR)
++	/*
++	 * GNU readline only (it defines RL_VERSION_MAJOR): libedit's
++	 * readline calls the hook in a busy loop while no key is there,
++	 * reading the keys a byte at a time (which breaks multibyte input)
++	 */
++	if (callback) {
++		smb_readline_event_callback = callback;
++		rl_event_hook = smb_readline_event_hook;
++	}
+ #endif
+ 	ret = readline(prompt);
+ 	if (ret && *ret)
+diff --git a/source3/lib/dbwrap/dbwrap_open.c b/source3/lib/dbwrap/dbwrap_open.c
+index eaf9092..f831b20 100644
+--- a/source3/lib/dbwrap/dbwrap_open.c
++++ b/source3/lib/dbwrap/dbwrap_open.c
+@@ -128,8 +128,14 @@ struct db_context *db_open_ex(TALLOC_CTX *mem_ctx,
+ 			if (tdb_runtime_check_for_robust_mutexes()) {
+ 				tdb_flags |= TDB_MUTEX_LOCKING;
+ 			} else {
++#ifdef USE_TDB_MUTEX_LOCKING
+ 				DBG_ERR("mutexes requested but not "
+ 					"available\n");
++#else
++				/* tdb built without them (no mmap) */
++				DBG_INFO("mutexes requested but not "
++					 "available\n");
++#endif
+ 			}
+ 		}
+ 
+diff --git a/tests/fcntl_lock.c b/tests/fcntl_lock.c
+index 242b9f7..1091a93 100644
+--- a/tests/fcntl_lock.c
++++ b/tests/fcntl_lock.c
+@@ -21,6 +21,10 @@
+ #endif
+ 
+ #include <errno.h>
++#ifdef __wasm__
++#include <spawn.h>
++#include <string.h>
++#endif
+ 
+ static int sys_waitpid(pid_t pid,int *status,int options)
+ {
+@@ -50,8 +54,14 @@ int main(int argc, char *argv[])
+ 
+ 	alarm(10);
+ 
++#ifdef __wasm__
++	/* no fork in the guest: the child is this program started again */
++	if (argc > 1 && strcmp(argv[1], "child") == 0) {
++		sleep(2);
++#else
+ 	if (!(pid=fork())) {
+ 		sleep(2);
++#endif
+ 		fd = open(DATA, O_RDONLY);
+ 
+ 		if (fd == -1) {
+@@ -80,6 +90,15 @@ int main(int argc, char *argv[])
+ 		}
+ 	}
+ 
++#ifdef __wasm__
++	{
++		char *args[] = { argv[0], "child", NULL };
++		if (posix_spawn(&pid, argv[0], NULL, NULL, args, NULL) != 0) {
++			fprintf(stderr,"ERROR: failed to start the child\n");
++			exit(1);
++		}
++	}
++#endif
+ 	unlink(DATA);
+ 	fd = open(DATA, O_RDWR|O_CREAT|O_EXCL, 0600);
+ 
+diff --git a/third_party/heimdal_build/roken.h b/third_party/heimdal_build/roken.h
+index 4740a3d..0441c10 100644
+--- a/third_party/heimdal_build/roken.h
++++ b/third_party/heimdal_build/roken.h
+@@ -6,6 +6,14 @@
+ 
+ #include "config.h"
+ 
++#if defined(__wasm__) && !defined(_SAMBA_HOSTCC_)
++/* no fork() or vfork() in the guest: lib/replace's rep_fork() fails with ENOSYS */
++#include <sys/types.h>
++#define fork rep_fork
++#define vfork rep_fork
++pid_t rep_fork(void);
++#endif
++
+ /* path to sysconf - should we force this to samba LIBDIR ? */
+ #define SYSCONFDIR "/etc"
+ 

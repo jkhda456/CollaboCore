@@ -194,6 +194,12 @@ if [[ "$MODE" == "--all" ]]; then
   fi
   tail -1 "$log"
 
+  echo "== smbclient: SMB1 to SMB3.11, signing, encryption, share lists, tar, Korean names, a terminal (a Samba server on loopback)"
+  if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_smbclient.py" >"$log" 2>&1; then
+    grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: smbclient"; exit 1
+  fi
+  tail -1 "$log"
+
   echo "== rg, column, scp, zip, perl: what agents reach for (perl's children without fork), in the guest"
   if ! COLLABO_RUNTIME="$runtime" python3 "$ROOT/tools/tests/test_agent_tools.py" >"$log" 2>&1; then
     grep -A3 "^FAIL" "$log" | head -30; echo "FAIL: agent tools"; exit 1
