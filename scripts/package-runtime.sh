@@ -14,8 +14,9 @@
 #     app/images/addons/*             add-ons, off unless the app asks (addons/README.md)
 #     app/licenses/*
 #     manifest.json                   { platform, engine, protocol, entry, addons, files }
-#                                     (files: every file's sha256, but launcher.conf, which is
-#                                     meant to be edited)
+#                                     (scripts/runtime-manifest.py; files: the sha256 of the
+#                                     launcher, bin/ and app/, not launcher.conf, which is meant
+#                                     to be edited; release.sh writes it again from what is there)
 #
 # Start it as:  <dir>/bin/collabo-core-engine <entry arguments…> --stdio
 # (the Dart package reads `entry` from the manifest and adds --stdio; see dart/collabo_core).
@@ -104,32 +105,8 @@ for platform in $PLATFORMS; do
   [[ -d "$ENGINE/images/addons" ]] && cp -r "$ENGINE/images/addons" "$dir/app/images/addons"
   cp -r "$ENGINE/licenses" "$dir/app/licenses"
 
-  "$PYTHON" - "$dir" "$platform" "$exe" <<'PY'
-import json, os, sys, hashlib
-d, platform, exe = sys.argv[1:]
-files = {}
-for root, _, names in os.walk(d):
-    for n in names:
-        if n == ".DS_Store" or n.startswith("._"):
-            continue  # macOS's (Finder, AppleDouble): release.sh leaves them out of the archive
-        p = os.path.join(root, n)
-        rel = os.path.relpath(p, d).replace(os.sep, "/")
-        if rel not in ("manifest.json", "launcher.conf"):
-            files[rel] = hashlib.sha256(open(p, "rb").read()).hexdigest()
-entry = ["bin/" + exe,
-         "--kernel", "app/images/vmlinux.wasm",
-         "--initramfs", "app/images/initramfs.cpio",
-         "--python-image", "app/images/python.cpio"]
-if os.path.exists(os.path.join(d, "app/images/tools.cpio")):
-    entry += ["--tools-image", "app/images/tools.cpio"]
-addons_dir = os.path.join(d, "app/images/addons")
-addons = sorted(n[:-5] for n in os.listdir(addons_dir) if n.endswith(".cpio")) if os.path.isdir(addons_dir) else []
-if addons:
-    entry += ["--addon-dir", "app/images/addons"]
-json.dump({"name": "collabo-core-runtime", "platform": platform, "engine": "wasmtime", "protocol": 1,
-           "entry": entry, "addons": addons, "files": dict(sorted(files.items()))},
-          open(os.path.join(d, "manifest.json"), "w"), indent=1)
-PY
+  # what release.sh writes again before it archives the folder (an image may change after this)
+  "$PYTHON" "$ROOT/scripts/runtime-manifest.py" "$dir"
 
   if [[ -n "${ARCHIVE:-}" ]]; then
     case "$platform" in

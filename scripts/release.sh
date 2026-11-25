@@ -13,6 +13,12 @@
 #   scripts/release.sh --build         build first (this platform's runtime and the web page)
 #   scripts/release.sh --index DIR     only rewrite DIR's VERSION file list and SHA256SUMS
 #
+# Each runtime's manifest.json is written again from its folder just before it is archived
+# (scripts/runtime-manifest.py): an image put into dist/runtime/*/app/images/ after packaging (a
+# rebuilt .cpio, an add-on) is then what the manifest lists, as `launcher --update --apply`
+# requires (it checks every file against the manifest's sha256). Only the manifests that differ
+# are rewritten; each platform gets a line saying what changed.
+#
 # Releases accumulate: an archive is replaced only when its platform is packed again, so the
 # runtimes built on other machines (Windows, macOS) stay next to this one's, and VERSION and
 # SHA256SUMS always cover every archive in the folder. The engine is native code and is built
@@ -71,6 +77,7 @@ for dir in "$ROOT"/dist/runtime/collabo-core-*/; do
   platform="$(basename "$dir")"; platform="${platform#collabo-core-}"
   if [[ -n "${PLATFORMS:-}" && " $PLATFORMS " != *" $platform "* ]]; then continue; fi
   echo "== $platform"
+  "$PYTHON" "$ROOT/scripts/runtime-manifest.py" "$dir"
   rm -f "$OUT/collabo-core-$platform.zip" "$OUT/collabo-core-$platform.tar.gz"
   case "$platform" in
     win-*) (cd "$ROOT/dist/runtime" && "$PYTHON" -c "

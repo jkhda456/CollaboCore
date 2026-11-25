@@ -11,8 +11,10 @@
 //! - It is unpacked in `.update/` in the runtime folder before anything else changes; a broken
 //!   download fails there (the zip's CRCs, gzip's, the size GitHub gives for a download). Its
 //!   manifest.json must list the launcher and the engine, and every file it lists must be in the
-//!   archive; the sha256 sums it gives are not compared: releases put together from several
-//!   machines' builds have held newer images than their manifests list (0.2.17's).
+//!   archive with the sha256 it gives, unless `--force`, which only warns about those files.
+//!   (release.sh writes each manifest again from its folder as it archives it; 0.2.17's win/mac
+//!   archives, packed before that, held newer images than their manifests list: they need
+//!   --force.)
 //! - Each file of the new manifest, then manifest.json, takes the place of the old one, which is
 //!   moved into `.update/` first; the old manifest's files the new one no longer has go there
 //!   too. Moves, not copies or deletes: a program that is running (this launcher, the engine of a
@@ -98,13 +100,13 @@ pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
     }
     if let Some(archive) = &request.archive {
         let archive = archive.canonicalize().map_err(|e| format!("{}: {e}", archive.display()))?;
-        return apply(&archive, &place.base, None, &runs).map(|()| 0);
+        return apply(&archive, &place.base, None, request.force, &runs).map(|()| 0);
     }
     if request.apply {
         let here = std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?;
         if let Some((archive, version)) = downloaded(&[here, place.base.clone()], request.force) {
             println!("{} (downloaded before): collaboCore {version}, this runtime {VERSION}", archive.display());
-            return apply(&archive, &place.base, Some(&version), &runs).map(|()| 0);
+            return apply(&archive, &place.base, Some(&version), request.force, &runs).map(|()| 0);
         }
     }
 
@@ -125,7 +127,7 @@ pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
     if request.apply {
         std::fs::create_dir_all(&work).map_err(|e| format!("making {}: {e}", work.display()))?;
         let file = work.join(format!("{}-{}", std::process::id(), release.name));
-        let result = fetch(&release, &file).and_then(|()| apply(&file, &place.base, Some(&release.tag), &runs));
+        let result = fetch(&release, &file).and_then(|()| apply(&file, &place.base, Some(&release.tag), request.force, &runs));
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&work);
         return result.map(|()| 0);
@@ -259,8 +261,7 @@ fn join(base: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(base.to_path_buf(), |path, part| path.join(part))
 }
 
-/// A file's sha256 (the tests' manifests).
-#[cfg(test)]
+/// A file's sha256, as manifests give it (lowercase hex).
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
@@ -368,8 +369,9 @@ fn manifest_files(manifest: &serde_json::Value) -> Option<Vec<(String, String)>>
     Some(files.iter().map(|(rel, sum)| (rel.clone(), sum.as_str().unwrap_or("").to_string())).collect())
 }
 
-/// Unpacks the archive into `new` and checks it against its manifest.
-fn stage(archive: &Path, new: &Path, base: &Path) -> Result<Staged, String> {
+/// Unpacks the archive into `new` and checks it against its manifest; `force`: files that are not
+/// what their sha256 says go in all the same (with a warning).
+fn stage(archive: &Path, new: &Path, base: &Path, force: bool) -> Result<Staged, String> {
     std::fs::create_dir_all(new).map_err(|e| format!("making {}: {e}", new.display()))?;
     let unpacked = unpack(archive, new)?;
     let text = std::fs::read_to_string(join(new, MANIFEST)).map_err(|_| "it has no manifest.json (not a collaboCore runtime?)")?;
@@ -381,12 +383,31 @@ fn stage(archive: &Path, new: &Path, base: &Path) -> Result<Staged, String> {
     // launcher.conf is the user's whatever a manifest says (it is not unpacked).
     let files: Vec<(String, String)> =
         manifest_files(&manifest).ok_or("its manifest.json has no file list")?.into_iter().filter(|(rel, _)| rel != CONF).collect();
-    // Only that the files are there: the sums are not compared (module comment).
-    for (rel, _) in &files {
+    // What each file is (its sha256, which --force may let differ from the manifest's).
+    let mut actual = Vec::with_capacity(files.len());
+    let mut differ = Vec::new();
+    for (rel, sum) in &files {
         safe(rel).map_err(|e| format!("its manifest.json: {e}"))?;
-        if !join(new, rel).is_file() {
+        let path = join(new, rel);
+        if !path.is_file() {
             return Err(format!("{rel}: its manifest.json lists it, and the archive does not have it"));
         }
+        let is = sha256(&path).map_err(|e| format!("{rel}: {e}"))?;
+        if !is.eq_ignore_ascii_case(sum) {
+            differ.push(rel.as_str());
+        }
+        actual.push((rel.clone(), is));
+    }
+    if !differ.is_empty() {
+        let (what, them) = if differ.len() == 1 { ("the file", "it") } else { ("the files", "them") };
+        let which = differ.join(", ");
+        if !force {
+            return Err(format!(
+                "{which}: not {what} its manifest.json lists (another sha256: a broken download, or a manifest older \
+                 than the files packed with it; --force puts {them} in place all the same)"
+            ));
+        }
+        eprintln!("update: {which}: not {what} its manifest.json lists (another sha256); put in place all the same (--force)");
     }
     let engine = manifest["entry"][0].as_str().unwrap_or("");
     for needed in [LAUNCHER, engine] {
@@ -412,7 +433,7 @@ fn stage(archive: &Path, new: &Path, base: &Path) -> Result<Staged, String> {
     for left_out in unpacked.iter().filter(|rel| !listed.contains(*rel) && *rel != MANIFEST) {
         eprintln!("update: left out {left_out} (its manifest.json does not list it)");
     }
-    let changed = files.iter().filter(|file| !old.contains(file)).count();
+    let changed = actual.iter().filter(|(rel, is)| !old.iter().any(|(was, sum)| was == rel && sum.eq_ignore_ascii_case(is))).count();
     let mut install: Vec<String> = files.into_iter().map(|(rel, _)| rel).collect();
     install.push(MANIFEST.into());
     let remove = old.into_iter().map(|(rel, _)| rel).filter(|rel| !listed.contains(rel) && rel != CONF).collect();
@@ -478,14 +499,15 @@ fn runs(path: &Path) -> Result<(), String> {
 }
 
 /// Puts the runtime in `archive` in place of the one in `base` (module comment). `tag`: the
-/// release's version, for the message; `runs`: whether a launcher runs.
-fn apply(archive: &Path, base: &Path, tag: Option<&str>, runs: &dyn Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+/// release's version, for the message; `force`: files that are not what the manifest's sha256 says
+/// go in all the same; `runs`: whether a launcher runs.
+fn apply(archive: &Path, base: &Path, tag: Option<&str>, force: bool, runs: &dyn Fn(&Path) -> Result<(), String>) -> Result<(), String> {
     let work = base.join(WORK);
     let id = std::process::id();
     let (new, old) = (work.join(format!("new-{id}")), work.join(format!("old-{id}")));
     let _ = std::fs::remove_dir_all(&new);
     let _ = std::fs::remove_dir_all(&old);
-    let staged = stage(archive, &new, base);
+    let staged = stage(archive, &new, base, force);
     let mut moves = Moves::default();
     let outcome = staged.and_then(|staged| {
         let swapped = swap(base, &new, &old, &staged, &mut moves)
@@ -662,7 +684,7 @@ mod tests {
     fn an_update_replaces_the_runtime_and_keeps_what_is_yours() {
         let Some((dir, base, archive)) = scene("ok", &|_| {}) else { return };
         let seen = std::cell::RefCell::new(None);
-        apply(&archive, &base, Some("9.9.9"), &|launcher| {
+        apply(&archive, &base, Some("9.9.9"), false, &|launcher| {
             *seen.borrow_mut() = std::fs::read_to_string(launcher).ok();
             Ok(())
         })
@@ -686,7 +708,7 @@ mod tests {
         }
         // A runtime without launcher.conf stays without one.
         std::fs::remove_file(base.join(CONF)).unwrap();
-        apply(&archive, &base, Some("9.9.9"), &|_| Ok(())).unwrap();
+        apply(&archive, &base, Some("9.9.9"), false, &|_| Ok(())).unwrap();
         assert!(!base.join(CONF).exists() && !base.join("launcher.conf.new").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -694,20 +716,43 @@ mod tests {
     #[test]
     fn a_new_launcher_that_does_not_run_puts_everything_back() {
         let Some((dir, base, archive)) = scene("undo", &|_| {}) else { return };
-        let error = apply(&archive, &base, Some("9.9.9"), &|_| Err("exec format error".into())).unwrap_err();
+        let error = apply(&archive, &base, Some("9.9.9"), false, &|_| Err("exec format error".into())).unwrap_err();
         assert!(error.contains("exec format error") && error.contains("as it was"), "{error}");
         as_it_was(&base);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 0.2.17's archives held newer images than their manifests list: they go in all the same.
+    /// A file that is not what the manifest's sha256 says (0.2.17's win/mac archives held newer
+    /// images than their manifests list): nothing changes, the launcher is not even tried;
+    /// with --force it goes in all the same.
     #[test]
-    fn files_that_are_not_what_the_manifest_sums_say_go_in_all_the_same() {
-        let changed = |release: &Path| std::fs::write(join(release, ENGINE), "not what the manifest says").unwrap();
+    fn a_file_that_is_not_what_the_manifest_says_changes_nothing_but_with_force() {
+        let changed = |release: &Path| {
+            std::fs::write(join(release, "app/images/k"), "a newer kernel").unwrap();
+            std::fs::write(join(release, ENGINE), "a newer engine").unwrap();
+        };
         let Some((dir, base, archive)) = scene("sums", &changed) else { return };
-        apply(&archive, &base, Some("9.9.9"), &|_| Ok(())).unwrap();
-        assert_eq!(read(&base, ENGINE).as_deref(), Some("not what the manifest says"));
+        let error = apply(&archive, &base, Some("9.9.9"), false, &|_| panic!("the launcher was tried")).unwrap_err();
+        let (named, _) = error.split_once(": not the files its manifest.json lists").expect(&error);
+        assert!(named.ends_with(&format!("{ENGINE}, app/images/k")) || named.ends_with(&format!("app/images/k, {ENGINE}")), "{error}");
+        assert!(error.contains("--force puts them in place") && error.contains("release.tar.gz"), "{error}");
+        as_it_was(&base);
+        assert_eq!(read(&base, "app/images/k").as_deref(), Some("kernel"));
+        apply(&archive, &base, Some("9.9.9"), true, &|_| Ok(())).unwrap();
+        assert_eq!(read(&base, "app/images/k").as_deref(), Some("a newer kernel"));
+        assert_eq!(read(&base, ENGINE).as_deref(), Some("a newer engine"));
         assert_eq!(read(&base, LAUNCHER).as_deref(), Some("new launcher"));
+        assert_eq!(read(&base, CONF).as_deref(), Some("my conf"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn force_does_not_make_up_for_a_missing_file() {
+        let missing = |release: &Path| std::fs::remove_file(join(release, "app/licenses/new.txt")).unwrap();
+        let Some((dir, base, archive)) = scene("force-missing", &missing) else { return };
+        let error = apply(&archive, &base, None, true, &|_| Ok(())).unwrap_err();
+        assert!(error.contains("app/licenses/new.txt: its manifest.json lists it, and the archive does not have it"), "{error}");
+        as_it_was(&base);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -715,10 +760,10 @@ mod tests {
     fn a_broken_archive_changes_nothing() {
         let missing = |release: &Path| std::fs::remove_file(join(release, "app/licenses/new.txt")).unwrap();
         let Some((dir, base, archive)) = scene("broken", &missing) else { return };
-        let error = apply(&archive, &base, None, &|_| Ok(())).unwrap_err();
+        let error = apply(&archive, &base, None, false, &|_| Ok(())).unwrap_err();
         assert!(error.contains("app/licenses/new.txt: its manifest.json lists it, and the archive does not have it"), "{error}");
         as_it_was(&base);
-        let error = apply(&base.join(CONF), &base, None, &|_| Ok(())).unwrap_err();
+        let error = apply(&base.join(CONF), &base, None, false, &|_| Ok(())).unwrap_err();
         assert!(error.contains("not a .tar.gz or a .zip"), "{error}");
         as_it_was(&base);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -732,7 +777,7 @@ mod tests {
         let at = bytes.len() - 8;
         bytes[at] ^= 0xff;
         std::fs::write(&archive, bytes).unwrap();
-        let error = apply(&archive, &base, None, &|_| Ok(())).unwrap_err();
+        let error = apply(&archive, &base, None, false, &|_| Ok(())).unwrap_err();
         assert!(error.contains("a broken download?"), "{error}");
         as_it_was(&base);
         std::fs::remove_dir_all(&dir).unwrap();

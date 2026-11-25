@@ -87,7 +87,9 @@ Usage:
                                           release's now, or FILE; launcher.conf, work/ and what
                                           you added stay; the old files go to .update/ and are
                                           removed after
-  launcher --update ... --force           the same when the release is not newer
+  launcher --update ... --force           the same when the release is not newer; --apply even
+                                          with files that are not what manifest.json lists
+                                          (another sha256: a warning names them)
   launcher --version                      the version (the engine's) and the platform
   launcher --help                         this text; bin/collabo-core-engine --help has the options
 
