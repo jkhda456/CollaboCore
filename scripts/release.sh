@@ -17,10 +17,17 @@
 # runtimes built on other machines (Windows, macOS) stay next to this one's, and VERSION and
 # SHA256SUMS always cover every archive in the folder. The engine is native code and is built
 # on its own OS; each machine adds its platform (CI collects them as artifacts).
+#
+# macOS's own files stay out of every archive: Finder's .DS_Store and the AppleDouble ._NAME
+# files (its tar writes them for extended attributes; on a shared or FAT volume they are real
+# files). No manifest lists them (package-runtime.sh skips them too).
 set -euo pipefail
 PYTHON="${PYTHON:-python3}"   # build.py passes its own interpreter
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/dist/release"
+# macOS's files left out (the header); COPYFILE_DISABLE keeps its tar from making ._ files.
+export COPYFILE_DISABLE=1
+NOT_OURS=(--exclude=.DS_Store --exclude='._*')
 
 # VERSION's file list and SHA256SUMS for everything in a release folder. VERSION's header (what
 # went in) is kept when there is one: --index runs on a folder another machine released into.
@@ -72,9 +79,10 @@ root = sys.argv[1]
 with zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED) as z:
     for base, _, names in os.walk(root):
         for name in names:
-            z.write(os.path.join(base, name))
+            if name != '.DS_Store' and not name.startswith('._'):
+                z.write(os.path.join(base, name))
 " "collabo-core-$platform" "$OUT/collabo-core-$platform.zip") ;;
-    *) tar -czf "$OUT/collabo-core-$platform.tar.gz" -C "$ROOT/dist/runtime" "collabo-core-$platform" ;;
+    *) tar "${NOT_OURS[@]}" -czf "$OUT/collabo-core-$platform.tar.gz" -C "$ROOT/dist/runtime" "collabo-core-$platform" ;;
   esac
   found=$((found + 1))
 done
@@ -82,7 +90,7 @@ done
 
 if [[ -d "$ROOT/dist/web" ]]; then
   echo "== web"
-  tar -czf "$OUT/collabo-core-web.tar.gz" -C "$ROOT/dist" web
+  tar "${NOT_OURS[@]}" -czf "$OUT/collabo-core-web.tar.gz" -C "$ROOT/dist" web
 fi
 
 # What is inside, so a published archive can be traced back to its sources.

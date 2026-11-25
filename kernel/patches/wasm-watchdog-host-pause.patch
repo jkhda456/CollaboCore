@@ -1,0 +1,139 @@
+The host can stop running the machine (a laptop's sleep, SIGSTOP, a debugger, a frozen browser
+tab, a VM the host runs in) while its wall clock, which get_now_nsec is, goes on. On resume
+jiffies leap by the whole pause, and RCU reported a grace period begun before it as a stall:
+"rcu_sched kthread timer wakeup didn't happen for N jiffies ... RCU_GP_WAIT_FQS(5)", "Possible
+timer handling issue", a self-detected stall with fqs=0. A KVM guest's watchdogs ask
+kvm_check_and_clear_guest_paused() before they report; the arch now answers it (its own
+asm/kvm_para.h instead of the generic one): yes when no cpu took a timer interrupt for more
+than 10 s just before, and then the stall timeouts restart, as pvclock_touch_watchdogs does.
+One KERN_DEBUG line in dmesg for each report dropped.
+
+diff --git a/arch/wasm/include/asm/Kbuild b/arch/wasm/include/asm/Kbuild
+index f2769be..4107751 100644
+--- a/arch/wasm/include/asm/Kbuild
++++ b/arch/wasm/include/asm/Kbuild
+@@ -1,5 +1,4 @@
+ generic-y += extable.h
+-generic-y += kvm_para.h
+ generic-y += qrwlock.h
+ generic-y += qrwlock_types.h
+ generic-y += qspinlock.h
+diff --git a/arch/wasm/kernel/time.c b/arch/wasm/kernel/time.c
+index df88707..ee991fa 100644
+--- a/arch/wasm/kernel/time.c
++++ b/arch/wasm/kernel/time.c
+@@ -6,6 +6,11 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
++#include <linux/atomic.h>
++#include <linux/kvm_para.h>
++#include <linux/math64.h>
++#include <linux/nmi.h>
++#include <linux/rcupdate.h>
+ #include <linux/timekeeping.h>
+ #include <asm/irq.h>
+ #include <asm/wasm_imports.h>
+@@ -85,9 +90,67 @@ late_initcall(wasm_sync_wall_clock);
+ 
+ static DEFINE_PER_CPU(struct clock_event_device, clockevent);
+ 
++/*
++ * The machine is a host process, and the host can stop running it for any length of time: a
++ * laptop's sleep, SIGSTOP, a debugger, a frozen browser tab, a VM the host itself runs in. Its
++ * clock goes on meanwhile (get_now_nsec is the host's wall clock), so jiffies leap by the whole
++ * pause at the first tick after it, and RCU, finding a grace period that began before it still
++ * open, reported a stall: "rcu_sched kthread timer wakeup didn't happen for N jiffies ...
++ * RCU_GP_WAIT_FQS(5)", "Possible timer handling issue", a self-detected stall with fqs=0.
++ *
++ * A KVM guest's host says when it stopped the guest (PVCLOCK_GUEST_STOPPED), and the stall
++ * watchdogs ask kvm_check_and_clear_guest_paused() before they report. This host says nothing,
++ * but there is a sign: no cpu took a timer interrupt for a long time. Even an idle guest takes
++ * some 20 a second, and a grace period in progress keeps RCU's own timer firing every few
++ * jiffies; a cpu stuck in the kernel leaves the others ticking, and its stall is reported.
++ * Longer than half RCU's stall timeout (21 s), since a shorter pause cannot make a healthy
++ * guest's grace period, milliseconds long, look stalled.
++ */
++#define HOST_PAUSE_NS		(10ULL * NSEC_PER_SEC)
++/* how long after such a pause a stall report is laid to it: the first ticks are where it comes */
++#define HOST_PAUSE_BLAME_NS	(10ULL * NSEC_PER_SEC)
++
++static atomic64_t last_timer_ns;	/* the latest timer interrupt, on any cpu */
++static atomic64_t pause_end_ns;		/* when the latest pause ended, until a watchdog asks */
++static atomic64_t pause_ns;		/* how long it was */
++
++/*
++ * The watchdogs' question (asm/kvm_para.h), asked when they are about to report (RCU: once
++ * jiffies have caught up with the pause, so the timeouts restarted here count from then on).
++ */
++bool kvm_check_and_clear_guest_paused(void)
++{
++	u64 end = atomic64_read_acquire(&pause_end_ns);
++
++	if (!end || atomic64_cmpxchg(&pause_end_ns, end, 0) != end)
++		return false;
++	if ((s64)(wasm_kernel_get_now_nsec() - end) > (s64)HOST_PAUSE_BLAME_NS)
++		return false;
++
++	/* pvclock_touch_watchdogs(); the stubs of those this kernel is built without too */
++	touch_softlockup_watchdog_sync();
++	rcu_cpu_stall_reset();
++	reset_hung_task_detector();
++	printk(KERN_DEBUG "wasm: stall report dropped: the host did not run the machine for %llu ms\n",
++	       div_u64(atomic64_read(&pause_ns), NSEC_PER_MSEC));
++	return true;
++}
++
+ static irqreturn_t timer_interrupt(int irq, void *dev)
+ {
+ 	struct clock_event_device *evt = this_cpu_ptr(&clockevent);
++	u64 now = wasm_kernel_get_now_nsec();
++	u64 last = atomic64_read_acquire(&last_timer_ns);
++
++	/*
++	 * Before the tick, which is where the stall watchdogs look. Cpus that resume together
++	 * may each see the gap; one that comes after it was published sees the pause noted.
++	 */
++	if (unlikely(last && (s64)(now - last) > (s64)HOST_PAUSE_NS)) {
++		atomic64_set(&pause_ns, now - last);
++		atomic64_set_release(&pause_end_ns, now);
++	}
++	atomic64_set_release(&last_timer_ns, now);
+ 
+ 	if (evt->event_handler)
+ 		evt->event_handler(evt);
+diff --git a/arch/wasm/include/asm/kvm_para.h b/arch/wasm/include/asm/kvm_para.h
+new file mode 100644
+index 000000000000..0e3e14eb6e6c
+--- /dev/null
++++ b/arch/wasm/include/asm/kvm_para.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_WASM_KVM_PARA_H
++#define _ASM_WASM_KVM_PARA_H
++
++#include <linux/types.h>
++#include <uapi/asm-generic/kvm_para.h>
++
++/*
++ * Not KVM, but the question the watchdogs ask with this, "did the host stop the machine?", is
++ * this host's too: arch/wasm/kernel/time.c answers it. The rest as asm-generic/kvm_para.h.
++ */
++bool kvm_check_and_clear_guest_paused(void);
++
++static inline unsigned int kvm_arch_para_features(void)
++{
++	return 0;
++}
++
++static inline unsigned int kvm_arch_para_hints(void)
++{
++	return 0;
++}
++
++static inline bool kvm_para_available(void)
++{
++	return false;
++}
++
++#endif

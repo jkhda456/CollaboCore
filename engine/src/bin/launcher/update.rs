@@ -4,12 +4,15 @@
 //! for another) has one archive per platform, `collabo-core-<platform>.tar.gz` (`.zip` for
 //! Windows), holding the runtime folder `collabo-core-<platform>/`. `--update` downloads this
 //! platform's into the current folder when the release is newer than this launcher;
-//! `--update --apply` (or `--update --apply FILE`, an archive already downloaded) puts it in
-//! place of this runtime:
+//! `--update --apply` puts one in place of this runtime: the newest that an earlier `--update`
+//! downloaded (in the current folder or the runtime's) when it is newer than this runtime, else
+//! the release's, downloaded then; `--update --apply FILE` that archive.
 //!
-//! - It is unpacked in `.update/` in the runtime folder and checked against the sha256 its
-//!   manifest.json gives for every file (the release has no checksums of its own) before
-//!   anything else changes.
+//! - It is unpacked in `.update/` in the runtime folder before anything else changes; a broken
+//!   download fails there (the zip's CRCs, gzip's, the size GitHub gives for a download). Its
+//!   manifest.json must list the launcher and the engine, and every file it lists must be in the
+//!   archive; the sha256 sums it gives are not compared: releases put together from several
+//!   machines' builds have held newer images than their manifests list (0.2.17's).
 //! - Each file of the new manifest, then manifest.json, takes the place of the old one, which is
 //!   moved into `.update/` first; the old manifest's files the new one no longer has go there
 //!   too. Moves, not copies or deletes: a program that is running (this launcher, the engine of a
@@ -97,6 +100,13 @@ pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
         let archive = archive.canonicalize().map_err(|e| format!("{}: {e}", archive.display()))?;
         return apply(&archive, &place.base, None, &runs).map(|()| 0);
     }
+    if request.apply {
+        let here = std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?;
+        if let Some((archive, version)) = downloaded(&[here, place.base.clone()], request.force) {
+            println!("{} (downloaded before): collaboCore {version}, this runtime {VERSION}", archive.display());
+            return apply(&archive, &place.base, Some(&version), &runs).map(|()| 0);
+        }
+    }
 
     let release = latest(&place.repo)?;
     let order = compare(&release.tag, VERSION);
@@ -109,7 +119,7 @@ pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
         return Ok(0);
     }
     if order != Ordering::Greater && !request.force {
-        println!("(--force {} it all the same)", if request.apply { "puts it in place" } else { "downloads" });
+        println!("(--force {} all the same)", if request.apply { "puts it in place" } else { "downloads it" });
         return Ok(0);
     }
     if request.apply {
@@ -123,8 +133,37 @@ pub fn command(args: &[String], place: &Place) -> Result<i32, String> {
     let here = std::env::current_dir().map_err(|e| format!("the current folder: {e}"))?;
     let to = here.join(download_name(&release));
     fetch(&release, &to)?;
-    println!("{}\n`launcher --update --apply {}` puts it in place of this runtime", to.display(), to.display());
+    println!("{}\n`launcher --update --apply` (from this folder or the runtime's) puts it in place of this runtime", to.display());
     Ok(0)
+}
+
+/// The version in the name of an archive `--update` downloaded for this platform
+/// (download_name), when it is one.
+fn downloaded_version(name: &str) -> Option<&str> {
+    let asset = archive_name(PLATFORM);
+    let ext = if asset.ends_with(".tar.gz") { ".tar.gz" } else { ".zip" };
+    let stem = &asset[..asset.len() - ext.len()];
+    let version = name.strip_prefix(stem)?.strip_prefix('-')?.strip_suffix(ext)?;
+    version_key(version).map(|_| version)
+}
+
+/// The newest archive an earlier `--update` downloaded into one of `dirs`, and its version:
+/// one newer than this runtime, or with --force any.
+fn downloaded(dirs: &[PathBuf], force: bool) -> Option<(PathBuf, String)> {
+    let mut best: Option<(PathBuf, String)> = None;
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(version) = downloaded_version(&name) else { continue };
+            if !entry.path().is_file() || (!force && compare(version, VERSION) != Ordering::Greater) {
+                continue;
+            }
+            if best.as_ref().map_or(true, |(_, newest)| compare(version, newest) == Ordering::Greater) {
+                best = Some((entry.path(), version.to_string()));
+            }
+        }
+    }
+    best
 }
 
 /// This platform's archive in a release.
@@ -220,6 +259,8 @@ fn join(base: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(base.to_path_buf(), |path, part| path.join(part))
 }
 
+/// A file's sha256 (the tests' manifests).
+#[cfg(test)]
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
@@ -340,11 +381,11 @@ fn stage(archive: &Path, new: &Path, base: &Path) -> Result<Staged, String> {
     // launcher.conf is the user's whatever a manifest says (it is not unpacked).
     let files: Vec<(String, String)> =
         manifest_files(&manifest).ok_or("its manifest.json has no file list")?.into_iter().filter(|(rel, _)| rel != CONF).collect();
-    for (rel, sum) in &files {
+    // Only that the files are there: the sums are not compared (module comment).
+    for (rel, _) in &files {
         safe(rel).map_err(|e| format!("its manifest.json: {e}"))?;
-        let actual = sha256(&join(new, rel)).map_err(|e| format!("{rel}: {e} (its manifest.json lists it)"))?;
-        if actual != *sum {
-            return Err(format!("{rel}: not the file its manifest.json lists (a broken download?)"));
+        if !join(new, rel).is_file() {
+            return Err(format!("{rel}: its manifest.json lists it, and the archive does not have it"));
         }
     }
     let engine = manifest["entry"][0].as_str().unwrap_or("");
@@ -576,9 +617,9 @@ mod tests {
         std::fs::read_to_string(join(dir, rel)).ok()
     }
 
-    /// An installed runtime and a release archive of a newer one, in a fresh folder; None
-    /// without a tar command.
-    fn scene(name: &str, break_it: bool) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    /// An installed runtime and a release archive of a newer one (`change` changes its folder
+    /// before it is packed), in a fresh folder; None without a tar command.
+    fn scene(name: &str, change: &dyn Fn(&Path)) -> Option<(PathBuf, PathBuf, PathBuf)> {
         let dir = std::env::temp_dir().join(format!("launcher-update-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let base = dir.join("rt");
@@ -594,9 +635,7 @@ mod tests {
             &[(LAUNCHER, "new launcher"), (ENGINE, "new engine"), ("app/images/k", "kernel"), ("app/licenses/new.txt", "new"), (&long, "long")],
             &[(CONF, "default conf")],
         );
-        if break_it {
-            std::fs::write(join(&release, ENGINE), "not what the manifest says").unwrap();
-        }
+        change(&release);
         let archive = dir.join("release.tar.gz");
         let made = Command::new("tar")
             .args(["-czf", archive.to_str().unwrap(), "-C", dir.join("release").to_str().unwrap(), &format!("collabo-core-{PLATFORM}")])
@@ -621,7 +660,7 @@ mod tests {
 
     #[test]
     fn an_update_replaces_the_runtime_and_keeps_what_is_yours() {
-        let Some((dir, base, archive)) = scene("ok", false) else { return };
+        let Some((dir, base, archive)) = scene("ok", &|_| {}) else { return };
         let seen = std::cell::RefCell::new(None);
         apply(&archive, &base, Some("9.9.9"), &|launcher| {
             *seen.borrow_mut() = std::fs::read_to_string(launcher).ok();
@@ -654,22 +693,76 @@ mod tests {
 
     #[test]
     fn a_new_launcher_that_does_not_run_puts_everything_back() {
-        let Some((dir, base, archive)) = scene("undo", false) else { return };
+        let Some((dir, base, archive)) = scene("undo", &|_| {}) else { return };
         let error = apply(&archive, &base, Some("9.9.9"), &|_| Err("exec format error".into())).unwrap_err();
         assert!(error.contains("exec format error") && error.contains("as it was"), "{error}");
         as_it_was(&base);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 0.2.17's archives held newer images than their manifests list: they go in all the same.
+    #[test]
+    fn files_that_are_not_what_the_manifest_sums_say_go_in_all_the_same() {
+        let changed = |release: &Path| std::fs::write(join(release, ENGINE), "not what the manifest says").unwrap();
+        let Some((dir, base, archive)) = scene("sums", &changed) else { return };
+        apply(&archive, &base, Some("9.9.9"), &|_| Ok(())).unwrap();
+        assert_eq!(read(&base, ENGINE).as_deref(), Some("not what the manifest says"));
+        assert_eq!(read(&base, LAUNCHER).as_deref(), Some("new launcher"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_broken_archive_changes_nothing() {
-        let Some((dir, base, archive)) = scene("broken", true) else { return };
+        let missing = |release: &Path| std::fs::remove_file(join(release, "app/licenses/new.txt")).unwrap();
+        let Some((dir, base, archive)) = scene("broken", &missing) else { return };
         let error = apply(&archive, &base, None, &|_| Ok(())).unwrap_err();
-        assert!(error.contains("not the file its manifest.json lists"), "{error}");
+        assert!(error.contains("app/licenses/new.txt: its manifest.json lists it, and the archive does not have it"), "{error}");
         as_it_was(&base);
         let error = apply(&base.join(CONF), &base, None, &|_| Ok(())).unwrap_err();
         assert!(error.contains("not a .tar.gz or a .zip"), "{error}");
         as_it_was(&base);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A byte changed in the gzip trailer (its CRC): every file inflates, the check is at the end.
+    #[test]
+    fn a_tar_gz_whose_crc_does_not_match_changes_nothing() {
+        let Some((dir, base, archive)) = scene("crc", &|_| {}) else { return };
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let at = bytes.len() - 8;
+        bytes[at] ^= 0xff;
+        std::fs::write(&archive, bytes).unwrap();
+        let error = apply(&archive, &base, None, &|_| Ok(())).unwrap_err();
+        assert!(error.contains("a broken download?"), "{error}");
+        as_it_was(&base);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--update --apply` takes the newest archive an earlier `--update` downloaded.
+    #[test]
+    fn apply_finds_the_archive_downloaded_before() {
+        let dir = std::env::temp_dir().join(format!("launcher-update-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (here, runtime) = (dir.join("here"), dir.join("runtime"));
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        let named = |version: &str| {
+            download_name(&Release { tag: version.into(), name: archive_name(PLATFORM), size: 0, url: String::new() })
+        };
+        for name in [named("0.0.1"), named("999.0.0"), format!("{}.part", named("999.5.0")), named("not-a-version")] {
+            std::fs::write(here.join(name), "").unwrap();
+        }
+        let other = if PLATFORM == "linux-x64" { "linux-arm64" } else { "linux-x64" };
+        std::fs::write(here.join(format!("collabo-core-{other}-999.9.9.tar.gz")), "").unwrap();
+        std::fs::write(runtime.join(named("v999.1.0")), "").unwrap();
+        let dirs = [here.clone(), runtime.clone()];
+        assert_eq!(downloaded(&dirs, false), Some((runtime.join(named("v999.1.0")), "v999.1.0".to_string())));
+        std::fs::remove_file(runtime.join(named("v999.1.0"))).unwrap();
+        assert_eq!(downloaded(&dirs, false), Some((here.join(named("999.0.0")), "999.0.0".to_string())));
+        // Only older ones: none, unless --force.
+        std::fs::remove_file(here.join(named("999.0.0"))).unwrap();
+        assert_eq!(downloaded(&dirs, false), None);
+        assert_eq!(downloaded(&dirs, true), Some((here.join(named("0.0.1")), "0.0.1".to_string())));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -278,6 +278,7 @@ mod host_tty {
 
     pub fn restore() {
         if let Some(termios) = SAVED.lock().unwrap().take() {
+            super::reset_keyboard_modes();
             // SAFETY: the settings tcgetattr gave back.
             unsafe { libc::tcsetattr(0, libc::TCSANOW, &termios) };
         }
@@ -351,6 +352,8 @@ mod host_tty {
 
     pub fn restore() {
         if let Some((in_mode, out_mode, in_cp, out_cp)) = SAVED.lock().unwrap().take() {
+            // While the console still takes escape sequences.
+            super::reset_keyboard_modes();
             // SAFETY: the settings the console gave back.
             unsafe {
                 SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), in_mode);
@@ -445,6 +448,42 @@ mod host_tty {
     pub fn input() -> Box<dyn std::io::Read + Send> {
         Box::new(std::io::stdin())
     }
+}
+
+/// Keyboard modes a guest program asked of this terminal and did not undo, as when the machine
+/// stops under it (Ctrl-] q, a crash): kitty's keyboard flags (the whole stack popped) and xterm's
+/// modifyOtherKeys (back to the terminal's own). Left on, the shell after it would be sent keys
+/// it cannot read, Ctrl-C among them. Only with the terminal taken raw (host_tty::restore).
+fn reset_keyboard_modes() {
+    use std::io::{IsTerminal, Write};
+    let mut out = std::io::stdout();
+    if out.is_terminal() {
+        let _ = out.write_all(b"\x1b[<99u\x1b[>4m");
+        let _ = out.flush();
+    }
+}
+
+/// Ctrl-] as a terminal sends it when a guest program asked for kitty's keyboard protocol or
+/// modifyOtherKeys (the agent's input box does): the plain byte, so that Ctrl-] q still leaves.
+fn plain_ctrl_bracket(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const ENCODED: [&[u8]; 2] = [b"\x1b[93;5u", b"\x1b[27;5;93~"];
+    if !bytes.contains(&0x1b) || !ENCODED.iter().any(|e| bytes.windows(e.len()).any(|w| w == *e)) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    'scan: while at < bytes.len() {
+        for encoded in ENCODED {
+            if bytes[at..].starts_with(encoded) {
+                out.push(0x1d);
+                at += encoded.len();
+                continue 'scan;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Leaves with the terminal as it was.
@@ -809,7 +848,8 @@ fn main() -> Result<()> {
                 break;
             }
             let mut bytes = Vec::with_capacity(read + 1);
-            for &byte in &buffer[..read] {
+            let typed = if raw { plain_ctrl_bracket(&buffer[..read]) } else { std::borrow::Cow::Borrowed(&buffer[..read]) };
+            for &byte in typed.iter() {
                 match (raw, escaped, byte) {
                     (true, false, 0x1d) => escaped = true,
                     (true, true, b'q' | b'Q' | b'.') => {
@@ -881,6 +921,14 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_ctrl_bracket_is_the_escape_too() {
+        assert_eq!(&*plain_ctrl_bracket(b"\x1b[93;5uq"), b"\x1dq");
+        assert_eq!(&*plain_ctrl_bracket(b"a\x1b[27;5;93~.\x1b[93;5u"), b"a\x1d.\x1d");
+        // Other keys, encoded or not, go on as typed.
+        assert_eq!(&*plain_ctrl_bracket(b"\x1b[13;2u\x1b[93;3u\x1b"), b"\x1b[13;2u\x1b[93;3u\x1b");
+    }
 
     #[test]
     fn exec_records_become_command_lines() {

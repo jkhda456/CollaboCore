@@ -76,6 +76,10 @@ if [[ "$MODE" == "--boot" || "$MODE" == "--all" ]]; then
   python3 "$T/test_preempt.py" >"$progs/preempt.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/preempt.txt" | head -40; echo "FAIL: preemption (kernel/patches/user-interrupt.patch, engine/src/user.rs on_epoch)"; exit 1; }
   tail -1 "$progs/preempt.txt"
 
+  echo "== guest boot: the host stopping the machine (SIGSTOP, a laptop's sleep) is no RCU stall; a cpu held for good still is"
+  python3 "$T/test_host_pause.py" >"$progs/host-pause.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/host-pause.txt" | head -40; echo "FAIL: host pause (kernel/patches/wasm-watchdog-host-pause.patch)"; exit 1; }
+  tail -1 "$progs/host-pause.txt"
+
   echo "== guest boot: with memory full of page cache in single pages, 256 KiB allocations reclaim instead of the OOM killer; exec still works"
   python3 "$T/test_high_order_alloc.py" >"$progs/high-order.txt" 2>&1 || { grep -A3 "^FAIL" "$progs/high-order.txt" | head -40; echo "FAIL: high-order allocations (kernel/patches/nommu-high-order-alloc.patch)"; exit 1; }
   tail -1 "$progs/high-order.txt"

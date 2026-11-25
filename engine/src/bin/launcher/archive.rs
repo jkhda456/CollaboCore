@@ -180,7 +180,11 @@ pub fn tar_gz_files(file: File, each: &mut dyn FnMut(&TarFile, &mut dyn Read) ->
     let mut long_name: Option<String> = None;
     loop {
         if !read_block(&mut tar, &mut header)? || header.iter().all(|b| *b == 0) {
-            return Ok(());
+            // On to the gzip trailer, so its CRC is checked: a bit flipped in a download can
+            // still inflate.
+            return std::io::copy(&mut tar, &mut std::io::sink())
+                .map(|_| ())
+                .map_err(|e| format!("after the files: {e} (a broken download?)"));
         }
         let stored = tar_number(&header[148..156])?;
         let sum: u64 = header.iter().enumerate().map(|(i, b)| if (148..156).contains(&i) { b' ' as u64 } else { *b as u64 }).sum();

@@ -110,6 +110,8 @@ d, platform, exe = sys.argv[1:]
 files = {}
 for root, _, names in os.walk(d):
     for n in names:
+        if n == ".DS_Store" or n.startswith("._"):
+            continue  # macOS's (Finder, AppleDouble): release.sh leaves them out of the archive
         p = os.path.join(root, n)
         rel = os.path.relpath(p, d).replace(os.sep, "/")
         if rel not in ("manifest.json", "launcher.conf"):

@@ -82,9 +82,11 @@ Usage:
   launcher --update                       download this platform's archive of the latest release,
                                           when it is newer than this runtime, into the current folder
   launcher --update --check               only say whether there is a newer release
-  launcher --update --apply [FILE]        download it (or take FILE) and put it in place of this
-                                          runtime: launcher.conf, work/ and what you added stay;
-                                          the old files go to .update/ and are removed after
+  launcher --update --apply [FILE]        put it in place of this runtime: the archive --update
+                                          downloaded (here or in the runtime folder), else the
+                                          release's now, or FILE; launcher.conf, work/ and what
+                                          you added stay; the old files go to .update/ and are
+                                          removed after
   launcher --update ... --force           the same when the release is not newer
   launcher --version                      the version (the engine's) and the platform
   launcher --help                         this text; bin/collabo-core-engine --help has the options
